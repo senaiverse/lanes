@@ -195,8 +195,8 @@ load helper
   [ "$output" = "1" ]
 }
 
-@test "the symlink mutex fallback behaves the same when flock is unavailable" {
-  export LANES_NO_FLOCK=1 LANES_POOL_SIZE=1
+@test "a slot held by a running job frees when it is killed, and no call leaves the mutex behind" {
+  export LANES_POOL_SIZE=1
   "$JOB" run first -- sleep 60
   run "$JOB" run second -- true
   [ "$status" -eq 75 ]
@@ -281,8 +281,7 @@ load helper
   [[ "$output" == *"lanes-job:"*"name"* ]]
 }
 
-# race_six: six concurrent runs against a pool of two; exactly two may start.
-race_six() {
+@test "six concurrent runs against a pool of two start exactly two" {
   export LANES_POOL_SIZE=2
   local i pids=()
   for i in 1 2 3 4 5 6; do
@@ -299,18 +298,8 @@ race_six() {
   [ "$full" -eq 4 ]
 }
 
-@test "six concurrent runs against a pool of two start exactly two (flock)" {
-  command -v flock >/dev/null 2>&1 || skip "flock not installed"
-  race_six
-}
-
-@test "six concurrent runs against a pool of two start exactly two (symlink fallback)" {
-  export LANES_NO_FLOCK=1
-  race_six
-}
-
-@test "symlink mutex held by a live owner is not broken, and the wait fails loudly" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
+@test "a mutex held by a live owner is not broken, and the wait fails loudly" {
+  export LANES_MUTEX_TIMEOUT=1
   mkdir -p "$LANES_DATA_DIR/locks"
   sleep 30 &
   owner=$!
@@ -322,16 +311,16 @@ race_six() {
   [ "$(readlink "$LANES_DATA_DIR/locks/.mutex.owner")" = "$owner" ]
 }
 
-@test "symlink mutex left by a dead owner is broken and released afterwards" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
+@test "a mutex left by a dead owner is broken and released afterwards" {
+  export LANES_MUTEX_TIMEOUT=1
   mutex_of_dead_owner
   run "$JOB" slot acquire p --pid $$
   [ "$status" -eq 0 ]
   [ -z "$(ls -A "$LANES_DATA_DIR/locks" | grep '^\.mutex')" ]
 }
 
-@test "two waiters that read the same dead symlink-mutex owner never both hold the mutex" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+@test "two waiters that read the same dead mutex owner never both hold the mutex" {
+  export LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
   # Waiter B pauses after reading the dead owner; waiter A then breaks the mutex and holds it inside fake tmux.
@@ -353,8 +342,8 @@ exit 1'
   [ ! -L "$LANES_DATA_DIR/locks/.mutex.owner" ]
 }
 
-@test "two breakers of one dead symlink-mutex owner never both hold the mutex" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+@test "two breakers of one dead mutex owner never both hold the mutex" {
+  export LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
   # Breaker B pauses after its own check of the dead owner, just before the removal; breaker C runs meanwhile.
@@ -375,8 +364,8 @@ exit 1'
   [[ "$(cat "$WORK/c.out")" == *"lanes-job:"*"mutex"* ]]
 }
 
-@test "a breaker killed between its marker and the removal does not wedge the symlink mutex" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
+@test "a breaker killed between its marker and the removal does not wedge the mutex" {
+  export LANES_MUTEX_TIMEOUT=1
   mutex_of_dead_owner
   breaker_killed_before_remove
   run "$JOB" slot acquire p --pid $$
@@ -386,7 +375,7 @@ exit 1'
 }
 
 @test "two breakers that take over a dead breaker's marker never both hold the mutex" {
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+  export LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
   breaker_killed_before_remove
@@ -407,9 +396,9 @@ exit 1'
   [[ "$(cat "$WORK/d.out")" == *"lanes-job:"*"mutex"* ]]
 }
 
-@test "a live holder that has just taken the fallback mutex is never broken by a waiter that reaches its timeout" {
+@test "a live holder that has just taken the mutex is never broken by a waiter that reaches its timeout" {
   sleep 30 &
-  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB KEEPER=$!
+  export LANES_MUTEX_TIMEOUT=1 JOB KEEPER=$!
   # Holder H pauses as soon as it has the mutex; waiter W runs its whole timeout meanwhile, wanting a slot for KEEPER.
   write_hook '[ "$1" = after-acquire ] && [ ! -e "$HOOK_DIR/w.pid" ] || exit 0
 LANES_TEST_HOOK= "$JOB" slot acquire p --pid "$KEEPER" >"$HOOK_DIR/w.out" 2>&1 &
@@ -428,7 +417,7 @@ echo "$?" >"$HOOK_DIR/w.status"'
   [ ! -e "$LANES_DATA_DIR/locks/p-2.lock" ]
 }
 
-# mutex_of_dead_owner: a fallback mutex whose owner pid has exited.
+# mutex_of_dead_owner: a mutex whose owner pid has exited.
 mutex_of_dead_owner() {
   local dead
   mkdir -p "$LANES_DATA_DIR/locks"
@@ -471,8 +460,7 @@ FAKE
   export PATH="$WORK/bin:$PATH" FAKE_TMUX_MODE="$1" FAKE_TMUX_DIR="$WORK"
 }
 
-# launcher_killed_after_window: the launcher dies by SIGKILL right after it opens the window, before any handoff.
-launcher_killed_after_window() {
+@test "a launcher killed right after it opens the window leaves the job owned by its live runner" {
   export LANES_POOL_SIZE=1
   write_hook '[ "$1" = after-window ] || exit 0
 echo "$PPID" >"$HOOK_DIR/launcher"
@@ -494,16 +482,6 @@ kill -9 "$PPID"'
   [[ "$output" == *"lanes-job:"*"already running"* ]]
   run "$JOB" run other -- true
   [ "$status" -eq 75 ]
-}
-
-@test "a launcher killed right after it opens the window leaves the job owned by its live runner (flock)" {
-  command -v flock >/dev/null 2>&1 || skip "flock not installed"
-  launcher_killed_after_window
-}
-
-@test "a launcher killed right after it opens the window leaves the job owned by its live runner (symlink fallback)" {
-  export LANES_NO_FLOCK=1
-  launcher_killed_after_window
 }
 
 # late_claim_hook: kill the first launcher right after it opens its window, and hold the first runner's claim until
@@ -564,7 +542,6 @@ live_windows() {
 }
 
 @test "a mutex another process now owns is not freed by the first holder" {
-  export LANES_NO_FLOCK=1
   fake_tmux steal
   run "$JOB" run stolen -- true
   [ "$status" -ne 0 ]
@@ -600,9 +577,7 @@ live_windows() {
 }
 
 @test "--env NAME passes the caller's variable to the job; unlisted ones do not arrive" {
-  # The tmux server keeps the environment it was started with, so start it before the variables exist.
-  "$JOB" run warm -- true
-  "$JOB" wait warm --timeout 20
+  warm_server
   export PASS_ME=visible HIDE_ME=secret
   "$JOB" run envjob --env PASS_ME -- bash -c 'echo "${PASS_ME:-none}|${HIDE_ME:-none}"'
   "$JOB" wait envjob --timeout 20
@@ -613,4 +588,85 @@ live_windows() {
   run "$JOB" run badenv --env 'A B' -- true
   [ "$status" -eq 2 ]
   [[ "$output" == *"lanes-job:"* ]]
+}
+
+@test "--env forwards the caller's value even for a name the script uses itself" {
+  warm_server
+  DATA=/in SESSION=sess POOL=pool name=nm CALLER_ENV=ce "$JOB" run clash \
+    --env DATA --env SESSION --env POOL --env name --env CALLER_ENV -- \
+    bash -c 'echo "$DATA|$SESSION|$POOL|$name|$CALLER_ENV"'
+  "$JOB" wait clash --timeout 20
+  [ "$(cat "$LANES_DATA_DIR/jobs/clash/log")" = "/in|sess|pool|nm|ce" ]
+}
+
+@test "--env values reach the command without changing the runner's own variables" {
+  warm_server
+  log=/x/log status=/x/status slot=/x/slot sig=1 cmd=c "$JOB" run inner \
+    --env log --env status --env slot --env sig --env cmd -- bash -c 'echo "$log|$status|$slot|$sig|$cmd"'
+  run "$JOB" wait inner --timeout 20
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EXIT:0"* ]]
+  [ "$(cat "$LANES_DATA_DIR/jobs/inner/log")" = "/x/log|/x/status|/x/slot|1|c" ]
+  [ ! -e "$LANES_DATA_DIR/locks/jobs-1.lock" ]
+}
+
+@test "under umask 022 the job record is private while it runs, and no forwarded value is left after it ends" {
+  umask 022
+  export SECRET_TOKEN=hunter2-value
+  "$JOB" run private --env SECRET_TOKEN -- sleep 60
+  local jd="$LANES_DATA_DIR/jobs/private"
+  [[ "$(ls -ld "$jd")" == drwx------* ]]
+  [[ "$(ls -l "$jd/run.sh")" == -rwx------* ]]
+  tmux -L "$LANES_TMUX_SOCKET" kill-window -t "lanes-jobs:private"
+  "$JOB" wait private --timeout 20
+  [ ! -e "$jd/run.sh" ]
+  ! grep -rq hunter2-value "$jd"
+}
+
+@test "a claim killed between its temporary link and the rename does not block later starts" {
+  export LANES_POOL_SIZE=1 LANES_CLAIM_TIMEOUT=2
+  write_hook '[ "$1" = before-rename ] && mkdir "$HOOK_DIR/killed-once" 2>/dev/null && kill -9 "$PPID"
+exit 0'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" run first -- true
+  [ "$status" -ne 0 ]
+  [ -d "$WORK/killed-once" ]
+  run "$JOB" run second -- true
+  [ "$status" -eq 0 ]
+  "$JOB" wait second --timeout 20
+  grep -q 'EXIT:0' "$(status_file second)"
+  [ -z "$(ls -A "$LANES_DATA_DIR/locks" | grep '\.new')" ]
+}
+
+@test "a runner signalled right after its claim still records the signal in STATUS and never starts its command" {
+  write_hook '[ "$1" = after-claim ] || exit 0
+kill -TERM "$(cat "$LANES_DATA_DIR/jobs/early/pid")"'
+  export LANES_TEST_HOOK="$WORK/hook"
+  "$JOB" run early -- touch "$WORK/ran"
+  run "$JOB" wait early --timeout 20
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EXIT:143"* ]]
+  [ ! -e "$WORK/ran" ]
+  [ ! -e "$LANES_DATA_DIR/locks/jobs-1.lock" ]
+}
+
+@test "a runner signalled just before it starts the command still stops the command and records the signal" {
+  write_hook '[ "$1" = before-start ] || exit 0
+kill -TERM "$PPID"'
+  export LANES_TEST_HOOK="$WORK/hook"
+  "$JOB" run late -- sleep 60
+  run "$JOB" wait late --timeout 15
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EXIT:143"* ]]
+}
+
+@test "a claim killed after it commits still leaves its runner owning and running the job" {
+  write_hook '[ "$1" = after-claim ] || exit 0
+kill -9 "$PPID"'
+  export LANES_TEST_HOOK="$WORK/hook"
+  "$JOB" run committed -- touch "$WORK/ran"
+  run "$JOB" wait committed --timeout 20
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EXIT:0"* ]]
+  [ -e "$WORK/ran" ]
 }

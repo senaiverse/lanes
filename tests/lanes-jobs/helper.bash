@@ -41,6 +41,12 @@ wait_for() {
   return 1
 }
 
+# warm_server: start the private tmux server with a finished job, so variables set later are not in its environment.
+warm_server() {
+  "$JOB" run warm -- true
+  "$JOB" wait warm --timeout 20
+}
+
 # write_hook <body>: an executable LANES_TEST_HOOK script; it gets the point name as $1 and $WORK as HOOK_DIR.
 write_hook() {
   printf '#!/usr/bin/env bash\n%s\n' "$1" >"$WORK/hook"

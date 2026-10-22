@@ -26,7 +26,8 @@ lanes-job run <name> -- <command> [args...]
 - The command runs in your current directory with your `PATH`. Other shell variables do not follow you: the job sees
   the environment of the dedicated tmux server, which keeps what it had when the first job started. Pass a variable
   with `--env NAME` (copies its current value; repeat for several) or set it for one command:
-  `lanes-job run t --env NODE_ENV -- npm test`, `lanes-job run t -- env CI=1 npm test`.
+  `lanes-job run t --env NODE_ENV -- npm test`, `lanes-job run t -- env CI=1 npm test`. The job's folder is readable
+  by your user only; the copied values sit in its `run.sh`, which is deleted when the job ends (a SIGKILL leaves it).
 - Jobs run on their own tmux server (socket `lanes`, session `lanes-jobs`), never your own. To watch one:
   `tmux -L lanes attach -t lanes-jobs`.
 
