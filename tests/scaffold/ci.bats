@@ -47,9 +47,9 @@ windows_job() { awk '/^  windows:/{f=1;next} f&&/^  [a-z]/{f=0} f' "$CI"; }
   grep -q 'scripts/test.sh' <<< "$job"
 }
 
-@test "git attributes keep LF in every shell file so Windows checkouts run" {
+@test "git attributes keep LF in every shell file and the plan template so Windows checkouts run" {
   local pat attrs="$BATS_TEST_DIRNAME/../../.gitattributes"
-  for pat in '*.sh' '*.bash' '*.bats' 'plugins/*/bin/*' '.githooks/*'; do
+  for pat in '*.sh' '*.bash' '*.bats' 'plugins/*/bin/*' '.githooks/*' 'plugins/lanes-plancheck/templates/plan.md'; do
     grep -qxF "$pat text eol=lf" "$attrs" || { echo "missing: $pat text eol=lf" >&2; false; }
   done
 }

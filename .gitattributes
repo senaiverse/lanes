@@ -3,3 +3,5 @@
 *.bats text eol=lf
 plugins/*/bin/* text eol=lf
 .githooks/* text eol=lf
+plugins/*/templates/** text eol=lf
+plugins/lanes-plancheck/templates/plan.md text eol=lf
