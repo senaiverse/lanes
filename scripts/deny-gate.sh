@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Fails when a tracked or untracked-non-ignored file, by its path or its contents, holds a word from the private deny-list.
 # The list comes from docs/PORT-SOURCES.local.md (line "Grep gate deny-list") or else from LANES_DENY_LIST.
-# Usage: deny-gate.sh [repo-dir]   exit 0 clean, 1 hits, 2 no usable list, not a git repo, or an unreadable file.
+# With --commits it scans no files: it checks the author, committer and message of each commit that
+# `git rev-list <rev-list-args>` yields, and names the short sha and the field, never the word.
+# Usage: deny-gate.sh [repo-dir] [--commits <rev-list-args>...]
+# Exit 0 clean, 1 hits, 2 no usable list, not a git repo, or an unreadable file.
 set -euo pipefail
 
 die() { echo "lanes-deny-gate: $1: $2" >&2; exit 2; }
 
-ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ROOT=""
+if [ "$#" -gt 0 ] && [ "$1" != "--commits" ]; then ROOT="$1"; shift; fi
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+COMMITS=0; REV_ARGS=()
+if [ "${1:-}" = "--commits" ]; then
+  COMMITS=1; shift
+  [ "$#" -gt 0 ] || die "--commits needs a revision range" "pass rev-list arguments after --commits"
+  REV_ARGS=("$@")
+fi
 git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $ROOT" "pass the repo dir as the first argument"
 
 LOCAL_REL="docs/PORT-SOURCES.local.md"
@@ -62,6 +73,35 @@ while IFS= read -r w; do
     printf '%s\n' "$w" >> "$FIXED"
   fi
 done < "$CLEAN"
+
+if [ "$COMMITS" -eq 1 ]; then
+  CHIT="$TMP/commit-hits"; : > "$CHIT"
+  field_hit() { # $1 text, $2 sha, $3 field label; same -F/-E rules and error handling as scan()
+    local pf mode rc
+    for mode in -F -E; do
+      if [ "$mode" = "-F" ]; then pf="$FIXED"; else pf="$REGEX"; fi
+      [ -s "$pf" ] || continue
+      rc=0; grep -qi "$mode" -f "$pf" <<< "$1" || rc=$?
+      [ "$rc" -le 1 ] || die "grep failed on commit $2 (exit $rc)" "fix the deny-list pattern"
+      if [ "$rc" -eq 0 ]; then printf '%s %s\n' "$2" "$3" >> "$CHIT"; return 0; fi
+    done
+  }
+  revs="$(git -C "$ROOT" rev-list "${REV_ARGS[@]}")" || die "git rev-list failed for: ${REV_ARGS[*]}" "check the pushed refs exist locally"
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    short="$(git -C "$ROOT" rev-parse --short "$sha")"
+    field_hit "$(git -C "$ROOT" log -1 --format='%an%n%ae' "$sha")" "$short" author
+    field_hit "$(git -C "$ROOT" log -1 --format='%cn%n%ce' "$sha")" "$short" committer
+    field_hit "$(git -C "$ROOT" log -1 --format='%B' "$sha")" "$short" message
+  done <<< "$revs"
+  if [ -s "$CHIT" ]; then
+    echo "lanes-deny-gate: deny-listed word found in a commit (short sha, field): rewrite the commit before pushing:" >&2
+    sed 's/^/  /' "$CHIT" >&2
+    exit 1
+  fi
+  echo "lanes-deny-gate: commits clean"
+  exit 0
+fi
 
 # Existing files to scan, one path per line: tracked and untracked-not-ignored, minus the private list itself.
 LIST="$TMP/list"; : > "$LIST"
