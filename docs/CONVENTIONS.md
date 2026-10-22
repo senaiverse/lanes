@@ -24,8 +24,12 @@
 - Session registry: `$DATA/lanes/<lane>.json` holds
   `{"lane":"<name>","session_id":"<current>","role":"lead|lane","tmux_pane":"%N","cwd":"<abs>","used_pct":<int|null>,"clear_ready":<bool>,"updated_at":"<ISO-8601 UTC>"}`.
   It is keyed by lane name because `/clear` rotates `session_id`. Every session is launched as `claude --name <lane>`,
-  and the lane name is the hook input's `session_title` (`docs/M0-FINDINGS.md` Q2, Q4). The core plugin owns this
-  file. Other pieces only read it.
+  and `lanes register` takes the lane name from the SessionStart input's `session_title` (`docs/M0-FINDINGS.md` Q2,
+  Q4). PreToolUse input has no `session_title`; a probe on 2.1.308 confirmed it. The core plugin owns this file.
+  Other pieces only read it.
+- Session index: `$DATA/sessions/<session_id>` holds one line, the lane name. `lanes register` writes it on every
+  SessionStart and removes the lane's previous one. Hooks other than SessionStart and UserPromptSubmit receive no
+  `session_title` (hooks docs), so they find the caller by `session_id` through this index. The core plugin owns it.
 - Hook commands call `"${CLAUDE_PLUGIN_ROOT}/bin/<tool>"` by absolute path, because `bin/` is not on PATH for hooks
   (M0 Q5). Skills and agents call the bare name.
 - Slot locks: `$DATA/locks/<pool>-<i>.lock`, a symlink whose target is the holder's pid. Creating it is atomic, and a

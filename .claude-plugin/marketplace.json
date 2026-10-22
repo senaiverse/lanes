@@ -9,6 +9,11 @@
       "name": "lanes-plancheck",
       "source": "./plugins/lanes-plancheck",
       "description": "Plan field checker (lanes-plancheck)."
+    },
+    {
+      "name": "lanes-guards",
+      "source": "./plugins/lanes-guards",
+      "description": "Multi-session guards: only the lead runs CI, merges and default-branch pushes; only the lead sends plans; no edits in the main checkout. Requires the core lanes plugin."
     }
   ]
 }

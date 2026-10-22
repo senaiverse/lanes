@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# lanes-guard <lead-only|plan-message|main-edit>: PreToolUse hook guards for a lead and its lanes.
+#   lead-only     Bash: refuse CI dispatch, merge and push-to-default commands unless the caller is the lead.
+#   plan-message  SendMessage: refuse a message that starts with the plan marker unless the caller is the lead.
+#   main-edit     Edit, Write, NotebookEdit: refuse a path inside the main checkout while linked worktrees exist.
+# Reads the hook JSON on stdin. A refusal is the PreToolUse decision JSON on stdout (code.claude.com/docs/en/hooks,
+# "PreToolUse decision control": hookSpecificOutput.permissionDecision "deny" plus permissionDecisionReason) and exit 0.
+# Silence with exit 0 hands the call to the normal permission flow. This is a mistake guard, not a security boundary:
+# it fails open on unreadable input or a missing jq, except for a command that still names a lead-only pattern.
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
+set -euo pipefail
+export LC_ALL=C
+
+DATA="${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}"
+DEFAULT_PATTERNS='gh workflow run; gh pr merge; git push @default'
+
+# shellcheck source-path=SCRIPTDIR source=../lib/tokenize.bash
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/tokenize.bash"
+
+note() { echo "lanes-guard: $*" >&2; }
+
+# deny <reason>: print the PreToolUse deny decision and stop.
+deny() {
+  jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+  exit 0
+}
+
+# ---- input and config --------------------------------------------------------------------------------------------
+
+# jstr <dotted path>: a string field of the hook input, or nothing.
+jstr() { jq -r --arg p "$1" 'try (getpath($p | split(".")) | strings) catch empty' <<<"$INPUT" 2>/dev/null || true; }
+
+# find_config: the first .lanes/guards.md in the project dir, then from the session directory upward.
+find_config() {
+  local d
+  CONFIG_FILE=""
+  for d in "${CLAUDE_PROJECT_DIR:-}" "$CWD"; do
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+      if [ -f "$d/.lanes/guards.md" ]; then CONFIG_FILE="$d/.lanes/guards.md"; return 0; fi
+      [ "$d" = "${CLAUDE_PROJECT_DIR:-}" ] && break
+      d="$(dirname "$d")"
+    done
+  done
+}
+
+# setting <key> <default>: guards.md "key: value" line, else the userConfig env CLAUDE_PLUGIN_OPTION_<KEY>, else the default.
+setting() {
+  local key="$1" v="" envname
+  if [ -n "$CONFIG_FILE" ]; then
+    v="$(sed -n "s/^[[:space:]]*$key:[[:space:]]*//p" "$CONFIG_FILE" | tail -n 1)"
+    v="${v%"${v##*[![:space:]]}"}"
+  fi
+  if [ -z "$v" ]; then
+    envname="CLAUDE_PLUGIN_OPTION_$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')"
+    v="${!envname:-}"
+  fi
+  printf '%s' "${v:-$2}"
+}
+
+# lookup_caller: sets ROLE (lead, lane, other role, none) and CALLER_LANE from the session index and the registry.
+# PreToolUse input carries no session_title, so the session id is the key: $DATA/sessions/<id> names the lane, which
+# `lanes register` rewrites on every SessionStart (docs/CONVENTIONS.md "State").
+lookup_caller() {
+  local lane="" safe='^[A-Za-z0-9][A-Za-z0-9._-]*$' f
+  ROLE="none"
+  CALLER_LANE=""
+  if [[ "$SID" =~ $safe ]] && [ -f "$DATA/sessions/$SID" ]; then IFS= read -r lane <"$DATA/sessions/$SID" || true; fi
+  [[ "$lane" =~ $safe ]] || return 0
+  f="$DATA/lanes/$lane.json"
+  [ -f "$f" ] || return 0
+  CALLER_LANE="$lane"
+  if ! ROLE="$(jq -er '.role | strings' "$f" 2>/dev/null)"; then
+    note "registry file $f is unreadable or has no role: treating the session as unregistered"
+    ROLE="none"
+  fi
+}
+
+# refuse_not_lead <rule> <what was refused> <allowed path>: the denial for a caller that is not the lead.
+refuse_not_lead() {
+  case "$ROLE" in
+    none) deny "lanes-guards rule $1: $2. This session is not in the lanes registry ($DATA/lanes), so the guard cannot tell whether it is the lead. Launch it as \`claude --name <lane>\` and run \`lanes register\` (lanes core plugin). Allowed path: $3" ;;
+    *) deny "lanes-guards rule $1: $2. This session is lane \"$CALLER_LANE\" (role $ROLE), not the lead. Allowed path: $3" ;;
+  esac
+}
+
+# ---- command matching --------------------------------------------------------------------------------------------
+
+# value_flags <tool>: option names that take a separate value, so the value is not mistaken for a subcommand word.
+value_flags() {
+  case "$1" in
+    gh) echo " -R --repo " ;;
+    git) echo " -C -c --git-dir --work-tree --namespace --exec-path --super-prefix --config-env -o --push-option --repo --receive-pack --exec " ;;
+    *) echo " " ;;
+  esac
+}
+
+# default_branches: the branch names a push must not target, one per line.
+default_branches() {
+  local configured head
+  configured="$(setting default_branch "")"
+  if [ -n "$configured" ]; then echo "$configured"; return 0; fi
+  head="$(git -C "$GIT_DIR" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$head" ]; then echo "${head#origin/}"; else printf 'main\nmaster\n'; fi
+}
+
+is_default_branch() { default_branches | grep -Fxq -- "$1"; }
+
+current_branch() { git -C "$GIT_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true; }
+
+# push_hits_default <flag_all> <repo_given> <words after "push"...>: true when the push can update a default branch.
+# The first word is the remote unless --repo named it, and no refspec means the current branch.
+push_hits_default() {
+  local all="$1" repo_given="$2" ref dst
+  shift 2
+  if [ "$all" = 1 ]; then return 0; fi
+  if [ "$repo_given" = 0 ] && [ "$#" -gt 0 ]; then shift; fi
+  if [ "$#" -eq 0 ]; then is_default_branch "$(current_branch)"; return; fi
+  for ref in "$@"; do
+    ref="${ref#+}"
+    dst="${ref##*:}"
+    if [ "$dst" = HEAD ]; then dst="$(current_branch)"; fi
+    dst="${dst#refs/heads/}"
+    if is_default_branch "$dst"; then return 0; fi
+  done
+  return 1
+}
+
+# match_command: tests one command (array W) against PATTERNS; sets MATCHED to the pattern text on a hit.
+match_command() {
+  local cmd="${W[0]}" base pat first a x need k flag_all repo_given
+  local -a pw pos
+  base="${cmd##*/}"
+  for pat in "${PATTERNS[@]}"; do
+    read -ra pw <<<"$pat"
+    [ "${#pw[@]}" -gt 0 ] || continue
+    first="${pw[0]}"
+    if [ "$base" != "$first" ]; then
+      # A command word the guard cannot resolve ($VAR, a substitution) is matched on the words after it.
+      [[ "$cmd" == *'$'* ]] && [ "${#pw[@]}" -gt 1 ] || continue
+    fi
+    pos=(); flag_all=0; repo_given=0
+    for ((a = 1; a < ${#W[@]}; a++)); do
+      x="${W[a]}"
+      if [[ "$x" == -?* ]]; then
+        if [ "$x" = "--all" ] || [ "$x" = "--mirror" ]; then flag_all=1; fi
+        if [ "$x" = "--repo" ] || [[ "$x" == --repo=* ]]; then repo_given=1; fi
+        if [[ "$(value_flags "$first")" == *" $x "* ]]; then a=$((a + 1)); fi
+      else
+        pos+=("$x")
+      fi
+    done
+    need=$((${#pw[@]} - 1))
+    if [ "${pw[need]}" = "@default" ]; then need=$((need - 1)); fi
+    if [ "${#pos[@]}" -lt "$need" ]; then
+      # xargs appends words at run time, so a prefix of the pattern may still complete.
+      [ "$VIA_XARGS" -eq 1 ] || continue
+      for ((k = 0; k < ${#pos[@]}; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
+      MATCHED="$pat"; return 0
+    fi
+    for ((k = 0; k < need; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
+    if [ "${pw[${#pw[@]} - 1]}" = "@default" ]; then
+      push_hits_default "$flag_all" "$repo_given" "${pos[@]:need}" || continue
+    fi
+    MATCHED="$pat"; return 0
+  done
+  return 1
+}
+
+# drop <n>: removes the first n words of W.
+drop() { if [ "${#W[@]}" -le "$1" ]; then W=(); else W=("${W[@]:$1}"); fi; }
+
+# is_assignment <word>
+is_assignment() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*\+?= ]]; }
+
+# WRAPPERS: commands that run the rest of their line, each with the options that take a separate value.
+declare -A WRAPPERS=(
+  [command]=" " [builtin]=" " [nohup]=" " [setsid]=" " [time]=" " [exec]=" -a " [nice]=" -n "
+  [timeout]=" -s -k --signal --kill-after " [env]=" -u --unset -C --chdir "
+  [sudo]=" -u -g -h -p -C -D -r -t -U -T " [doas]=" -u -g -h -p -C -D -r -t -U -T "
+  [xargs]=" -I -L -n -P -s -d -E -a -J "
+)
+
+# stdin_script <index>: the text a shell with no script operand would read on stdin: its own heredoc or here-string,
+# else the heredoc of the command piped into it, else the arguments of a piped echo or printf.
+stdin_script() {
+  local p="${CMD_PIPE[$1]:--1}" w
+  local -a words
+  if [ -n "${CMD_STDIN[$1]:-}" ]; then printf '%s' "${CMD_STDIN[$1]}"; return 0; fi
+  [ "$p" -ge 0 ] || return 0
+  if [ -n "${CMD_STDIN[p]:-}" ]; then printf '%s' "${CMD_STDIN[p]}"; return 0; fi
+  IFS="$SEP" read -ra words <<<"${CMDS[p]}"
+  case "${words[0]##*/}" in
+    echo|printf) for w in "${words[@]:1}"; do printf '%s ' "$w"; done ;;
+  esac
+}
+
+# check_command <index in CMDS>: strips wrappers, follows shells and eval into CMDS, and matches the real command.
+check_command() {
+  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script
+  local -a W=()
+  VIA_XARGS=0
+  while [ -n "$rest" ]; do W+=("${rest%%"$SEP"*}"); rest="${rest#*"$SEP"}"; done
+  while :; do
+    while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do drop 1; done
+    [ "${#W[@]}" -gt 0 ] || return 0
+    base="${W[0]##*/}"
+    if [ -n "${WRAPPERS[$base]+x}" ]; then
+      drop 1
+      while [ "${#W[@]}" -gt 0 ] && [[ "${W[0]}" == -* ]]; do
+        if [ "${W[0]}" = "--" ]; then drop 1; break; fi
+        if [ "$base" = command ] && [[ "${W[0]}" =~ ^-[a-zA-Z]*[vV] ]]; then return 0; fi
+        if [ "$base" = env ] && [[ "${W[0]}" =~ ^(-S|--split-string)$ ]]; then tokenize "${W[1]:-}"; return 0; fi
+        if [[ "${WRAPPERS[$base]}" == *" ${W[0]} "* ]]; then drop 2; else drop 1; fi
+      done
+      if [ "$base" = timeout ]; then drop 1; fi
+      if [ "$base" = xargs ]; then VIA_XARGS=1; fi
+      continue
+    fi
+    case "$base" in
+      '{'|'}'|'!'|if|then|else|elif|do|while|until|coproc) drop 1 ;;
+      bash|sh|zsh|dash|ksh|ash|mksh)
+        k=1; mode=operand; script=""
+        while [ "$k" -lt "${#W[@]}" ]; do
+          a="${W[k]}"
+          case "$a" in
+            -o|-O|+o|+O) k=$((k + 2)) ;;
+            --) break ;;
+            -*|+*)
+              if [[ "$a" =~ ^-[A-Za-z]*c[A-Za-z]*$ ]]; then mode=c; script="${W[k + 1]:-}"; break; fi
+              if [[ "$a" =~ ^-[A-Za-z]*s[A-Za-z]*$ ]]; then mode=stdin; fi
+              k=$((k + 1)) ;;
+            *) break ;;
+          esac
+        done
+        if [ "$mode" = operand ] && [ "$k" -ge "${#W[@]}" ]; then mode=stdin; fi
+        if [ "$mode" = stdin ]; then script="$(stdin_script "$idx")"; fi
+        if [ -n "$script" ]; then tokenize "$script"; fi
+        return 0 ;;
+      eval) drop 1; tokenize "${W[*]:-}"; return 0 ;;
+      source|.) return 0 ;;
+      *) match_command || true; return 0 ;;
+    esac
+  done
+}
+
+# loose_match <text>: true when the words of a pattern appear in order in text with any separators. This is the fallback
+# for text the tokenizer could not parse, so it errs toward matching.
+loose_match() {
+  local text="$1" pat w re
+  local -a pw
+  for pat in "${PATTERNS[@]}"; do
+    read -ra pw <<<"$pat"
+    re=""
+    for w in "${pw[@]}"; do
+      [ "$w" = "@default" ] && continue
+      w="$(printf '%s' "$w" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+      re+="${re:+[^[:alnum:]_]+}$w"
+    done
+    if [ -n "$re" ] && [[ "$text" =~ $re ]]; then MATCHED="$pat"; return 0; fi
+  done
+  return 1
+}
+
+# load_patterns: PATTERNS from the setting, split on ";".
+load_patterns() {
+  local raw p
+  PATTERNS=()
+  raw="$(setting lead_only_commands "$DEFAULT_PATTERNS")"
+  while IFS= read -r p; do
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [ -n "$p" ] && PATTERNS+=("$p")
+  done <<<"${raw//;/$'\n'}"
+  return 0
+}
+
+# ---- guards ------------------------------------------------------------------------------------------------------
+
+guard_lead_only() {
+  local cmd idx
+  CMDS=(); CMD_STDIN=(); CMD_PIPE=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
+  load_patterns
+  if [ "$VALID" -eq 0 ]; then
+    if loose_match "$INPUT"; then
+      note "hook input is not valid JSON but names a lead-only command"
+      SID=""; ROLE="none"
+      refuse_not_lead lead-only "\`$MATCHED\` is lead-only" "ask the lead to run it; the lead is the session registered with role lead"
+    fi
+    note "hook input is not a JSON object: guard skipped"
+    exit 0
+  fi
+  [ "$(jstr tool_name)" = Bash ] || exit 0
+  cmd="$(jstr tool_input.command)"
+  [ -n "$cmd" ] || exit 0
+  tokenize "$cmd"
+  for ((idx = 0; idx < ${#CMDS[@]}; idx++)); do
+    check_command "$idx"
+    [ -z "$MATCHED" ] || break
+  done
+  if [ -z "$MATCHED" ] && [ "$LOOSE" -eq 1 ]; then loose_match "$LOOSE_TEXT" || true; fi
+  [ -n "$MATCHED" ] || exit 0
+  lookup_caller
+  [ "$ROLE" != lead ] || exit 0
+  refuse_not_lead lead-only "\`$MATCHED\` is lead-only (CI dispatch, merge and push to the default branch)" \
+    "ask the lead to run it, or change lead_only_commands in .lanes/guards.md"
+}
+
+guard_plan_message() {
+  local marker msg trimmed
+  [ "$VALID" -eq 1 ] || { note "hook input is not a JSON object: guard skipped"; exit 0; }
+  [ "$(jstr tool_name)" = SendMessage ] || exit 0
+  msg="$(jstr tool_input.message)"
+  [ -n "$msg" ] || exit 0
+  marker="$(setting plan_marker "PLAN:")"
+  trimmed="${msg#"${msg%%[![:space:]]*}"}"
+  [[ "$trimmed" == "$marker"* ]] || exit 0
+  lookup_caller
+  [ "$ROLE" != lead ] || exit 0
+  refuse_not_lead plan-message "a message starting with \"$marker\" is a plan, and plans come from the lead" \
+    "send the lead facts (file:line, what you ran, what you ruled out), or the plain text without the marker"
+}
+
+# canon <path>: the physical path, resolving symlinks, even when the file or its directories do not exist yet.
+canon() {
+  local p="$1" hops=0 t tail="" anc
+  while [ -L "$p" ] && [ "$hops" -lt 20 ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    hops=$((hops + 1))
+  done
+  anc="$p"
+  while [ ! -e "$anc" ] && [ ! -L "$anc" ] && [ "$anc" != "/" ]; do
+    tail="/$(basename "$anc")$tail"
+    anc="$(dirname "$anc")"
+  done
+  if [ -d "$anc" ]; then
+    printf '%s%s' "$(cd -P "$anc" && pwd -P)" "$tail"
+  else
+    printf '%s/%s%s' "$(cd -P "$(dirname "$anc")" && pwd -P)" "$(basename "$anc")" "$tail"
+  fi
+}
+
+# under <path> <root>
+under() { [ "$1" = "$2" ] || [[ "$1" == "$2"/* ]]; }
+
+guard_main_edit() {
+  local tool path enabled listing line target main root rel top hint inside=0
+  local -a roots=()
+  [ "$VALID" -eq 1 ] || { note "hook input is not a JSON object: guard skipped"; exit 0; }
+  tool="$(jstr tool_name)"
+  case "$tool" in
+    Edit|Write) path="$(jstr tool_input.file_path)" ;;
+    NotebookEdit) path="$(jstr tool_input.notebook_path)" ;;
+    *) exit 0 ;;
+  esac
+  [ -n "$path" ] || exit 0
+  enabled="$(setting main_checkout_guard off)"
+  [[ "$enabled" =~ ^(on|yes|true|1)$ ]] || exit 0
+
+  listing="$(git -C "$GIT_DIR" worktree list --porcelain 2>/dev/null || true)"
+  if [ -z "$listing" ]; then
+    note "session directory $GIT_DIR is not a git checkout: main-checkout guard skipped"
+    exit 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) roots+=("$(canon "${line#worktree }")") ;;
+      bare) exit 0 ;;
+    esac
+  done <<<"$listing"
+  # With only the main checkout there is nothing to protect.
+  [ "${#roots[@]}" -ge 2 ] || exit 0
+
+  case "$path" in /*) ;; *) path="$GIT_DIR/$path" ;; esac
+  target="$(canon "$path")"
+  main="${roots[0]}"
+  under "$target" "$main" || exit 0
+  for root in "${roots[@]:1}"; do
+    if under "$target" "$root"; then inside=1; fi
+  done
+  [ "$inside" -eq 0 ] || exit 0
+
+  if [[ "$(setting lead_exempt_main_checkout no)" =~ ^(on|yes|true|1)$ ]]; then
+    lookup_caller
+    [ "$ROLE" != lead ] || exit 0
+  fi
+
+  rel="${target#"$main"/}"
+  top="$(git -C "$GIT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ] && [ "$(canon "$top")" != "$main" ]; then hint="$(canon "$top")/$rel"; else hint="${roots[1]}/$rel (or another linked worktree)"; fi
+  deny "lanes-guards rule main-edit: $path is inside the main checkout ($main) while lanes work in linked worktrees. Allowed path: the same file in a worktree, $hint. The lead may be exempted with lead_exempt_main_checkout: yes in .lanes/guards.md."
+}
+
+# no_jq: without jq the caller cannot be identified, so a call whose raw text names a lead-only command is refused (exit 2
+# feeds stderr to the model) and any other call passes with a note.
+no_jq() {
+  CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+  find_config
+  if [ "$NAME" = lead-only ]; then
+    load_patterns
+    if loose_match "$INPUT"; then
+      note "jq not found, and the call names \`$MATCHED\`, which is lead-only: refused because the caller cannot be identified. Install jq, or ask the lead to run it."
+      exit 2
+    fi
+  fi
+  note "jq not found: the $NAME guard is skipped; install jq"
+  exit 0
+}
+
+# ---- main --------------------------------------------------------------------------------------------------------
+
+NAME="${1:-}"
+case "$NAME" in
+  lead-only|plan-message|main-edit) ;;
+  *) echo "lanes-guard: usage: lanes-guard lead-only|plan-message|main-edit (PreToolUse JSON on stdin)" >&2; exit 2 ;;
+esac
+INPUT="$(cat || true)"
+command -v jq >/dev/null 2>&1 || no_jq
+VALID=1
+jq -e 'type == "object"' >/dev/null 2>&1 <<<"$INPUT" || VALID=0
+SID=""; CWD=""
+if [ "$VALID" -eq 1 ]; then
+  SID="$(jstr session_id)"
+  CWD="$(jstr cwd)"
+fi
+[ -n "$CWD" ] && [ -d "$CWD" ] || CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+GIT_DIR="$CWD"
+ROLE="none"; CALLER_LANE=""; MATCHED=""
+find_config
+
+case "$NAME" in
+  lead-only) guard_lead_only ;;
+  plan-message) guard_plan_message ;;
+  main-edit) guard_main_edit ;;
+esac

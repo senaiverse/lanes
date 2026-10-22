@@ -1,0 +1,19 @@
+# Guards
+
+Copy this file to `.lanes/guards.md` in your project. Each `key: value` line is read by `lanes-guards`; other text is
+ignored. A key left out falls back to the plugin's userConfig option of the same name, then to the default shown.
+
+```
+lead_only_commands: gh workflow run; gh pr merge; git push @default
+plan_marker: PLAN:
+main_checkout_guard: off
+lead_exempt_main_checkout: no
+default_branch:
+```
+
+- `lead_only_commands`: commands only the lead may run, separated by `;`. This list replaces the default, so repeat any
+  default you keep. `git push @default` means a push to the default branch.
+- `plan_marker`: a `SendMessage` starting with this text is refused unless the sender is the lead.
+- `main_checkout_guard`: `on` refuses Edit, Write and NotebookEdit inside the main checkout while linked worktrees exist.
+- `lead_exempt_main_checkout`: `yes` lets the lead edit the main checkout.
+- `default_branch`: the branch `@default` protects. Empty means the remote's head, else `main` and `master`.

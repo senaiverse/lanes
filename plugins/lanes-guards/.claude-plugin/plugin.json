@@ -1,0 +1,41 @@
+{
+  "name": "lanes-guards",
+  "version": "0.1.0",
+  "description": "Multi-session guards for a lead and its lanes: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. For destructive commands (rm -rf, git reset --hard) use destructive_command_guard or cc-safety-net; this plugin does not cover them.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["guards", "hooks", "tmux", "multi-session"],
+  "userConfig": {
+    "lead_only_commands": {
+      "type": "string",
+      "title": "Lead-only commands",
+      "description": "Commands only the lead session may run, separated by semicolons. A project's .lanes/guards.md overrides this. git push @default means a push to the default branch.",
+      "default": "gh workflow run; gh pr merge; git push @default"
+    },
+    "plan_marker": {
+      "type": "string",
+      "title": "Plan marker",
+      "description": "A SendMessage whose text starts with this marker is refused unless the sender is the lead. A project's .lanes/guards.md overrides this.",
+      "default": "PLAN:"
+    },
+    "main_checkout_guard": {
+      "type": "boolean",
+      "title": "Main-checkout guard",
+      "description": "Refuse Edit, Write and NotebookEdit inside the main checkout while linked worktrees exist. A project's .lanes/guards.md overrides this.",
+      "default": false
+    },
+    "lead_exempt_main_checkout": {
+      "type": "boolean",
+      "title": "Lead may edit the main checkout",
+      "description": "Let the lead session edit the main checkout when the main-checkout guard is on. A project's .lanes/guards.md overrides this.",
+      "default": false
+    },
+    "default_branch": {
+      "type": "string",
+      "title": "Default branch",
+      "description": "The branch that git push @default protects. Empty means the remote's head, else main and master. A project's .lanes/guards.md overrides this."
+    }
+  }
+}
