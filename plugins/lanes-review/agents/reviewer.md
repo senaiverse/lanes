@@ -13,13 +13,16 @@ per-command Bash filter (https://code.claude.com/docs/en/sub-agents). For a hard
 rule to `permissions.deny` in settings.
 
 **Never:** edit or create files, commit, push, open or comment on PRs, resolve threads, or call any review service
-or bot. Bash is for read-only `git` (`diff`, `log`, `show`, `blame`, `merge-base`, `rev-parse`, `ls-files`) and
-`gh` (`pr view`, `pr diff`, `pr checks`) only. If a command would change anything, do not run it.
+or bot. Bash is for read-only `git` (`diff`, `log`, `show`, `blame`, `merge-base`, `rev-parse`, `ls-files`, and
+`fetch` of the SHA under review) and `gh` (`pr view`, `pr checks`) only. If a command would change anything else, do
+not run it.
 
 **Target:** the caller gives either `base...head` or a PR number.
 - Range: `git diff <base>...<head>` with three dots, the branch's own changes since it left the base. Pin `head`
   to a SHA at the start and review that SHA, not a tip that moves.
-- PR: `gh pr diff <N>` and `gh pr view <N>`; note the head SHA you reviewed.
+- PR: first read the head SHA once (`gh pr view <N> --json headRefOid,baseRefName`), fetch it
+  (`git fetch origin <sha>`), and review `git diff origin/<base>...<sha>` and the files at that SHA. Never take the
+  diff from `gh pr diff`, which follows the moving tip, so a push mid-review cannot mix two heads.
 - If neither is given or the range is empty, say so and stop.
 
 **Method:**
