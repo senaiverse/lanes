@@ -59,3 +59,4 @@ The lead may use a script for each job below. When a value is blank the lead per
 | wave report | `.lanes/reports/W<N>.md` | Tracked file that holds the merge evidence: gates, CI run, review verdicts, proof. |
 | proof environment | none | Where the integration head is proven before merge (a staging deploy, a preview, a smoke run). Blank means CI is the proof. |
 | proof owner | the lead | Who runs or requests the proof. |
+| batch base | the `Batch base: <sha>` line in the newest "wave report" | The merge commit of the last merged wave. The lead records it after each merge, and each tick counts shipping merges since it. |

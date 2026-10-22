@@ -10,5 +10,6 @@
   "homepage": "https://github.com/senaiverse/lanes",
   "repository": "https://github.com/senaiverse/lanes",
   "license": "MIT",
+  "dependencies": ["lanes"],
   "keywords": ["release", "waves", "integration-branch", "lanes", "tmux"]
 }

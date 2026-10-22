@@ -19,6 +19,11 @@
       "name": "lanes-review",
       "source": "./plugins/lanes-review",
       "description": "Adversarial reviewer agent, instructed not to edit; not sandboxed."
+    },
+    {
+      "name": "lanes-waves",
+      "source": "./plugins/lanes-waves",
+      "description": "Release waves: theme branches, one integration branch, review PRs by area, one merge."
     }
   ]
 }
