@@ -6,6 +6,11 @@
   },
   "plugins": [
     {
+      "name": "lanes-jobs",
+      "source": "./plugins/lanes-jobs",
+      "description": "Tmux pane pool with STATUS files and slot locks (lanes-job)."
+    },
+    {
       "name": "lanes-plancheck",
       "source": "./plugins/lanes-plancheck",
       "description": "Plan field checker (lanes-plancheck)."

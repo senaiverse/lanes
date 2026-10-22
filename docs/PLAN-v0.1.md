@@ -129,7 +129,7 @@ Each guard's refusal message names the rule and the allowed path.
 ## M3 — lanes-jobs
 
 `lanes-job run <name> -- <cmd>` runs a command in a pooled tmux pane and writes STATUS (`EXIT:<code>`, start, end, log
-path). Slots are pid-symlink locks under `${CLAUDE_PLUGIN_DATA}` (`CONVENTIONS.md` "State"). Tests cover: pool exhausted, a job killed mid-run (STATUS still
+path). Slots are pid-symlink locks under the shared state dir (`CONVENTIONS.md` "Code" and "State"). Tests cover: pool exhausted, a job killed mid-run (STATUS still
 written by the trap), a stale lock after a crash, and two jobs with the same name.
 
 ## M4 — lanes-waves, lanes-plancheck, lanes-ci, lanes-review
