@@ -333,19 +333,63 @@ SUBMIT /clear"
 @test "a dead mutex holder is taken over by exactly one of many racing processes: no update is lost" {
   register_lane alpha s1 %7 >/dev/null
   export LANES_NO_FLOCK=1
+  local pids
+  SECONDS=0
   for round in 1 2 3 4 5; do
     ln -s "999999.$round" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+    pids=()
     for i in $(seq 1 30); do
       (jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt 2>>"$LANES_TEST_TMP/err") &
+      pids+=("$!")
     done
-    wait
+    # Only these pids: a bare `wait` also waits for the BATS_TEST_TIMEOUT watchdog bats runs in this shell.
+    wait "${pids[@]}"
   done
+  [ "$SECONDS" -lt 60 ] || { echo "150 racing hooks took $SECONDS s" >&2; false; }
   # Under load a hook may give up waiting for the mutex (a timeout, reported as "locked"); that is
   # allowed. What must never happen is a lost update: every call either counted or reported its timeout.
   local timeouts prompts
   timeouts="$(grep -c locked "$LANES_TEST_TMP/err" || true)"
   prompts="$(state alpha .prompts)"
   [ $((prompts + timeouts)) -eq 150 ] || { echo "prompts=$prompts timeouts=$timeouts" >&2; false; }
+}
+
+# bounded_hook: one `hook prompt` under the no-flock mutex, killed at 20 s; sets RC, OUT and ELAPSED.
+bounded_hook() {
+  SECONDS=0
+  RC=0
+  OUT="$(jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' |
+    PATH="$LANES_TEST_TMP/shim:$PATH" LANES_NO_FLOCK=1 timeout 20 "$LANES" hook prompt 2>&1)" || RC=$?
+  ELAPSED=$SECONDS
+}
+
+@test "the mutex acquire is bounded: a dead holder's lock that comes back after every removal ends in 'locked' within 3 s" {
+  register_lane alpha s1 %7 >/dev/null
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # rm that never removes the lock link: the worst case, a dead-holder lock that is back at once after each break.
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ "$a" == *.mutex.lnk ]] && exit 0; done\nexec %q "$@"\n' "$(command -v rm)" >"$LANES_TEST_TMP/shim/rm"
+  chmod +x "$LANES_TEST_TMP/shim/rm"
+  ln -s 999999.1 "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  bounded_hook
+  [ "$RC" -ne 124 ] || { echo "the hook never returned" >&2; false; }
+  [ "$ELAPSED" -le 5 ] || { echo "took $ELAPSED s" >&2; false; }
+  [[ "$OUT" == *"registry locked"* ]]
+}
+
+@test "the mutex acquire is bounded: a live holder and a live break marker end in 'locked' within 3 s" {
+  register_lane alpha s1 %7 >/dev/null
+  mkdir -p "$LANES_TEST_TMP/shim"
+  sleep 30 &
+  live=$!
+  ln -s "$live.1" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  ln -s "$live.2" "$LANES_DATA_DIR/lanes/state/.mutex.lnk.break"
+  bounded_hook
+  kill "$live"
+  [ "$RC" -ne 124 ]
+  [ "$ELAPSED" -le 5 ] || { echo "took $ELAPSED s" >&2; false; }
+  [[ "$OUT" == *"registry locked"* ]]
+  run state alpha .prompts
+  assert_output 0
 }
 
 @test "a cleared record older than the request timeout is not resumed: no goal is typed" {

@@ -96,15 +96,16 @@ plugin_root() {
 # lock_take <path> <wait seconds> [holder pid]: ln -s creates the lock atomically with its holder in it, so it is never
 # seen half-written; a dead holder's lock is broken (lock_break). Sets LOCK_MINE, the target to release with.
 # A dead holder whose pid was reused looks alive, so the lock then refuses (fails safe) until its link is removed.
+# Every attempt counts, a break included, so the acquire ends after at most <wait> * 10 + 1 attempts.
 LOCK_MINE=""
 lock_take() {
-  local path="$1" tries=0 seen
+  local path="$1" tries=0 limit=$(($2 * 10 + 1)) seen
   LOCK_MINE="${3:-$BASHPID}.$RANDOM$RANDOM"
   until ln -s "$LOCK_MINE" "$path" 2>/dev/null; do
+    tries=$((tries + 1))
+    ((tries > limit)) && { LOCK_MINE=""; return 1; }
     seen="$(readlink "$path" 2>/dev/null || true)"
     if [[ -n "$seen" ]] && ! kill -0 "${seen%%.*}" 2>/dev/null && lock_break "$path" "$seen"; then continue; fi
-    tries=$((tries + 1))
-    ((tries > $2 * 10)) && { LOCK_MINE=""; return 1; }
     sleep 0.1
   done
 }
