@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Fake Claude Code pane for the lanes tests. It draws the 2.1.308 prompt box (a `❯` + NBSP input line between rules,
+# a dim placeholder when empty), reads keys in raw mode, and fires the lanes hooks the way Claude Code does.
+# Launch it with argv[0] "claude" so tmux reports pane_current_command=claude. Behaviour knobs are FAKE_* env vars.
+set -u
+
+LANE="${FAKE_LANE:?FAKE_LANE}"
+LANES="${LANES_BIN:?LANES_BIN}"
+LOG="${FAKE_LOG:?FAKE_LOG}"
+CWD="$PWD"
+SID="fake-$$-$RANDOM"
+composer="${FAKE_DRAFT:-}"
+swallow="${FAKE_SWALLOW_ENTERS:-0}"
+turn_ms="${FAKE_TURN_MS:-300}"
+# A /goal is a Stop hook that starts another turn after each one (no UserPromptSubmit), here FAKE_GOAL_TURNS times,
+# then gives control back with the goal still set; the footer shows `◎ /goal active` while one is set (goal docs).
+goal=""
+goal_left=0
+on_esc="${FAKE_ON_ESC:-}"
+busy=0
+turn_end=0
+transcript=()
+if [[ -n "${FAKE_TRANSCRIPT:-}" ]]; then
+  while IFS= read -r line; do transcript+=("$line"); done <<<"$FAKE_TRANSCRIPT"
+fi
+
+log() { printf '%s\n' "$*" >>"$LOG"; }
+
+now_ms() { local t="${EPOCHREALTIME/./}"; printf '%s' "${t:0:13}"; }
+
+# fire <register|prompt|stop> [extra jq args]: one hook call with Claude Code's input shape.
+fire() {
+  local kind="$1" json
+  case "$kind" in
+    start) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg src "$2" \
+      '{hook_event_name:"SessionStart",source:$src,session_id:$s,session_title:$t,cwd:$c}')"
+      printf '%s' "$json" | "$LANES" register >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
+    prompt) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg p "$2" \
+      '{hook_event_name:"UserPromptSubmit",session_id:$s,session_title:$t,cwd:$c,prompt:$p}')"
+      printf '%s' "$json" | "$LANES" hook prompt >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
+    stop) json="$(jq -nc --arg s "$SID" --arg c "$CWD" \
+      '{hook_event_name:"Stop",session_id:$s,cwd:$c,stop_hook_active:false,background_tasks:[]}')"
+      printf '%s' "$json" | "$LANES" hook stop >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
+  esac
+}
+
+draw() {
+  local start=0 n="${#transcript[@]}"
+  ((n > 30)) && start=$((n - 30))
+  printf '\033[H\033[2J'
+  local i
+  for ((i = start; i < n; i++)); do printf '%s\r\n' "${transcript[i]}"; done
+  if [[ -n "${FAKE_DIALOG:-}" ]]; then
+    printf ' Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n Enter to confirm · Esc to cancel\r\n'
+    return
+  fi
+  ((busy)) && printf '✻ Working… (1s · esc to interrupt)\r\n'
+  printf '──────────────────────────────── %s ─\r\n' "$LANE"
+  if [[ -n "$composer" ]]; then
+    printf '❯\302\240%s\r\n' "$composer"
+  else
+    printf '❯\302\240\033[2mTry "edit <filepath> to..."\033[0m\r\n'
+  fi
+  printf '────────────────────────────────────────\r\n  fake-claude %s\r\n' "$SID"
+  [[ -n "$goal" ]] && printf '  ◎ /goal active (1m)\r\n'
+  return 0
+}
+
+start_turn() {
+  busy=1
+  turn_end=$(($(now_ms) + turn_ms))
+}
+
+enter() {
+  if ((swallow > 0)); then
+    swallow=$((swallow - 1))
+    log "ENTER-SWALLOWED"
+    return
+  fi
+  local text="$composer"
+  composer=""
+  log "SUBMIT $text"
+  if [[ "$text" == "/clear" ]]; then
+    SID="fake-$$-$RANDOM"
+    transcript=()
+    busy=0
+    goal=""
+    fire start clear
+  elif [[ "$text" =~ ^/goal\ (clear|stop|off|reset|none|cancel)$ ]]; then
+    [[ -n "${FAKE_GOAL_CLEAR_HOOK:-}" ]] && fire prompt "$text"
+    if [[ -n "$goal" ]]; then transcript+=("❯ $text" "  ⎿  Goal cleared: $goal"); else transcript+=("❯ $text" "  ⎿  No goal set"); fi
+    goal=""
+  elif [[ "$text" == "/goal "* ]]; then
+    [[ -z "${FAKE_GOAL_NO_HOOK:-}" ]] && fire prompt "$text"
+    transcript+=("❯ $text" "  ⎿  Goal set: ${text#/goal }")
+    goal="${text#/goal }"
+    goal_left="${FAKE_GOAL_TURNS:-0}"
+    start_turn
+  elif [[ -n "$text" ]]; then
+    fire prompt "${pasted:-$text}"
+    transcript+=("❯ $text")
+    start_turn
+  fi
+  pasted=""
+}
+
+# nap <seconds>: a sleep without a child process, so tmux keeps reporting pane_current_command=claude.
+exec {napfd}<> <(:)
+nap() { read -rt "$1" -u "$napfd" _ || true; }
+
+stty raw -echo 2>/dev/null
+pasted=""
+[[ -z "${FAKE_NO_REGISTER:-}" ]] && fire start startup
+if [[ -n "${FAKE_GOAL:-}" ]]; then
+  goal="$FAKE_GOAL"
+  goal_left="${FAKE_GOAL_TURNS:-0}"
+  fire prompt "/goal $goal"
+  start_turn
+fi
+if [[ -n "${FAKE_BUSY_FOREVER:-}" ]]; then
+  fire prompt "long task"
+  busy=1
+  turn_end=0
+fi
+draw
+while :; do
+  # Poll with `read -t 0` (consumes nothing), then read blocking: a `read -t <n>` that times out as a key arrives can
+  # drop that key. A burst is every key that arrives with gaps under 10 ms.
+  if read -t 0; then
+    burst=""
+    while read -t 0; do
+      while read -t 0; do IFS= read -rsn1 -d '' c; burst+="$c"; done
+      nap 0.01
+    done
+    log "BURST ${#burst}"
+    if ((${#burst} > 800)); then
+      pasted="$burst"
+      composer="[Pasted text #1]"
+    else
+      i=0
+      while ((i < ${#burst})); do
+        k="${burst:i:1}"
+        case "$k" in
+          $'\r' | $'\n') enter ;;
+          $'\e')
+            log "ESC"
+            if [[ "$on_esc" == prompt ]]; then
+              # A human submits a message right after the lead's Escape: a new turn starts.
+              on_esc=""
+              log "HUMAN-PROMPT"
+              fire prompt "a human's message"
+              transcript+=("❯ a human's message")
+              start_turn
+            fi
+            # A human starts a draft at the Escape (draft), or just before the next key arrives (draft-late).
+            [[ "$on_esc" == draft ]] && { composer="human draft"; on_esc=""; }
+            [[ "$on_esc" == draft-late ]] && on_esc=draft-next
+            ;;
+          $'\177') composer="${composer%?}" ;;
+          *)
+            [[ "$on_esc" == draft-next ]] && { composer="human draft"; on_esc=""; }
+            composer+="$k"
+            ;;
+        esac
+        i=$((i + 1))
+      done
+    fi
+    draw
+  else
+    nap 0.03
+  fi
+  if ((busy && turn_end > 0 && $(now_ms) >= turn_end)); then
+    busy=0
+    transcript+=("● done")
+    fire stop
+    if [[ -n "$goal" ]] && ((goal_left > 0)); then
+      goal_left=$((goal_left - 1))
+      log "GOAL-CONTINUE"
+      start_turn
+    fi
+    draw
+  fi
+done

@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+# jq programs are single-quoted on purpose: their $names are jq variables, not shell ones.
+# shellcheck disable=SC2016
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
+# lanes: the session registry, the journal and the clear handshake for one lead session and its lane sessions in tmux.
+#   lanes init [--claude-md yes|no] [lane...]   write the journal template into the journal dir (never overwrites)
+#   lanes status [--json]                        every lane: pane, context %, busy/idle, clear-ready, handshake
+#   lanes request <lane>                         lead: open a clear handshake (the lane must rewrite RESUME after it)
+#   lanes clear-ready [--lane <lane>]            lane, from its work tree: refuse unless clean, pushed, RESUME valid
+#   lanes clear <lane> [--wait <seconds>]        lead: refuse unless ready, idle and unchanged; send /clear and /goal
+#   lanes goal <lane> <text> [--wait <seconds>]  lead: set or replace a lane's /goal through the same checks
+#   lanes away on|off|status                     away mode: the ask tool is refused, questions go to morning.md
+#   lanes journal-dir                            the journal folder for this work tree (absolute path)
+#   lanes monitor-lock <name> <pid>            a watcher loop claims its name (skills/lead/MONITORS.md)
+#   lanes monitor-diff <name>                    print the items of stdin whose state changed since the last pass
+#   lanes register | hook prompt|stop|ask        hook entry points (SessionStart, UserPromptSubmit, Stop, PreToolUse)
+#   lanes statusline                             status line body (run through bin/lanes-statusline)
+set -euo pipefail
+# Exit 1, not 2: from a UserPromptSubmit hook an exit 2 would block the user's prompt. A status line prints its stdout.
+if ! command -v jq >/dev/null 2>&1; then
+  [[ "${1:-}" == statusline ]] && echo "lanes: jq is not installed"
+  echo "lanes: jq is not installed: install jq 1.6 or newer and put it on PATH" >&2
+  exit 1
+fi
+
+DATA="${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}"
+REG="$DATA/lanes"
+STATE="$REG/state"
+
+# Claude Code 2.1.308 screen facts (measured on a private tmux server): the input line starts with `❯` and a
+# no-break space; an empty input shows a dim placeholder; a turn shows a spinner word ending in `…` above the box.
+PROMPT_MARK=$'❯\xc2\xa0'
+CLAUDE_COMMAND="${LANES_CLAUDE_COMMAND:-claude}"
+RESUME_START='<!-- lanes:resume:start -->'
+RESUME_END='<!-- lanes:resume:end -->'
+RESUME_CAP=8000
+GOAL_CAP=4000   # the /goal condition limit (code.claude.com/docs/en/goal)
+HOOK_CAP=10000  # additionalContext over this is replaced by a file path and a preview (hooks docs)
+REQUIRED_SECTIONS=("Goal" "Now" "Next step" "Links" "Running" "Suggested skills")
+
+IDLE_GAP="${LANES_IDLE_GAP:-3}"
+CLEAR_TIMEOUT="${LANES_CLEAR_TIMEOUT:-20}"
+BUSY_TTL="${LANES_BUSY_TTL:-1800}"
+PCT_STALE="${LANES_PCT_STALE:-900}"
+REQUEST_TIMEOUT="${LANES_REQUEST_TIMEOUT:-900}"
+SEND_CHUNK="${LANES_SEND_CHUNK:-256}"
+SEND_GAP="${LANES_SEND_GAP:-0.03}"
+
+# die is the one exit path of every refusal, so once lanes clear has typed /goal clear (GOAL_CLEARED) each message
+# after it says so: the lane is left without its goal until the next lanes clear sets it again.
+GOAL_CLEARED=0
+die() {
+  local note=""
+  ((GOAL_CLEARED)) && note=" (its /goal was cleared; the next 'lanes clear' sets it again)"
+  echo "lanes: $1: $2$note" >&2
+  exit "${3:-1}"
+}
+
+usage() {
+  echo "lanes: usage: lanes init|status|request|clear-ready|clear|goal|away|journal-dir|monitor-lock|monitor-diff|register|hook|statusline (see the header of $0)" >&2
+  exit 2
+}
+
+now() { date +%s; }
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+valid_lane() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+int_in_range() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= $2 && $1 <= $3)); }
+hash_of() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
+
+# char_count <text>: characters by code point, an astral one counted twice so the count is never below JavaScript's
+# string length; jq counts the same under every locale, while ${#x} counts bytes under LC_ALL=C.
+char_count() { printf '%s' "$1" | jq -Rs '[explode[] | if . > 65535 then 2 else 1 end] | add // 0'; }
+
+# The tmux server is the caller's own, or the private -L socket named by LANES_TMUX_SOCKET (tests). fd 9 (the mutex)
+# is closed so a tmux server started here never inherits it.
+tm() {
+  if [[ -n "${LANES_TMUX_SOCKET:-}" ]]; then
+    tmux -L "$LANES_TMUX_SOCKET" "$@" 9>&-
+  else
+    tmux "$@" 9>&-
+  fi
+}
+
+# The plugin root, from this script's own path with symlinks followed (CLAUDE_PLUGIN_ROOT is absent in the Bash tool).
+plugin_root() {
+  local self="${BASH_SOURCE[0]}" target
+  while [[ -L "$self" ]]; do
+    target="$(readlink "$self")"
+    case "$target" in /*) self="$target" ;; *) self="$(dirname "$self")/$target" ;; esac
+  done
+  (cd "$(dirname "$self")/.." && pwd)
+}
+
+# ---- locks: a symlink whose target "<pid>.<nonce>" names its holder ----------------------------------------------
+
+# lock_take <path> <wait seconds> [holder pid]: ln -s creates the lock atomically with its holder in it, so it is never
+# seen half-written; a dead holder's lock is broken (lock_break). Sets LOCK_MINE, the target to release with.
+# A dead holder whose pid was reused looks alive, so the lock then refuses (fails safe) until its link is removed.
+LOCK_MINE=""
+lock_take() {
+  local path="$1" tries=0 seen
+  LOCK_MINE="${3:-$BASHPID}.$RANDOM$RANDOM"
+  until ln -s "$LOCK_MINE" "$path" 2>/dev/null; do
+    seen="$(readlink "$path" 2>/dev/null || true)"
+    if [[ -n "$seen" ]] && ! kill -0 "${seen%%.*}" 2>/dev/null && lock_break "$path" "$seen"; then continue; fi
+    tries=$((tries + 1))
+    ((tries > $2 * 10)) && { LOCK_MINE=""; return 1; }
+    sleep 0.1
+  done
+}
+
+lock_holder() { local t; t="$(readlink "$1" 2>/dev/null || true)"; echo "${t%%.*}"; }
+
+# lock_drop <path> <target>: remove the lock only while it still has that target.
+lock_drop() { [[ "$(readlink "$1" 2>/dev/null || true)" == "$2" ]] && rm -f "$1"; return 0; }
+
+# lock_break <path> <target seen dead>: one breaker at a time holds <path>.break, and it removes the lock only if the
+# lock still has the target it saw dead, so a lock that a live process took meanwhile is never removed.
+lock_break() {
+  local marker="$1.break" mine="$BASHPID.$RANDOM$RANDOM" cur
+  if ! ln -s "$mine" "$marker" 2>/dev/null; then
+    cur="$(readlink "$marker" 2>/dev/null || true)"
+    [[ -n "$cur" ]] && ! kill -0 "${cur%%.*}" 2>/dev/null && lock_drop "$marker" "$cur"
+    return 1
+  fi
+  lock_drop "$1" "$2"
+  lock_drop "$marker" "$mine"
+}
+
+# ---- mutex: one short lock around every registry and state write -------------------------------------------------
+
+MUTEX_HELD=0
+MUTEX_MINE=""
+# mutex_take <seconds>: flock where it exists, else the symlink lock (stock macOS).
+mutex_take() {
+  mkdir -p "$STATE"
+  if [[ -z "${LANES_NO_FLOCK:-}" ]] && command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE/.mutex"
+    flock -w "$1" 9 || return 1
+  else
+    lock_take "$STATE/.mutex.lnk" "$1" || return 1
+    MUTEX_MINE="$LOCK_MINE"
+  fi
+  MUTEX_HELD=1
+}
+
+mutex_drop() {
+  ((MUTEX_HELD)) || return 0
+  MUTEX_HELD=0
+  exec 9>&-
+  [[ -n "$MUTEX_MINE" ]] && lock_drop "$STATE/.mutex.lnk" "$MUTEX_MINE"
+  MUTEX_MINE=""
+}
+
+# One exit path: a TERM (the status line is cancelled that way) still drops the mutex, the clear lock and a temp file.
+ATOMIC_TMP=""
+CLEAR_LOCK=""
+CLEAR_MINE=""
+on_exit() {
+  mutex_drop
+  [[ -n "$ATOMIC_TMP" ]] && rm -f "$ATOMIC_TMP"
+  [[ -n "$CLEAR_LOCK" ]] && lock_drop "$CLEAR_LOCK" "$CLEAR_MINE"
+  return 0
+}
+trap on_exit EXIT
+trap 'exit 143' TERM INT
+
+# ---- JSON files --------------------------------------------------------------------------------------------------
+
+# write_atomic <file> <content>: a temp file in the same directory, then mv, so a reader never sees half a file.
+# Empty content is refused: it only comes from an update that failed, and it would erase the file.
+write_atomic() {
+  [[ -n "$2" ]] || { echo "lanes: refusing to write empty content to $1: the update that produced it failed" >&2; return 1; }
+  local dir
+  dir="$(dirname "$1")"
+  mkdir -p "$dir"
+  ATOMIC_TMP="$(mktemp "$dir/.tmp.XXXXXX")"
+  printf '%s\n' "$2" >"$ATOMIC_TMP"
+  mv -f "$ATOMIC_TMP" "$1"
+  ATOMIC_TMP=""
+}
+
+reg_file() { printf '%s/%s.json' "$REG" "$1"; }
+state_file() { printf '%s/%s.json' "$STATE" "$1"; }
+
+# reg_read <lane>: print the entry; exit 1 when missing, 2 when not a valid registry object.
+reg_read() {
+  local f
+  f="$(reg_file "$1")"
+  [[ -f "$f" ]] || return 1
+  jq -ce 'select(type == "object" and (.lane | type == "string") and has("session_id"))' "$f" 2>/dev/null || return 2
+}
+
+# state_read <lane>: the lane's activity and handshake record, or {} when missing or unreadable.
+state_read() {
+  local f
+  f="$(state_file "$1")"
+  [[ -f "$f" ]] && jq -ce 'select(type == "object")' "$f" 2>/dev/null || echo '{}'
+}
+
+# state_update <lane> <jq filter> [jq args...]: read, apply, write under the caller's mutex; a failed jq writes nothing.
+state_update() {
+  local lane="$1" filter="$2" cur out
+  shift 2
+  cur="$(state_read "$lane")"
+  out="$(jq -c "$@" "$filter" <<<"$cur")" || { echo "lanes: state update for '$lane' failed: left as it was" >&2; return 1; }
+  write_atomic "$(state_file "$lane")" "$out"
+}
+
+# reg_update <lane> <jq filter> [jq args...]: same for a registry entry that must already be valid.
+reg_update() {
+  local lane="$1" filter="$2" cur out
+  shift 2
+  cur="$(reg_read "$lane")" || return 1
+  out="$(jq -c --arg now "$(iso_now)" "$@" "$filter | .updated_at = \$now" <<<"$cur")" ||
+    { echo "lanes: registry update for '$lane' failed: left as it was" >&2; return 1; }
+  write_atomic "$(reg_file "$lane")" "$out"
+}
+
+# The activity of a lane from its state record, one definition for status and for clear: busy, busy-expired (no Stop
+# within LANES_BUSY_TTL, as after an interrupt), background, idle, or unknown (no hook seen yet).
+ACTIVITY_JQ='def activity($now; $ttl): if has("busy") | not then "unknown"
+  elif .busy and (.busy_since // 0) < $now - $ttl then "busy-expired"
+  elif .busy then "busy" elif (.background // 0) > 0 then "background" else "idle" end;'
+activity_of() { jq -r --argjson now "$(now)" --argjson ttl "$BUSY_TTL" "$ACTIVITY_JQ"' activity($now; $ttl)' <<<"$1"; }
+
+config_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE/config.json" 2>/dev/null || true; }
+
+threshold() {
+  local t="${LANES_THRESHOLD:-$(config_get threshold)}"
+  int_in_range "$t" 1 100 || t=70
+  echo "$t"
+}
+
+journal_dir() {
+  local d="${LANES_JOURNAL_DIR:-$(config_get journal_dir)}"
+  echo "${d:-.lanes}"
+}
+
+# journal_root <cwd>: an absolute journal_dir as is, else relative to the git top level of cwd (or cwd itself).
+journal_root() {
+  local jd top
+  jd="$(journal_dir)"
+  if [[ "$jd" == /* ]]; then
+    echo "$jd"
+    return
+  fi
+  top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo "$1")"
+  echo "$top/$jd"
+}
+
+resume_path() { printf '%s/next-%s.md' "$(journal_root "$2")" "$1"; }
+
+# ---- RESUME block ------------------------------------------------------------------------------------------------
+
+# resume_block <file>: the text between the markers; exit 1 when the file or a marker is missing.
+resume_block() {
+  [[ -f "$1" ]] || return 1
+  grep -qxF "$RESUME_START" "$1" && grep -qxF "$RESUME_END" "$1" || return 1
+  awk -v s="$RESUME_START" -v e="$RESUME_END" '$0 == e {on = 0} on {print} $0 == s {on = 1}' "$1"
+}
+
+# section_text <block> <heading>: the non-empty, non-comment lines under `### <heading>`.
+section_text() {
+  awk -v h="### $2" '
+    /^### / {on = ($0 == h); next}
+    on && /^[[:space:]]*<!--.*-->[[:space:]]*$/ {next}
+    on && NF {print}
+  ' <<<"$1"
+}
+
+# goal_problem <text>: why the text cannot be typed as `/goal <text>`, or nothing.
+goal_problem() {
+  if [[ -z "$1" ]]; then
+    echo "is empty"
+  elif [[ "$1" == *$'\n'* ]]; then
+    echo "must be one line (it is typed as /goal, and a newline would submit it early)"
+  elif [[ "$1" == *[[:cntrl:]]* ]]; then
+    echo "holds a control character"
+  elif (($(char_count "$1") > GOAL_CAP)); then
+    echo "is over $GOAL_CAP characters, the /goal limit"
+  fi
+}
+
+# resume_problems <block>: one line per problem; empty output means the block is usable.
+resume_problems() {
+  local block="$1" sec prob n
+  n="$(char_count "$block")"
+  if ((n > RESUME_CAP)); then
+    echo "RESUME block is $n characters, over the $RESUME_CAP cap: link to files instead of copying them"
+  fi
+  for sec in "${REQUIRED_SECTIONS[@]}"; do
+    grep -qxF "### $sec" <<<"$block" || echo "RESUME block has no '### $sec' section"
+  done
+  [[ -n "$(section_text "$block" "Next step")" ]] || echo "RESUME 'Next step' is empty"
+  prob="$(goal_problem "$(section_text "$block" "Goal")")"
+  [[ -z "$prob" ]] || echo "RESUME 'Goal' $prob"
+}
+
+# ---- lookups -----------------------------------------------------------------------------------------------------
+
+each_lane() {
+  local f
+  for f in "$REG"/*.json; do
+    [[ -e "$f" ]] || continue
+    f="${f##*/}"
+    echo "${f%.json}"
+  done
+}
+
+# Session index: $DATA/sessions/<session_id> holds the lane name, because only SessionStart and UserPromptSubmit carry
+# session_title. A session id becomes a file name, so only a plain one is indexed.
+valid_sid() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+
+# lane_for_session <session_id> [title]: the lane whose registry entry holds this session id. The registry decides,
+# so an index file left by a cleared session never resolves.
+lane_for_session() {
+  local sid="$1" title="${2:-}" lane="" e
+  valid_sid "$sid" || return 1
+  if [[ -n "$title" ]] && valid_lane "$title"; then
+    lane="$title"
+  else
+    lane="$(head -n 1 "$DATA/sessions/$sid" 2>/dev/null || true)"
+  fi
+  valid_lane "$lane" && e="$(reg_read "$lane")" && [[ "$(jq -r .session_id <<<"$e")" == "$sid" ]] || return 1
+  echo "$lane"
+}
+
+lane_for_pane() {
+  local lane e
+  [[ -n "${1:-}" ]] || return 1
+  while IFS= read -r lane; do
+    e="$(reg_read "$lane")" || continue
+    [[ "$(jq -r '.tmux_pane // ""' <<<"$e")" == "$1" ]] && { echo "$lane"; return 0; }
+  done < <(each_lane)
+  return 1
+}
+
+# caller_lane: the registered lane of the pane this command runs in, or nothing.
+caller_lane() { lane_for_pane "${TMUX_PANE:-}" || true; }
+
+pane_exists() { [[ -n "$1" ]] && [[ "$(tm display -p -t "$1" '#{pane_id}' 2>/dev/null)" == "$1" ]]; }
+pane_command() { tm display -p -t "$1" '#{pane_current_command}' 2>/dev/null; }
+pane_runs_claude() { pane_exists "$1" && [[ "$(pane_command "$1")" == "$CLAUDE_COMMAND" ]]; }
+# pane_identity <pane>: "<tmux server pid> <pane pid>", or nothing when the pane cannot be read.
+pane_identity() { tm display -p -t "$1" '#{pid} #{pane_pid}' 2>/dev/null; }
+
+# ---- hooks -------------------------------------------------------------------------------------------------------
+
+NOTICES=()
+notice() {
+  echo "lanes: $1" >&2
+  NOTICES+=("lanes: $1")
+}
+
+# hook_emit [additional context]: the one JSON object a SessionStart hook prints; nothing when there is nothing to say.
+hook_emit() {
+  local ctx="${1:-}" msg=""
+  ((${#NOTICES[@]})) && msg="$(printf '%s\n' "${NOTICES[@]}")"
+  [[ -z "$ctx" && -z "$msg" ]] && return 0
+  jq -nc --arg ctx "$ctx" --arg msg "$msg" '
+    (if $msg != "" then {systemMessage: $msg} else {} end)
+    + (if $ctx != "" then {hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}} else {} end)'
+}
+
+refresh_statusline_link() {
+  local root="$1" tmp
+  [[ -x "$root/bin/lanes-statusline" ]] || return 0
+  mkdir -p "$DATA"
+  tmp="$DATA/.lanes-statusline.$$"
+  ln -sf "$root/bin/lanes-statusline" "$tmp" && mv -f "$tmp" "$DATA/lanes-statusline"
+}
+
+record_config() {
+  local t="${CLAUDE_PLUGIN_OPTION_THRESHOLD:-}" j="${CLAUDE_PLUGIN_OPTION_JOURNAL_DIR:-}" cur
+  [[ -z "$t" && -z "$j" ]] && return 0
+  if [[ -n "$t" ]] && ! int_in_range "$t" 1 100; then
+    notice "threshold option '$t' is not a whole number from 1 to 100: using 70"
+    t=70
+  fi
+  cur="$(jq -ce 'select(type == "object")' "$STATE/config.json" 2>/dev/null || echo '{}')"
+  write_atomic "$STATE/config.json" "$(jq -c --arg t "$t" --arg j "$j" \
+    '(if $t != "" then .threshold = ($t | tonumber) else . end) | (if $j != "" then .journal_dir = $j else . end)' <<<"$cur")"
+}
+
+# who <lane> <role>: how SessionStart names the session to the model, since the model cannot see LANES_ROLE.
+who() { if [[ "$2" == lead ]]; then printf 'you are the lead "%s"' "$1"; else printf 'you are lane "%s"' "$1"; fi; }
+
+# resume_context <lane> <role> <dir>: what SessionStart(clear) injects, never over the hook cap: the whole text is
+# counted, and past the cap the lane is pointed at the file instead.
+resume_context() {
+  local lane="$1" role="$2" dir="$3" file block problems text n me
+  me="$(who "$lane" "$role")"
+  file="$(resume_path "$lane" "$dir")"
+  if ! block="$(resume_block "$file")"; then
+    printf 'lanes: %s, just cleared. No RESUME block was found at %s. Ask the lead for your next step before you change anything.' "$me" "$file"
+    return
+  fi
+  n="$(char_count "$block")"
+  if ((n > RESUME_CAP)); then
+    printf 'lanes: %s, just cleared. Your RESUME block at %s is %s characters, over the %s cap, so it was not injected. Read that file now, then shorten the block.' "$me" "$file" "$n" "$RESUME_CAP"
+    return
+  fi
+  problems="$(resume_problems "$block")"
+  text="$(printf 'lanes: %s, just cleared by the lanes handshake. Your RESUME block from %s is below; it is your state. The rules are in %s/RULES.md.\n\n%s\n\nStart with the Next step.' \
+    "$me" "$file" "$(journal_root "$dir")" "$block")"
+  [[ -n "$problems" ]] && text+="$(printf '\nThe block has problems: %s' "$(tr '\n' ';' <<<"$problems")")"
+  n="$(char_count "$text")"
+  if ((n > HOOK_CAP)); then
+    printf 'lanes: %s, just cleared. Your RESUME block at %s, with its wrapper, is %s characters, over the %s-character hook cap, so it was not injected. Read that file now.' "$me" "$file" "$n" "$HOOK_CAP"
+    return
+  fi
+  printf '%s' "$text"
+}
+
+# gc_sessions: remove index files whose lane's registry entry names another session, or that name no lane.
+gc_sessions() {
+  local f lane
+  for f in "$DATA/sessions"/*; do
+    [[ -e "$f" ]] || continue
+    lane="$(head -n 1 "$f" 2>/dev/null || true)"
+    valid_lane "$lane" && [[ "$(reg_read "$lane" | jq -r .session_id 2>/dev/null)" == "${f##*/}" ]] && continue
+    rm -f "$f"
+  done
+}
+
+# release_pane <lane> <pane>: a pane runs one session, so any other lane entry naming it loses it (and clear-ready).
+release_pane() {
+  local other
+  [[ -n "$2" ]] || return 0
+  while IFS= read -r other; do
+    [[ "$other" != "$1" && "$(reg_read "$other" | jq -r '.tmux_pane // ""' 2>/dev/null)" == "$2" ]] || continue
+    reg_update "$other" '.tmux_pane = null | .clear_ready = false'
+    notice "pane $2 was registered to lane '$other', which now has no pane"
+  done < <(each_lane)
+}
+
+cmd_register() {
+  local input lane sid cwd src pane role existing old_pane old_sid ctx="" fresh wt down ids f=()
+  input="$(cat || true)"
+  mapfile -t f < <(jq -r 'if type == "object" then (.session_title // ""), (.session_id // ""), (.cwd // ""), (.source // "")
+    else empty end' 2>/dev/null <<<"$input")
+  if ((${#f[@]} != 4)); then
+    notice "hook input is not a JSON object: nothing registered"
+    hook_emit
+    return 0
+  fi
+  lane="${f[0]}" sid="${f[1]}" cwd="${f[2]}" src="${f[3]}" pane="${TMUX_PANE:-}"
+  [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]] && refresh_statusline_link "$CLAUDE_PLUGIN_ROOT"
+  mutex_take 5 || { notice "registry is locked by another lanes process: not registered this time"; hook_emit; return 0; }
+  record_config
+  if [[ -z "$lane" ]]; then
+    notice "no session_title in the hook input: start every session as 'claude --name <lane>' so it can be a lane"
+    hook_emit
+    return 0
+  fi
+  if ! valid_lane "$lane"; then
+    notice "lane name '$lane' is not usable: use letters, digits, dot, dash and underscore (rename with /rename)"
+    hook_emit
+    return 0
+  fi
+  [[ -z "$pane" ]] && notice "TMUX_PANE is not set: lane '$lane' is registered without a pane, so 'lanes clear' cannot reach it; run it inside tmux"
+  existing=""
+  if existing="$(reg_read "$lane")"; then
+    :
+  elif [[ $? -eq 2 ]]; then
+    notice "registry entry for '$lane' was corrupt and has been replaced"
+    existing=""
+  fi
+  role="lane" old_pane="" old_sid=""
+  if [[ -n "$existing" ]]; then
+    mapfile -t f < <(jq -r '(.tmux_pane // ""), (.session_id // ""), (.role // "lane")' <<<"$existing")
+    old_pane="${f[0]}" old_sid="${f[1]}" role="${f[2]}"
+    if [[ "$old_sid" != "$sid" && -n "$old_pane" && "$old_pane" != "$pane" ]] && pane_runs_claude "$old_pane"; then
+      notice "lane name '$lane' is already in use by pane $old_pane: this session was not registered; restart it with another --name"
+      hook_emit
+      return 0
+    fi
+  fi
+  case "${LANES_ROLE:-}" in lead | lane) role="$LANES_ROLE" ;; esac
+  fresh=1
+  [[ -n "$existing" && "$old_sid" == "$sid" ]] && fresh=0
+  # The pane's identity beside its id: the tmux server pid and the pane's own pid (pane_owner_problem compares them).
+  ids="$( [[ -n "$pane" ]] && pane_identity "$pane" || true)"
+  write_atomic "$(reg_file "$lane")" "$(jq -nc --argjson old "${existing:-null}" --arg lane "$lane" --arg sid "$sid" \
+    --arg role "$role" --arg pane "$pane" --arg cwd "$cwd" --arg now "$(iso_now)" --argjson fresh "$fresh" --arg ids "$ids" '
+    ($ids | split(" ") | map(tonumber? // null)) as $id
+    | {lane: $lane, session_id: $sid, role: $role, tmux_pane: (if $pane == "" then null else $pane end),
+     tmux_pid: $id[0], pane_pid: $id[1], cwd: $cwd,
+     used_pct: (if $fresh == 1 then null else $old.used_pct end),
+     clear_ready: (if $fresh == 1 then false else ($old.clear_ready // false) end), updated_at: $now}')"
+  release_pane "$lane" "$pane"
+  valid_sid "$sid" && write_atomic "$DATA/sessions/$sid" "$lane"
+  gc_sessions
+  if ((fresh)); then
+    # A new session has no /goal: startup has none, and /clear removes one (code.claude.com/docs/en/goal).
+    state_update "$lane" '
+      (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid
+       then .handshake.state = "cleared" | .handshake.cleared_at = $now | .handshake.cleared_session = $sid else . end)
+      | .session_id = $sid | .busy = false | .background = 0 | .prompts = 0 | .stops = 0
+      | .last_command = null | .goal = null | .pct_at = null' --arg sid "$sid" --argjson now "$(now)"
+  fi
+  # RESUME is read from the work tree clear-ready proved, which can differ from the session's start directory.
+  wt="$(state_read "$lane" | jq -r '.handshake.worktree // ""')"
+  mutex_drop
+  if [[ "$src" == clear ]]; then
+    ctx="$(resume_context "$lane" "$role" "${wt:-$cwd}")"
+  else
+    ctx="lanes: $(who "$lane" "$role"); follow the ${role} skill."
+  fi
+  # The lead re-arms the watchers that ran here before and are down; the model reads this, not the systemMessage.
+  if [[ "$role" == lead ]]; then
+    down="$(monitors_down)"
+    [[ -z "$down" ]] || ctx+="${ctx:+$'\n\n'}lanes: watchers not running: $down. Start each from skills/lead/MONITORS.md (a running one refuses a second start)."
+  fi
+  hook_emit "$ctx"
+}
+
+# cmd_hook prompt|stop|ask: UserPromptSubmit and Stop keep the busy flag (idle never comes from screen text), and
+# PreToolUse(AskUserQuestion) refuses while away mode is on. They print nothing else, since prompt stdout reaches the
+# model. jq reads the input once from stdin: a prompt can be far larger than a command-line argument may be.
+cmd_hook() {
+  local kind="${1:-}" lane f=()
+  case "$kind" in ask | prompt | stop) ;; *) usage ;; esac
+  mapfile -t f < <(jq -r '
+    def clears: test("^/goal +(clear|stop|off|reset|none|cancel) *$");
+    if type == "object" then (.session_id // ""), (.session_title // ""), (.cwd // ""),
+      ((.prompt // "") as $p | {
+        cmd: (if $p | startswith("/") then $p[0:200] else null end),
+        no_turn: (($p | test("^/goal *$")) or ($p | clears)), clears: ($p | clears),
+        goal: (if ($p | startswith("/goal ")) and (($p | clears) | not) and ($p | length) <= 6 + $cap then $p[6:] else null end)
+      } | tojson),
+      ((.background_tasks // []) | if type == "array" then length else 0 end)
+    else empty end' --argjson cap "$GOAL_CAP" 2>/dev/null)
+  ((${#f[@]} == 5)) || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
+  if [[ "$kind" == ask ]]; then
+    [[ -f "$STATE/away.json" ]] || return 0
+    jq -nc --arg m "$(journal_root "${f[2]:-$PWD}")/morning.md" '{hookSpecificOutput: {hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: ("lanes away mode is on: the human is away, so ask nothing now. Add the question to " + $m
+        + " (one question, its facts and costs, your recommended option marked) and continue with other work. Only the human'"'"'s own message lifts away mode (lanes away off).")}}'
+    return 0
+  fi
+  lane="$(lane_for_session "${f[0]}" "${f[1]}")" || return 0
+  mutex_take 3 || { echo "lanes: registry locked: busy flag for '$lane' not updated" >&2; return 0; }
+  if [[ "$kind" == prompt ]]; then
+    # `/goal` alone and `/goal clear` (with its aliases) start no turn, so no Stop would ever end a busy flag set here.
+    state_update "$lane" '.session_id = $sid | .last_command = $p.cmd | .activity_at = $now
+      | if $p.no_turn then (if $p.clears then .goal = null else . end)
+        else .busy = true | .busy_since = $now | .prompts = ((.prompts // 0) + 1)
+          | (if $p.goal != null then .goal = $p.goal else . end) end' \
+      --arg sid "${f[0]}" --argjson p "${f[3]}" --argjson now "$(now)"
+  else
+    state_update "$lane" '.busy = false | .stops = ((.stops // 0) + 1) | .activity_at = $now | .background = $bg' \
+      --argjson bg "${f[4]}" --argjson now "$(now)"
+  fi
+  return 0
+}
+
+# ---- status line -------------------------------------------------------------------------------------------------
+
+# cmd_statusline: record used_pct for the session that owns the lane, then print one line. Never fails, never waits
+# long: Claude Code cancels a running status line when the next update arrives, and the write is a temp file + mv.
+cmd_statusline() {
+  local input lane sid pct line
+  input="$(cat 2>/dev/null || true)"
+  lane="$(jq -r '.session_name // ""' <<<"$input" 2>/dev/null || true)"
+  sid="$(jq -r '.session_id // ""' <<<"$input" 2>/dev/null || true)"
+  pct="$(jq -r '.context_window.used_percentage // "null" | if type == "number" then floor else "null" end' <<<"$input" 2>/dev/null || echo null)"
+  [[ "$pct" =~ ^[0-9]+$ ]] || pct=null
+  if [[ -n "$lane" ]] && valid_lane "$lane"; then
+    (
+      trap on_exit EXIT # a subshell resets traps, and a cancelled status line must not leave a temp file
+      trap 'exit 143' TERM INT
+      e="$(reg_read "$lane")" || exit 0
+      [[ "$(jq -r .session_id <<<"$e")" == "$sid" ]] || exit 0
+      mutex_take 1 || exit 0
+      reg_update "$lane" '.used_pct = $pct' --argjson pct "$pct"
+      state_update "$lane" '.pct_at = $now' --argjson now "$(now)"
+      mutex_drop
+    ) 2>/dev/null || true
+  fi
+  line="lanes ${lane:-?} ctx ${pct/null/?}%"
+  [[ "$pct" != null ]] && ((pct >= $(threshold))) && line+=" at threshold"
+  printf '%s\n' "$line"
+  return 0
+}
+
+# ---- status ------------------------------------------------------------------------------------------------------
+
+# lane_view <lane>: one JSON object with everything status reports, the three-state context % included.
+lane_view() {
+  local lane="$1" e st pane alive=false n
+  n="$(now)"
+  if ! e="$(reg_read "$lane")"; then
+    jq -nc --arg l "$lane" '{lane: $l, error: "corrupt registry entry"}'
+    return
+  fi
+  st="$(state_read "$lane")"
+  pane="$(jq -r '.tmux_pane // ""' <<<"$e")"
+  pane_exists "$pane" && alive=true
+  jq -nc --argjson e "$e" --argjson s "$st" --argjson now "$n" --argjson thr "$(threshold)" --argjson alive "$alive" \
+    --argjson ttl "$BUSY_TTL" --argjson stale "$PCT_STALE" --argjson rto "$REQUEST_TIMEOUT" "$ACTIVITY_JQ"'
+    ($s.handshake // {}) as $h
+    | {lane: $e.lane, role: $e.role, pane: $e.tmux_pane, pane_alive: $alive, used_pct: $e.used_pct,
+       ctx: (if $e.used_pct == null then "unknown"
+             elif ($s.pct_at // 0) < $now - $stale then "stale"
+             else "fresh" end),
+       at_threshold: ($e.used_pct != null and $e.used_pct >= $thr),
+       activity: ($s | activity($now; $ttl)),
+       clear_ready: $e.clear_ready,
+       handshake: (if $h.state == "requested" and ($h.requested_at // 0) < $now - $rto then "request-timed-out"
+                   else ($h.state // "none") end)}'
+}
+
+cmd_status() {
+  local json=0 lane rows=() thr
+  [[ "${1:-}" == "--json" ]] && json=1
+  while IFS= read -r lane; do rows+=("$(lane_view "$lane")"); done < <(each_lane)
+  if ((json)); then
+    printf '%s\n' "${rows[@]+"${rows[@]}"}" | jq -s .
+    return 0
+  fi
+  thr="$(threshold)"
+  if ((${#rows[@]} == 0)); then
+    echo "lanes: no lanes registered in $REG (start each session as 'claude --name <lane>' inside tmux)"
+    return 0
+  fi
+  printf 'threshold %s%%\n' "$thr"
+  printf '%s\n' "${rows[@]}" | jq -r '
+    if .error then "\(.lane)\tERROR: \(.error)"
+    else [.lane, .role, (.pane // "no-pane") + (if .pane_alive then "" else "(gone)" end),
+          (if .used_pct == null then "ctx unknown" else "ctx \(.used_pct)%" + (if .ctx == "stale" then " stale" else "" end) end)
+            + (if .at_threshold then " AT-THRESHOLD" else "" end),
+          .activity, (if .clear_ready then "clear-ready" else "-" end), "handshake " + .handshake] | join("\t") end'
+}
+
+# ---- away mode, init ---------------------------------------------------------------------------------------------
+
+# cmd_away: the record names who set it (the caller's lane, from its pane) and when; only the human lifts it.
+cmd_away() {
+  local by
+  case "${1:-status}" in
+    on)
+      by="$(caller_lane)"
+      write_atomic "$STATE/away.json" "$(jq -nc --arg t "$(iso_now)" --arg by "${by:-outside a lane pane}" '{away: true, since: $t, set_by: $by}')"
+      echo "away mode on: the ask tool is refused; questions go to the morning list"
+      ;;
+    off) rm -f "$STATE/away.json" && echo "away mode off" ;;
+    status)
+      if [[ -f "$STATE/away.json" ]]; then
+        jq -r '"away mode on since \(.since), set by \(.set_by // "an unknown caller")"' "$STATE/away.json"
+      else
+        echo "away mode off"
+      fi
+      ;;
+    *) usage ;;
+  esac
+}
+
+cmd_init() {
+  local claude_md="" root tpl dest f lane jd import created=() kept=() block cmd
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --claude-md) claude_md="${2:-}"; shift 2 ;;
+      -*) usage ;;
+      *) break ;;
+    esac
+  done
+  root="$(plugin_root)"
+  tpl="$root/templates/journal"
+  [[ -d "$tpl" ]] || die "template folder $tpl is missing" "reinstall the lanes plugin"
+  dest="$(journal_root "$PWD")"
+  mkdir -p "$dest"
+  for f in README.md RULES.md tracker.md morning.md; do
+    if [[ -e "$dest/$f" ]]; then kept+=("$f"); else cp "$tpl/$f" "$dest/$f"; created+=("$f"); fi
+  done
+  for lane in "$@"; do
+    valid_lane "$lane" || die "invalid lane '$lane'" "use letters, digits, dot, dash and underscore" 2
+    for f in next "done"; do
+      if [[ -e "$dest/$f-$lane.md" ]]; then kept+=("$f-$lane.md"); else
+        sed "s/<lane>/$lane/g" "$tpl/$f-lane.md" >"$dest/$f-$lane.md"
+        created+=("$f-$lane.md")
+      fi
+    done
+  done
+  echo "journal: $dest"
+  ((${#created[@]})) && echo "  wrote: ${created[*]}"
+  ((${#kept[@]})) && echo "  kept (already there): ${kept[*]}"
+
+  refresh_statusline_link "$root"
+  cmd="\"$DATA/lanes-statusline\""
+  [[ -n "${LANES_DATA_DIR:-}" ]] && cmd="LANES_DATA_DIR=\"$LANES_DATA_DIR\" $cmd"
+  block="$(jq -n --arg c "$cmd" '{statusLine: {type: "command", command: $c, refreshInterval: 30}}')"
+  echo
+  echo "status line: a plugin cannot set it, so add this to your settings.json (it records each lane's context %):"
+  echo "$block"
+
+  jd="$(journal_dir)"
+  import="@$jd/RULES.md"
+  local top
+  top="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  echo
+  if [[ -f "$top/CLAUDE.md" ]] && grep -qxF "$import" "$top/CLAUDE.md"; then
+    echo "CLAUDE.md already imports $import"
+    return 0
+  fi
+  if [[ -z "$claude_md" && -t 0 ]]; then
+    printf 'Add the line %s to %s/CLAUDE.md so every session loads the lanes rules? [y/N] ' "$import" "$top"
+    read -r claude_md || claude_md=""
+  fi
+  case "$claude_md" in
+    y | Y | yes)
+      printf '\n%s\n' "$import" >>"$top/CLAUDE.md"
+      echo "added $import to $top/CLAUDE.md"
+      ;;
+    n | N | no) echo "CLAUDE.md not changed" ;;
+    "") echo "CLAUDE.md not changed: a plugin's own CLAUDE.md is not loaded, so the rules need '$import' in $top/CLAUDE.md; run 'lanes init --claude-md yes' to add it, or '--claude-md no' to skip" ;;
+    *) die "--claude-md '$claude_md'" "answer yes or no" 2 ;;
+  esac
+}
+
+# shellcheck source-path=SCRIPTDIR source=../lib/handshake.bash
+source "$(plugin_root)/lib/handshake.bash"
+# shellcheck source-path=SCRIPTDIR source=../lib/monitor.bash
+source "$(plugin_root)/lib/monitor.bash"
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  register) cmd_register ;;
+  hook) shift; cmd_hook "$@" ;;
+  statusline) cmd_statusline ;;
+  status) shift; cmd_status "$@" ;;
+  request) shift; cmd_request "$@" ;;
+  clear-ready) shift; cmd_clear_ready "$@" ;;
+  clear) shift; cmd_clear "$@" ;;
+  goal) shift; cmd_goal "$@" ;;
+  away) shift; cmd_away "$@" ;;
+  journal-dir) journal_root "$PWD" ;;
+  monitor-lock) shift; cmd_monitor_lock "$@" ;;
+  monitor-diff) shift; cmd_monitor_diff "$@" ;;
+  *) usage ;;
+esac

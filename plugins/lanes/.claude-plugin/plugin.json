@@ -1,0 +1,26 @@
+{
+  "name": "lanes",
+  "version": "0.1.0",
+  "description": "Run a lead session and lane sessions in tmux: a journal carries state, and a lane at its context threshold is cleared through a handshake and resumes from its RESUME block.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["tmux", "sessions", "handoff", "context", "journal", "workflow"],
+  "userConfig": {
+    "threshold": {
+      "type": "number",
+      "title": "Clear threshold (% of context)",
+      "description": "At or above this context use, the lead asks a lane to write its RESUME block and report clear-ready.",
+      "default": 70,
+      "min": 1,
+      "max": 100
+    },
+    "journal_dir": {
+      "type": "string",
+      "title": "Journal folder",
+      "description": "Where the journal lives, relative to the repository root or absolute (for a journal on its own branch or worktree).",
+      "default": ".lanes"
+    }
+  }
+}
