@@ -64,6 +64,21 @@ windows_job() { awk '/^  windows:/{f=1;next} f&&/^  [a-z]/{f=0} f' "$CI"; }
   [[ "$output" != *"every action is pinned"* ]]
 }
 
+@test "test.sh fails a test that runs past the per-test time limit instead of hanging" {
+  local suite="$BATS_TEST_TMPDIR/hang-suite"
+  mkdir -p "$suite"
+  printf '#!/usr/bin/env bats\n@test "hangs" { sleep 30; }\n' > "$suite/a.bats"
+  SECONDS=0
+  BATS_TEST_TIMEOUT=2 run "$BATS_TEST_DIRNAME/../../scripts/test.sh" "$suite"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"timeout"* ]] || { echo "$output" >&2; false; }
+  [ "$SECONDS" -lt 25 ]
+}
+
+@test "test.sh sets a per-test time limit by default" {
+  grep -q 'BATS_TEST_TIMEOUT:-' "$BATS_TEST_DIRNAME/../../scripts/test.sh"
+}
+
 @test "test.sh given a missing suite directory fails and names it" {
   run "$BATS_TEST_DIRNAME/../../scripts/test.sh" "$BATS_TEST_TMPDIR/no-such-suite"
   [ "$status" -ne 0 ]
