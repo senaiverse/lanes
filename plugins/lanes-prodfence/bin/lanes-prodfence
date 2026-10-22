@@ -57,12 +57,35 @@ clean_marker() {
   trim "$m"
 }
 
+# jq_text <jq arguments>: jq's text output without carriage returns, keeping jq's exit status. A native jq.exe under Git
+# Bash writes CRLF (jq manual, --binary), and a trailing CR would make "Edit" or a path compare unequal.
+jq_text() {
+  local out
+  out="$(jq "$@")" || return
+  printf '%s\n' "${out//$'\r'/}"
+}
+
+# to_posix <path>: a Windows path (C:\x, C:/x or \\host\share), as Claude Code on Windows sends it, in the POSIX form the
+# shell's file tests and the project root use; any other path unchanged. Without cygpath it cannot be read: exit 2.
+to_posix() {
+  case "$1" in
+    [A-Za-z]:[\\/]* | \\\\*)
+      command -v cygpath >/dev/null 2>&1 \
+        || { echo "$ME: a Windows path needs cygpath (Git Bash) to be checked: refusing the call: $REPORT" >&2; exit 2; }
+      cygpath -u -- "$1"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 INPUT="$(</dev/stdin)"
 CWD="$PWD"
 if [ "$HAVE_JQ" -eq 1 ]; then
-  in_cwd="$(jq -r 'if type == "object" and (.cwd | type) == "string" then .cwd else empty end' <<<"$INPUT" 2>/dev/null || true)"
+  in_cwd="$(jq_text -r 'if type == "object" and (.cwd | type) == "string" then .cwd else empty end' <<<"$INPUT" 2>/dev/null || true)"
+  in_cwd="$(to_posix "$in_cwd")"
   case "$in_cwd" in /*) CWD="$in_cwd" ;; esac
 fi
+[ -z "${CLAUDE_PROJECT_DIR:-}" ] || CLAUDE_PROJECT_DIR="$(to_posix "$CLAUDE_PROJECT_DIR")"
 
 # The project root holding .lanes/prodfence.md: CLAUDE_PROJECT_DIR first, then upward from the session cwd.
 # A dangling symlink counts as present, so a config on an unmounted volume fails closed instead of turning the fence off.
@@ -93,7 +116,7 @@ split_list() {
   SPLIT=()
   v="$(trim "$1")"
   if [[ $v == '['* ]]; then
-    v="$(jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a list of strings") end' <<<"$v" 2>/dev/null)" \
+    v="$(jq_text -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a list of strings") end' <<<"$v" 2>/dev/null)" \
       || broken "a markers or protected_paths value starting with [ is not a JSON array of strings" "write it as a list separated by ';'"
   else
     v="${v//;/$'\n'}"
@@ -219,7 +242,7 @@ fi
 
 load_config || exit 0
 
-TOOL="$(jq -er 'if type == "object" and (.tool_name | type) == "string" and (.tool_input | type) == "object" then .tool_name else error("bad") end' <<<"$INPUT" 2>/dev/null)" \
+TOOL="$(jq_text -er 'if type == "object" and (.tool_name | type) == "string" and (.tool_input | type) == "object" then .tool_name else error("bad") end' <<<"$INPUT" 2>/dev/null)" \
   || { echo "$ME: the hook input is not a PreToolUse object with tool_name and tool_input: refusing the call: $REPORT" >&2; exit 2; }
 
 deny() {
@@ -231,7 +254,8 @@ deny() {
 # first_hit <needle>...: prints the first field whose text contains a needle, ignoring ASCII case, or nothing. The whole
 # serialized input is the last field, so a needle in a key still matches; a field name holding a needle reads tool_input.
 first_hit() {
-  LANES_PRODFENCE_NEEDLES="$(printf '%s\n' "$@")" jq -r '
+  # shellcheck disable=SC2016  # the single-quoted text is a jq program, not shell
+  LANES_PRODFENCE_NEEDLES="$(printf '%s\n' "$@")" jq_text -r '
     (env.LANES_PRODFENCE_NEEDLES | split("\n") | map(select(length > 0) | ascii_downcase)) as $ns
     | def hit: ascii_downcase as $v | any($ns[]; . as $n | $v | contains($n));
     ([{f: "tool_name", v: .tool_name}]
@@ -302,6 +326,7 @@ real_globs() {
       tail="${g:${#head}}"
     fi
     [ -n "$head" ] || continue
+    head="$(to_posix "$head")"
     [[ $head == /* ]] || head="$ROOT/$head"
     head="$(canon "$head")"
     REAL_HEADS+=("${head%/}${tail:+/}")
@@ -340,11 +365,12 @@ protected() {
 case "$TOOL" in
   Read | Edit | Write | NotebookEdit)
     # One jq call prints "<field>=<path>"; the field name holds no "=", so the first "=" splits them.
-    target="$(jq -r '.tool_input | if (.file_path | type) == "string" then "file_path=\(.file_path)" elif (.notebook_path | type) == "string" then "notebook_path=\(.notebook_path)" else empty end' <<<"$INPUT")"
+    target="$(jq_text -r '.tool_input | if (.file_path | type) == "string" then "file_path=\(.file_path)" elif (.notebook_path | type) == "string" then "notebook_path=\(.notebook_path)" else empty end' <<<"$INPUT")"
     [ -n "$target" ] || { echo "$ME: $TOOL input has no file_path: refusing the call: $REPORT" >&2; exit 2; }
+    path="$(to_posix "${target#*=}")"
     REAL_ROOT="$(canon "$ROOT")"
     real_globs
-    if protected "${target#*=}"; then deny "protected path" "tool_input.${target%%=*}"; fi
+    if protected "$path"; then deny "protected path" "tool_input.${target%%=*}"; fi
     # The path is always matched against markers; the content written or replaced only with fence_file_content on.
     [ "$FILE_CONTENT" = on ] \
       || INPUT="$(jq -c '.tool_input |= with_entries(select(.key == "file_path" or .key == "notebook_path"))' <<<"$INPUT")"

@@ -17,6 +17,8 @@ setup() {
   mkdir -p "$PROJ/.lanes" "$PROJ/src"
   export CLAUDE_PROJECT_DIR="$PROJ"
   unset CLAUDE_PLUGIN_OPTION_MARKERS CLAUDE_PLUGIN_OPTION_PROTECTED_PATHS
+  # Git Bash's ln -s copies by default; real symlinks are what the symlink tests need, and ln fails loudly without them.
+  export MSYS="winsymlinks:nativestrict${MSYS:+ $MSYS}"
   cd "$PROJ"
 }
 
@@ -235,24 +237,28 @@ refute_leaks() {
   assert_failure 2
   [[ "$stderr" == *"markers_file markers.txt"* ]]
   [[ "$stderr" != *"$LANES_TEST_TMP/private"* ]] || { echo "full markers_file path shown: $stderr" >&2; false; }
-  [ "$(id -u)" -ne 0 ] || skip "root reads a mode-000 file"
   mkdir -p "${private%/*}"
-  printf '%s\n' "$MARKER" >"$private"
-  chmod 000 "$private"
-  guard "$(bash_input "ls")"
-  assert_failure 2
-  chmod 600 "$private"
   : >"$private"
   config "markers_file: $private" "## Markers" "- $PROJECT_MARKER"
   guard "$(bash_input "ls")"
   assert_failure 2
   [[ "$stderr" == *"lists no markers"* ]]
+  printf '%s\n' "$MARKER" >"$private"
+  chmod 000 "$private"
+  [ ! -r "$private" ] || skip "mode 000 does not deny reads here (root, or NTFS under Git Bash); the missing file above covers the same refusal"
+  guard "$(bash_input "ls")"
+  assert_failure 2
 }
 
 @test "without jq a configured fence refuses with exit 2 and an unconfigured one passes" {
   local nojq="$LANES_TEST_TMP/nojq"
   mkdir -p "$nojq"
   ln -s "$(command -v bash)" "$nojq/bash"
+  # Under Git Bash, bash.exe needs its msys DLLs from its own directory; elsewhere this glob matches nothing.
+  local dll
+  for dll in "$(dirname "$(command -v bash)")"/msys-*.dll; do
+    [ ! -e "$dll" ] || ln -s "$dll" "$nojq/"
+  done
   default_config
   run --separate-stderr env PATH="$nojq" "$BIN" guard <<<'{"tool_name":"Bash","tool_input":{"command":"ls"}}'
   assert_failure 2
@@ -344,7 +350,8 @@ refute_leaks() {
 }
 
 @test "a config symlink whose target is gone refuses instead of turning the fence off" {
-  ln -s "$LANES_TEST_TMP/unmounted/prodfence.md" "$PROJ/.lanes/prodfence.md"
+  ln -s "$LANES_TEST_TMP/unmounted/prodfence.md" "$PROJ/.lanes/prodfence.md" \
+    || skip "this filesystem cannot hold a symlink to a missing target, so a dangling config cannot occur here"
   guard "$(bash_input "ls")"
   assert_failure 2
   [[ "$stderr" == *"cannot read"* ]]
@@ -444,7 +451,8 @@ edit_of() {
   default_config
   guard "$(edit_of "$ops/prod/app.yaml")"
   assert_denied
-  guard "$(bash_input "cat $ops/prod/app.yaml")"
+  # A command is matched as text, so it is refused when it names the real path (macOS: /private/tmp, not /tmp).
+  guard "$(bash_input "cat $(cd -P "$ops" && pwd -P)/prod/app.yaml")"
   assert_denied
   guard "$(edit_of "$ops/staging.yaml")"
   assert_allowed
@@ -542,6 +550,77 @@ edit_of() {
   run --separate-stderr "$BIN" nope
   assert_failure 2
   [[ "$stderr" == *"usage"* ]]
+}
+
+# win_setup: under Git Bash the real cygpath converts paths; elsewhere a stand-in cygpath maps C:\<p> or C:/<p> back to
+# /<p>, so the Windows path handling runs on every OS. win_path <posix path> prints the path as Windows writes it.
+win_setup() {
+  WIN_FAKE=0
+  command -v cygpath >/dev/null 2>&1 && return
+  WIN_FAKE=1
+  mkdir -p "$LANES_TEST_TMP/winbin"
+  # shellcheck disable=SC2016  # the stand-in's body is written literally
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '[ "$1" = -u ] && [ "$2" = -- ] || { echo "stand-in cygpath: unexpected arguments $*" >&2; exit 9; }' \
+    'p="${3//\\//}"; printf "%s\n" "${p#[A-Za-z]:}"' >"$LANES_TEST_TMP/winbin/cygpath"
+  chmod +x "$LANES_TEST_TMP/winbin/cygpath"
+  export PATH="$LANES_TEST_TMP/winbin:$PATH"
+}
+
+win_path() {
+  if [ "$WIN_FAKE" -eq 0 ]; then cygpath -w "$1"; else local p="${1//\//\\}"; printf 'C:%s\n' "$p"; fi
+}
+
+@test "Windows paths in the hook input and CLAUDE_PROJECT_DIR are read in their POSIX form" {
+  default_config
+  win_setup
+  local f
+  f="$(win_path "$PROJ/src/.env.production")"
+  guard "$(hook_input Write "$(jq -cn --arg f "$f" '{file_path: $f, content: ""}')")"
+  assert_denied
+  guard "$(hook_input Write "$(jq -cn --arg f "${f//\\//}" '{file_path: $f, content: ""}')")"
+  assert_denied
+  export CLAUDE_PROJECT_DIR
+  CLAUDE_PROJECT_DIR="$(win_path "$PROJ")"
+  cd "$LANES_TEST_TMP"
+  guard "$(edit_of "$(win_path "$PROJ/deploy/prod/app.yaml")")"
+  assert_denied
+  guard "$(edit_of "$(win_path "$PROJ/src/app.ts")")"
+  assert_allowed
+  f="$(win_path "$PROJ")"
+  config "protected_paths: ${f//\\//}/deploy/prod/*" "## Markers" "- $MARKER"
+  guard "$(edit_of "$PROJ/deploy/prod/app.yaml")"
+  assert_denied
+  unset CLAUDE_PROJECT_DIR
+  guard "$(jq -cn --arg cwd "$(win_path "$PROJ/src")" --arg c "ping $MARKER" \
+    '{cwd: $cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: $c}}')"
+  assert_denied
+}
+
+@test "a Windows path without cygpath to convert it refuses with exit 2" {
+  command -v cygpath >/dev/null 2>&1 && skip "cygpath is on PATH (Git Bash); the conversion itself is tested above"
+  default_config
+  guard "$(edit_of 'C:\proj\deploy\prod\app.yaml')"
+  assert_failure 2
+  [[ "$stderr" == *"a Windows path needs cygpath"* ]] || { echo "said: $stderr" >&2; false; }
+}
+
+@test "jq output with CRLF line ends, as a native jq.exe under Git Bash writes it, is read the same" {
+  default_config
+  local fake="$LANES_TEST_TMP/crlfbin" real
+  real="$(command -v jq)"
+  mkdir -p "$fake"
+  printf '#!/usr/bin/env bash\nset -o pipefail\n%q "$@" | awk '"'"'{ printf "%%s\\r\\n", $0 }'"'"'\n' "$real" >"$fake/jq"
+  chmod +x "$fake/jq"
+  [ "$(printf '"x"' | "$fake/jq" -r . | od -An -c | tr -d ' ')" = 'x\r\n' ]
+  local call
+  for call in "$(hook_input Write "$(jq -cn --arg f "$PROJ/src/.env.production" '{file_path: $f, content: ""}')")" \
+    "$(edit_of "$PROJ/deploy/prod/app.yaml")" "$(bash_input "cat .env.production")" "$(bash_input "ping $MARKER")"; do
+    run --separate-stderr env PATH="$fake:$PATH" "$BIN" guard <<<"$call"
+    assert_denied
+  done
+  run --separate-stderr env PATH="$fake:$PATH" "$BIN" guard <<<"$(bash_input "ls")"
+  assert_allowed
 }
 
 @test "every refusal the skill quotes is what the guard prints, with <field> standing for the field" {

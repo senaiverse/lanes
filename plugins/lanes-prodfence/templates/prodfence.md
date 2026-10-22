@@ -21,6 +21,7 @@ protected_paths: deploy/production/*; infra/prod/*.tf; .env.production
   path as given or its real path (symlinks and `..` resolved), absolute or below the project root, and a glob without
   `/` also matches the file name. A glob's directory is resolved too, so a glob written through a symlink, or naming a
   symlinked directory, also matches the real path. `*` matches across `/`, and case is ignored on every filesystem.
+  Under Git Bash an absolute glob may start with a drive (`C:/repo/deploy/*`); write it with `/`, not `\`.
 
 The plugin's userConfig options `markers` and `protected_paths` add to these, as lists separated by `;` (a comma in
 `markers` is refused, because it is not a separator).
