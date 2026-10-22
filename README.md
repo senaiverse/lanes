@@ -1,5 +1,11 @@
 # lanes
 
+[![ci](https://github.com/senaiverse/lanes/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/senaiverse/lanes/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-d9a441.svg)](https://code.claude.com/docs/en/plugins)
+
+![Illustration: a lead hands work to three lanes; when lane-api reaches 70% context it writes a RESUME note, is cleared, and resumes from the note while the others keep building](assets/how-it-works.svg)
+
 One AI session plans. Several others build in parallel. When a builder's memory fills up, it writes a note, gets
 wiped, and carries on from that note.
 
@@ -103,7 +109,9 @@ lanes gives AI sessions that same routine.
 **Honest limits:**
 
 - **tmux only.** lanes sends `/clear` and the goal to a session by typing into its tmux pane.
-- **Linux, macOS and WSL.** Native Windows is out of scope. On Windows, use WSL.
+- **Linux, macOS and WSL.** On native Windows, only `lanes-plancheck` is supported, through Git Bash (Git for
+  Windows), which is what Claude Code uses to run hooks there. CI runs its suite on Windows. Everything that needs tmux
+  needs WSL on Windows.
 - **Bash 4+ and jq.** Every script runs on Bash and jq only. macOS ships Bash 3.2, so run `brew install bash` first.
 - **The guards are mistake guards, not a sandbox.** They refuse a lane that runs a lead-only command, and they say
   why. A determined session can still reach around them. The reviewer agent is instructed not to edit, and it is not
@@ -137,8 +145,8 @@ The feature request for a context-threshold handoff in Claude Code itself
 ([anthropics/claude-code#50978](https://github.com/anthropics/claude-code/issues/50978)) was closed by the stale
 bot, not by a maintainer. lanes works with today's Claude Code and needs no change in it.
 
-What lanes will not do: sandbox a session, guard against destructive commands, support native Windows, or clear a
-lane without the handshake.
+What lanes will not do: sandbox a session, guard against destructive commands, run its tmux plugins on native
+Windows, or clear a lane without the handshake.
 
 ## Install
 
@@ -204,7 +212,8 @@ wire two things yourself.
   version first and stops with a one-line message if it is too old.
 - **git**, and `gh` if you use `lanes-waves`, `lanes-ci` or `lanes-review` with pull requests.
 - **Claude Code 2.1.224 or later.**
-- Linux, macOS, or WSL. No native Windows.
+- Linux, macOS, or WSL. On native Windows, only `lanes-plancheck`, through Git for Windows (its Git Bash ships Bash
+  5 and jq).
 
 </details>
 

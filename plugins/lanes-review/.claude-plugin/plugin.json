@@ -1,0 +1,10 @@
+{
+  "name": "lanes-review",
+  "version": "0.1.0",
+  "description": "An adversarial reviewer agent for a branch range or a pull request, instructed not to edit; not sandboxed.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["review", "agent", "workflow"]
+}

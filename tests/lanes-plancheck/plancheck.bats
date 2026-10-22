@@ -170,6 +170,8 @@ without() {
 @test "the checker finds the template when run through a symlink" {
   mkdir -p linkbin
   ln -s "$BIN" linkbin/lanes-plancheck
+  # Git Bash copies instead of linking unless native symlinks are enabled; then there is no symlink to resolve.
+  [ -L linkbin/lanes-plancheck ] || skip "this system cannot create a real symlink"
   write_plan plan.md "${DEFAULTS[@]}"
   run linkbin/lanes-plancheck plan.md
   [ "$status" -eq 0 ]
