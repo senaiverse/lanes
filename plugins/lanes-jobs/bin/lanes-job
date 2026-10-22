@@ -73,12 +73,18 @@ mutex_acquire() {
   trap mutex_release EXIT
 }
 
-# mutex_break <owner read>: breakers of one mutex instance serialize on an atomic mkdir of a marker named for the
-# owner they read, inside that instance, and the winner breaks it only if the instance still names that owner. So a
-# waiter holding a stale reading never moves aside a newer instance that a live process now owns.
+# mutex_break <owner read>: breakers of one mutex instance serialize on a marker inside it, named for the owner they
+# read and created atomically as a symlink to the breaker's pid; the winner breaks the instance only if it still names
+# that owner, so a stale reading never moves a newer instance aside. A marker whose breaker died is superseded by the
+# next generation (.1, .2, ...), which only one breaker can create, so a crash between marker and move never wedges it.
 mutex_break() {
+  local marker="$MUTEX_DIR/break.${1//[^0-9]/_}" gen=0 breaker
   test_hook before-break
-  mkdir "$MUTEX_DIR/break.${1//[^0-9]/_}" 2>/dev/null || return 0
+  until ln -s "$$" "$marker.$gen" 2>/dev/null; do
+    breaker="$(readlink "$marker.$gen" 2>/dev/null || true)"
+    [[ -n "$breaker" ]] && ! pid_alive "$breaker" || return 0
+    gen=$((gen + 1))
+  done
   [[ "$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)" == "$1" ]] || return 0
   test_hook before-move
   mv "$MUTEX_DIR" "$MUTEX_DIR.stale.$$"

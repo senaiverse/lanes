@@ -213,7 +213,8 @@ load helper
 }
 
 @test "missing tmux is a clear error" {
-  run env PATH=/nonexistent /bin/bash "$JOB" run x -- true
+  # The suite's own Bash runs the script: macOS /bin/bash is 3.2, which stops at the Bash 4 guard before tmux is checked.
+  run env PATH=/nonexistent "$BASH" "$JOB" run x -- true
   [ "$status" -ne 0 ]
   [[ "$output" == *"lanes-job:"*"tmux"* ]]
 }
@@ -297,11 +298,7 @@ race_six() {
 
 @test "mkdir mutex left by a dead owner is broken and released afterwards" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
-  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
-  sleep 0.01 &
-  dead=$!
-  wait "$dead"
-  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  mutex_of_dead_owner
   run "$JOB" slot acquire p --pid $$
   [ "$status" -eq 0 ]
   [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
@@ -310,11 +307,7 @@ race_six() {
 @test "two waiters that read the same dead mkdir-mutex owner never both hold the mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
-  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
-  sleep 0.01 &
-  dead=$!
-  wait "$dead"
-  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  mutex_of_dead_owner
   # Waiter B pauses after reading the dead owner; waiter A then breaks the mutex and holds it inside fake tmux.
   write_hook '[ "$1" = before-break ] && [ ! -e "$HOOK_DIR/a.pid" ] || exit 0
 LANES_TEST_HOOK= "$JOB" run a -- true >"$HOOK_DIR/a.out" 2>&1 &
@@ -337,11 +330,7 @@ exit 1'
 @test "two breakers of one dead mkdir-mutex owner never both hold the mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
-  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
-  sleep 0.01 &
-  dead=$!
-  wait "$dead"
-  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  mutex_of_dead_owner
   # Breaker B pauses after its own check of the dead owner, just before the move; breaker C runs meanwhile.
   write_hook '[ "$1" = before-move ] && [ ! -e "$HOOK_DIR/c.pid" ] || exit 0
 LANES_TEST_HOOK= "$JOB" run c -- true >"$HOOK_DIR/c.out" 2>&1 &
@@ -358,6 +347,57 @@ exit 1'
   [ "$status" -eq 0 ]
   [ ! -e "$WORK/inside" ]
   [[ "$(cat "$WORK/c.out")" == *"lanes-job:"*"mutex"* ]]
+}
+
+@test "a breaker killed between its marker and the move does not wedge the mkdir mutex" {
+  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
+  mutex_of_dead_owner
+  breaker_killed_before_move
+  run "$JOB" slot acquire p --pid $$
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$LANES_DATA_DIR/locks/p-1.lock")" = "$$" ]
+  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+}
+
+@test "two breakers that take over a dead breaker's marker never both hold the mutex" {
+  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+  fake_tmux hold
+  mutex_of_dead_owner
+  breaker_killed_before_move
+  # Breaker C takes over the dead breaker's marker and pauses just before the move; breaker D runs meanwhile.
+  write_hook '[ "$1" = before-move ] && [ ! -e "$HOOK_DIR/d.pid" ] || exit 0
+LANES_TEST_HOOK= "$JOB" run d -- true >"$HOOK_DIR/d.out" 2>&1 &
+d=$!
+echo "$d" >"$HOOK_DIR/d.pid"
+for _ in $(seq 200); do { [ -e "$HOOK_DIR/inside" ] || ! kill -0 "$d" 2>/dev/null; } && exit 0; sleep 0.05; done
+exit 1'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" slot acquire p --pid $$
+  unset LANES_TEST_HOOK
+  touch "$WORK/go"
+  [ -e "$WORK/d.pid" ]
+  [ "$status" -eq 0 ]
+  [ ! -e "$WORK/inside" ]
+  [[ "$(cat "$WORK/d.out")" == *"lanes-job:"*"mutex"* ]]
+}
+
+# mutex_of_dead_owner: a mkdir mutex whose owner pid has exited.
+mutex_of_dead_owner() {
+  local dead
+  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
+  sleep 0.01 &
+  dead=$!
+  wait "$dead"
+  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+}
+
+# breaker_killed_before_move: a breaker dies by SIGKILL after taking its marker and before moving the mutex aside.
+breaker_killed_before_move() {
+  write_hook '[ "$1" = before-move ] || exit 0
+kill -9 "$PPID"'
+  LANES_TEST_HOOK="$WORK/hook" run "$JOB" slot acquire p --pid $$
+  [ "$status" -eq 137 ]
+  [ -d "$LANES_DATA_DIR/locks/.mutex.d" ]
 }
 
 # fake_tmux <mode>: a tmux on PATH that behaves per mode (see the script).
