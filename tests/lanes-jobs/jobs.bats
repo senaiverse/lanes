@@ -169,7 +169,7 @@ load helper
   [ "$output" = "1" ]
 }
 
-@test "the mkdir mutex fallback behaves the same when flock is unavailable" {
+@test "the symlink mutex fallback behaves the same when flock is unavailable" {
   export LANES_NO_FLOCK=1 LANES_POOL_SIZE=1
   "$JOB" run first -- sleep 60
   run "$JOB" run second -- true
@@ -178,7 +178,7 @@ load helper
   "$JOB" wait first --timeout 20
   run "$JOB" run third -- true
   [ "$status" -eq 0 ]
-  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ ! -L "$LANES_DATA_DIR/locks/.mutex.owner" ]
 }
 
 @test "a duplicate running name is refused" {
@@ -278,33 +278,33 @@ race_six() {
   race_six
 }
 
-@test "six concurrent runs against a pool of two start exactly two (mkdir fallback)" {
+@test "six concurrent runs against a pool of two start exactly two (symlink fallback)" {
   export LANES_NO_FLOCK=1
   race_six
 }
 
-@test "mkdir mutex held by a live owner is not broken, and the wait fails loudly" {
+@test "symlink mutex held by a live owner is not broken, and the wait fails loudly" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
-  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
+  mkdir -p "$LANES_DATA_DIR/locks"
   sleep 30 &
   owner=$!
-  echo "$owner" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  ln -s "$owner" "$LANES_DATA_DIR/locks/.mutex.owner"
   run "$JOB" slot acquire p --pid $$
   kill "$owner"
   [ "$status" -ne 0 ]
   [[ "$output" == *"lanes-job:"*"mutex"* ]]
-  [ -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ "$(readlink "$LANES_DATA_DIR/locks/.mutex.owner")" = "$owner" ]
 }
 
-@test "mkdir mutex left by a dead owner is broken and released afterwards" {
+@test "symlink mutex left by a dead owner is broken and released afterwards" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
   mutex_of_dead_owner
   run "$JOB" slot acquire p --pid $$
   [ "$status" -eq 0 ]
-  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ -z "$(ls -A "$LANES_DATA_DIR/locks" | grep '^\.mutex')" ]
 }
 
-@test "two waiters that read the same dead mkdir-mutex owner never both hold the mutex" {
+@test "two waiters that read the same dead symlink-mutex owner never both hold the mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
@@ -318,21 +318,21 @@ exit 1'
   run "$JOB" slot acquire p --pid $$
   unset LANES_TEST_HOOK
   [ -e "$WORK/inside" ]
-  [ "$(cat "$LANES_DATA_DIR/locks/.mutex.d/owner")" = "$(cat "$WORK/a.pid")" ]
+  [ "$(readlink "$LANES_DATA_DIR/locks/.mutex.owner")" = "$(cat "$WORK/a.pid")" ]
   [ "$status" -ne 0 ]
   [[ "$output" == *"lanes-job:"*"mutex"* ]]
   [ ! -e "$LANES_DATA_DIR/locks/p-1.lock" ]
   touch "$WORK/go"
   wait_for 10 bash -c '! kill -0 "$1" 2>/dev/null' _ "$(cat "$WORK/a.pid")"
-  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ ! -L "$LANES_DATA_DIR/locks/.mutex.owner" ]
 }
 
-@test "two breakers of one dead mkdir-mutex owner never both hold the mutex" {
+@test "two breakers of one dead symlink-mutex owner never both hold the mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
-  # Breaker B pauses after its own check of the dead owner, just before the move; breaker C runs meanwhile.
-  write_hook '[ "$1" = before-move ] && [ ! -e "$HOOK_DIR/c.pid" ] || exit 0
+  # Breaker B pauses after its own check of the dead owner, just before the removal; breaker C runs meanwhile.
+  write_hook '[ "$1" = before-remove ] && [ ! -e "$HOOK_DIR/c.pid" ] || exit 0
 LANES_TEST_HOOK= "$JOB" run c -- true >"$HOOK_DIR/c.out" 2>&1 &
 c=$!
 echo "$c" >"$HOOK_DIR/c.pid"
@@ -349,23 +349,23 @@ exit 1'
   [[ "$(cat "$WORK/c.out")" == *"lanes-job:"*"mutex"* ]]
 }
 
-@test "a breaker killed between its marker and the move does not wedge the mkdir mutex" {
+@test "a breaker killed between its marker and the removal does not wedge the symlink mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1
   mutex_of_dead_owner
-  breaker_killed_before_move
+  breaker_killed_before_remove
   run "$JOB" slot acquire p --pid $$
   [ "$status" -eq 0 ]
   [ "$(readlink "$LANES_DATA_DIR/locks/p-1.lock")" = "$$" ]
-  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ -z "$(ls -A "$LANES_DATA_DIR/locks" | grep '^\.mutex')" ]
 }
 
 @test "two breakers that take over a dead breaker's marker never both hold the mutex" {
   export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
   fake_tmux hold
   mutex_of_dead_owner
-  breaker_killed_before_move
-  # Breaker C takes over the dead breaker's marker and pauses just before the move; breaker D runs meanwhile.
-  write_hook '[ "$1" = before-move ] && [ ! -e "$HOOK_DIR/d.pid" ] || exit 0
+  breaker_killed_before_remove
+  # Breaker C takes over the dead breaker's marker and pauses just before the removal; breaker D runs meanwhile.
+  write_hook '[ "$1" = before-remove ] && [ ! -e "$HOOK_DIR/d.pid" ] || exit 0
 LANES_TEST_HOOK= "$JOB" run d -- true >"$HOOK_DIR/d.out" 2>&1 &
 d=$!
 echo "$d" >"$HOOK_DIR/d.pid"
@@ -381,23 +381,44 @@ exit 1'
   [[ "$(cat "$WORK/d.out")" == *"lanes-job:"*"mutex"* ]]
 }
 
-# mutex_of_dead_owner: a mkdir mutex whose owner pid has exited.
+@test "a live holder that has just taken the fallback mutex is never broken by a waiter that reaches its timeout" {
+  sleep 30 &
+  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB KEEPER=$!
+  # Holder H pauses as soon as it has the mutex; waiter W runs its whole timeout meanwhile, wanting a slot for KEEPER.
+  write_hook '[ "$1" = after-acquire ] && [ ! -e "$HOOK_DIR/w.pid" ] || exit 0
+LANES_TEST_HOOK= "$JOB" slot acquire p --pid "$KEEPER" >"$HOOK_DIR/w.out" 2>&1 &
+w=$!
+echo "$w" >"$HOOK_DIR/w.pid"
+wait "$w"
+echo "$?" >"$HOOK_DIR/w.status"'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" slot acquire p --pid $$
+  unset LANES_TEST_HOOK
+  kill "$KEEPER"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$WORK/w.status")" -ne 0 ]
+  [[ "$(cat "$WORK/w.out")" == *"lanes-job:"*"mutex"* ]]
+  [ "$(readlink "$LANES_DATA_DIR/locks/p-1.lock")" = "$$" ]
+  [ ! -e "$LANES_DATA_DIR/locks/p-2.lock" ]
+}
+
+# mutex_of_dead_owner: a fallback mutex whose owner pid has exited.
 mutex_of_dead_owner() {
   local dead
-  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
+  mkdir -p "$LANES_DATA_DIR/locks"
   sleep 0.01 &
   dead=$!
   wait "$dead"
-  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  ln -s "$dead" "$LANES_DATA_DIR/locks/.mutex.owner"
 }
 
-# breaker_killed_before_move: a breaker dies by SIGKILL after taking its marker and before moving the mutex aside.
-breaker_killed_before_move() {
-  write_hook '[ "$1" = before-move ] || exit 0
+# breaker_killed_before_remove: a breaker dies by SIGKILL after taking its marker and before removing the mutex.
+breaker_killed_before_remove() {
+  write_hook '[ "$1" = before-remove ] || exit 0
 kill -9 "$PPID"'
   LANES_TEST_HOOK="$WORK/hook" run "$JOB" slot acquire p --pid $$
   [ "$status" -eq 137 ]
-  [ -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+  [ -L "$LANES_DATA_DIR/locks/.mutex.owner" ]
 }
 
 # fake_tmux <mode>: a tmux on PATH that behaves per mode (see the script).
@@ -417,7 +438,7 @@ case "$FAKE_TMUX_MODE" in
     exit 0 ;;
 esac
 [[ "$args" == *" has-session "* ]] && { [ "$FAKE_TMUX_MODE" = window ] && exit 0; exit 1; }
-if [ "$FAKE_TMUX_MODE" = steal ]; then echo 999999 >"$LANES_DATA_DIR/locks/.mutex.d/owner"; fi
+if [ "$FAKE_TMUX_MODE" = steal ]; then ln -sfn 999999 "$LANES_DATA_DIR/locks/.mutex.owner"; fi
 exit 1
 FAKE
   chmod +x "$WORK/bin/tmux"
@@ -454,7 +475,7 @@ kill -9 "$PPID"'
   launcher_killed_after_window
 }
 
-@test "a launcher killed right after it opens the window leaves the job owned by its live runner (mkdir fallback)" {
+@test "a launcher killed right after it opens the window leaves the job owned by its live runner (symlink fallback)" {
   export LANES_NO_FLOCK=1
   launcher_killed_after_window
 }
@@ -521,8 +542,7 @@ live_windows() {
   fake_tmux steal
   run "$JOB" run stolen -- true
   [ "$status" -ne 0 ]
-  [ -d "$LANES_DATA_DIR/locks/.mutex.d" ]
-  [ "$(cat "$LANES_DATA_DIR/locks/.mutex.d/owner")" = "999999" ]
+  [ "$(readlink "$LANES_DATA_DIR/locks/.mutex.owner")" = "999999" ]
 }
 
 @test "a failed session start leaves no job directory and no slot" {

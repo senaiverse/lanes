@@ -42,61 +42,61 @@ tm() {
   tmux -L "${LANES_TMUX_SOCKET:-lanes}" "$@" 9>&-
 }
 
-# A short mutex around every lock decision. flock releases it if we die. The mkdir fallback (no flock on stock macOS,
-# or LANES_NO_FLOCK set by tests) records its owner pid: a waiter breaks it only when that owner is dead (or, after the
-# timeout, left no pid), and the holder frees it only while it is still the owner.
+# A short mutex around every lock decision; flock releases it if we die. The fallback (no flock on stock macOS, or
+# LANES_NO_FLOCK set by tests) is a symlink to its owner's pid, created in one call like the slot locks, so it never
+# exists without an owner: a waiter breaks it only when that owner is dead, and the holder frees it only while it
+# still points to the holder. It has its own name, because the flock path opens .mutex as a regular file.
 MUTEX_HELD=0
-MUTEX_DIR=""
+MUTEX_LINK=""
 mutex_acquire() {
   mkdir -p "$DATA/locks"
   if [[ -z "${LANES_NO_FLOCK:-}" ]] && command -v flock >/dev/null 2>&1; then
     exec 9>"$DATA/locks/.mutex"
     flock -w "$MUTEX_TIMEOUT" 9 || die "could not take the lock mutex" "another lanes-job is stuck; retry"
   else
-    MUTEX_DIR="$DATA/locks/.mutex.d"
+    MUTEX_LINK="$DATA/locks/.mutex.owner"
     local waited=0 limit=$((MUTEX_TIMEOUT * 10)) holder
-    until mkdir "$MUTEX_DIR" 2>/dev/null; do
-      holder="$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)"
+    until ln -s "$$" "$MUTEX_LINK" 2>/dev/null; do
+      holder="$(readlink "$MUTEX_LINK" 2>/dev/null || true)"
       if ((waited > limit)); then
-        die "could not take the lock mutex (owner pid ${holder:-unknown})" "if no lanes-job is running, remove $MUTEX_DIR"
+        die "could not take the lock mutex (owner pid ${holder:-unknown})" "if no lanes-job is running, remove $MUTEX_LINK"
       elif [[ -n "$holder" ]] && ! pid_alive "$holder"; then
         mutex_break "$holder"
-      elif [[ -z "$holder" ]] && ((waited == limit)); then
-        mutex_break ""
       fi
       waited=$((waited + 1))
       sleep 0.1
     done
-    echo "$$" >"$MUTEX_DIR/owner"
   fi
   MUTEX_HELD=1
   trap mutex_release EXIT
+  test_hook after-acquire
 }
 
-# mutex_break <owner read>: breakers of one mutex instance serialize on a marker inside it, named for the owner they
-# read and created atomically as a symlink to the breaker's pid; the winner breaks the instance only if it still names
-# that owner, so a stale reading never moves a newer instance aside. A marker whose breaker died is superseded by the
-# next generation (.1, .2, ...), which only one breaker can create, so a crash between marker and move never wedges it.
+# mutex_break <owner read>: breakers of one dead owner serialize on a marker named for it, a symlink to the breaker's
+# pid; a marker whose breaker died is superseded by the next generation (.1, .2, ...), which only one breaker can
+# create. The winner removes the mutex only if it still names that owner, so a stale reading never frees a newer one.
 mutex_break() {
-  local marker="$MUTEX_DIR/break.${1//[^0-9]/_}" gen=0 breaker
+  local marker="$MUTEX_LINK.break.${1//[^0-9]/_}" gen=0 breaker
   test_hook before-break
   until ln -s "$$" "$marker.$gen" 2>/dev/null; do
     breaker="$(readlink "$marker.$gen" 2>/dev/null || true)"
     [[ -n "$breaker" ]] && ! pid_alive "$breaker" || return 0
     gen=$((gen + 1))
   done
-  [[ "$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)" == "$1" ]] || return 0
-  test_hook before-move
-  mv "$MUTEX_DIR" "$MUTEX_DIR.stale.$$"
-  rm -rf "$MUTEX_DIR.stale.$$"
+  if [[ "$(readlink "$MUTEX_LINK" 2>/dev/null || true)" == "$1" ]]; then
+    test_hook before-remove
+    rm -f "$MUTEX_LINK"
+  fi
+  # Every marker for this owner is now spent: lower generations name dead breakers, and none can win a recheck again.
+  rm -f "$marker".*
 }
 
 mutex_release() {
   ((MUTEX_HELD)) || return 0
   MUTEX_HELD=0
   exec 9>&-
-  if [[ -n "$MUTEX_DIR" && "$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)" == "$$" ]]; then
-    rm -rf "$MUTEX_DIR"
+  if [[ -n "$MUTEX_LINK" && "$(readlink "$MUTEX_LINK" 2>/dev/null || true)" == "$$" ]]; then
+    rm -f "$MUTEX_LINK"
   fi
 }
 

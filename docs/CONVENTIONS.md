@@ -30,8 +30,9 @@
   (M0 Q5). Skills and agents call the bare name.
 - Slot locks: `$DATA/locks/<pool>-<i>.lock`, a symlink whose target is the holder's pid. Creating it is atomic, and a
   dead holder's lock is replaced on the next acquire. A slot outlives one process (separate `acquire` and `release`
-  calls), which a flock cannot express. A short `flock` mutex guards each lock decision. On macOS without `flock`, an
-  atomic `mkdir` mutex with an owner-pid file stands in.
+  calls), which a flock cannot express. A short `flock` mutex guards each lock decision. On macOS without `flock`, a
+  mutex symlink `$DATA/locks/.mutex.owner` → holder pid, created with one `ln -s`, stands in, so no mutex exists
+  without its owner.
 
 ## Layout and tests
 

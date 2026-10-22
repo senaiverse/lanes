@@ -34,9 +34,10 @@ lanes-job status <name>               # exit 0 finished, 3 running, 4 lost, 2 un
 lanes-job list
 ```
 
-The Bash tool kills a call after 120 s unless you raise its `timeout` (maximum 600000 ms). Keep the `wait` timeout
-below the tool timeout: either wait in short slices (`--timeout 100`, repeat on exit 124), or set the Bash `timeout`
-above a longer wait (for `--timeout 600`, set `timeout: 600000`).
+The Bash tool kills a call after 120 s unless you raise its `timeout` (maximum 600000 ms). The `wait` timeout must be
+shorter than the tool timeout, so `wait` returns its exit 124 before the tool kills the call: either wait in short
+slices (`--timeout 100`, repeat on exit 124), or raise the Bash `timeout` above a longer wait (`--timeout 590` with
+`timeout: 600000`).
 
 STATUS has four lines: `EXIT:<code>`, `START:`, `END:` and `LOG:<path>`. It is written last, even when the job was
 killed (`EXIT:143` for TERM, `129` for a closed window). `EXIT:0` means the command passed.
