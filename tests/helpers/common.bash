@@ -9,7 +9,8 @@ load "$LANES_TOOLS_DIR/bats-assert/load"
 
 # Call from setup(). Exports LANES_DATA_DIR (temp), LANES_TMUX_SOCKET and an isolated TMUX_TMPDIR.
 lanes_test_setup() {
-  LANES_TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/lanes-test.XXXXXX")"
+  # Under /tmp, not $TMPDIR: macOS's long $TMPDIR pushes the tmux socket path past the 104-byte limit.
+  LANES_TEST_TMP="$(mktemp -d /tmp/lanes-test.XXXXXX)"
   export LANES_DATA_DIR="$LANES_TEST_TMP/data"
   mkdir -p "$LANES_DATA_DIR"
   export TMUX_TMPDIR="$LANES_TEST_TMP/tmux"
