@@ -142,31 +142,35 @@ lane without the handshake.
 
 ## Install
 
-Inside Claude Code:
+This repository is a marketplace named `lanes` that holds several plugins. Inside Claude Code, add the marketplace
+once, then install each plugin you want by its name. The form is `/plugin install <plugin>@<marketplace>`, so the
+core reads `lanes@lanes`. Requirements: tmux, jq and Bash 4+.
 
 ```
 /plugin marketplace add senaiverse/lanes
-/plugin install <name>@lanes
-```
 
-Replace `<name>` with a plugin from the table. Requirements: tmux, jq and Bash 4+.
+# The core: the lead and lane workflow (coming in v0.1)
+/plugin install lanes@lanes
+
+# Optional, pick what you need
+/plugin install lanes-guards@lanes      # lead-only commands and plans; needs the core (coming in v0.1)
+/plugin install lanes-waves@lanes       # release waves; needs the core (coming in v0.1)
+/plugin install lanes-jobs@lanes        # long commands in a tmux job pool; works alone (coming in v0.1)
+/plugin install lanes-review@lanes      # adversarial reviewer agent; works alone (coming in v0.1)
+/plugin install lanes-plancheck@lanes   # plan field checker; works alone (available now)
+```
 
 | Plugin | What it does | Required? | Status |
 |---|---|---|---|
 | `lanes` | The core. The journal template, the clear handshake, the lead and lane skills, session registry, `lanes-statusline`. | Required for the lead and lane workflow | Coming in v0.1 |
-| `lanes-guards` | Three guards: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. | Optional | Coming in v0.1 |
-| `lanes-jobs` | `lanes-job`: run a long command in a pooled tmux window and read the result from a STATUS file. | Optional, works alone | Coming in v0.1 |
+| `lanes-guards` | Three guards: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. | Optional, needs `lanes` | Coming in v0.1 |
 | `lanes-waves` | Release waves: theme branches, one integration branch, review PRs by area, one merge. | Optional, needs `lanes` | Coming in v0.1 |
+| `lanes-jobs` | `lanes-job`: run a long command in a pooled tmux window and read the result from a STATUS file. | Optional, works alone | Coming in v0.1 |
+| `lanes-review` | An adversarial reviewer agent for a branch range or a pull request. Instructed not to edit; not sandboxed. | Optional, works alone | Coming in v0.1 |
 | `lanes-plancheck` | `lanes-plancheck`: checks that a plan file carries its required fields before a lane builds it. | Optional, works alone | Available |
-| `lanes-review` | An adversarial reviewer agent for a branch range or a pull request. Instructed not to edit; not sandboxed. | Optional | Coming in v0.1 |
 | `lanes-ci` | A CI watcher and the journal drift check. | Optional | Planned for v0.1 |
 
-Install `lanes-plancheck` today:
-
-```
-/plugin marketplace add senaiverse/lanes
-/plugin install lanes-plancheck@lanes
-```
+A plugin marked "coming" is not in the marketplace yet, and its install command fails until it lands.
 
 <details>
 <summary>Setup the core needs (v0.1 preview: coming with the <code>lanes</code> plugin)</summary>
