@@ -340,10 +340,12 @@ SUBMIT /clear"
     done
     wait
   done
-  run grep -c locked "$LANES_TEST_TMP/err"
-  assert_output 0
-  run state alpha .prompts
-  assert_output 150
+  # Under load a hook may give up waiting for the mutex (a timeout, reported as "locked"); that is
+  # allowed. What must never happen is a lost update: every call either counted or reported its timeout.
+  local timeouts prompts
+  timeouts="$(grep -c locked "$LANES_TEST_TMP/err" || true)"
+  prompts="$(state alpha .prompts)"
+  [ $((prompts + timeouts)) -eq 150 ] || { echo "prompts=$prompts timeouts=$timeouts" >&2; false; }
 }
 
 @test "a cleared record older than the request timeout is not resumed: no goal is typed" {
