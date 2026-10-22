@@ -1,5 +1,11 @@
 # lanes
 
+[![ci](https://github.com/senaiverse/lanes/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/senaiverse/lanes/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-d9a441.svg)](https://code.claude.com/docs/en/plugins)
+
+![lanes: one lead plans, lanes build in parallel, each clears at its context limit and carries on from its note](assets/social-preview.png)
+
 One AI session plans. Several others build in parallel. When a builder's memory fills up, it writes a note, gets
 wiped, and carries on from that note.
 
