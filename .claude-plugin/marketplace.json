@@ -9,6 +9,11 @@
       "name": "lanes-plancheck",
       "source": "./plugins/lanes-plancheck",
       "description": "Plan field checker (lanes-plancheck)."
+    },
+    {
+      "name": "lanes-prodfence",
+      "source": "./plugins/lanes-prodfence",
+      "description": "Production fence: refuses any tool call that mentions a configured production marker (lanes-prodfence)."
     }
   ]
 }

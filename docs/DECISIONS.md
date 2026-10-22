@@ -26,7 +26,7 @@ Owner grill, 2026-10-22. Each line is a settled decision; change one only with t
 | 3 | Shape | Pieces plus one recipe: every piece works alone, and one lead/lane skill pair composes them. |
 | 4 | Required core | Journal template, the clear handshake, and the lead and lane skills. |
 | 5 | Optional | Job pane pool (STATUS files, slots), release waves, plan checker, CI monitors, local-vs-CI test choice, reviewer agent. |
-| 6 | Guards | Multi-session guards only: only the lead dispatches CI and merges, only the lead sends plan messages, no edits in the main checkout. Destructive-command guarding is left to destructive_command_guard / cc-safety-net (README points there). |
+| 6 | Guards | Multi-session guards only: only the lead dispatches CI and merges, only the lead sends plan messages, no edits in the main checkout. Destructive-command guarding is left to destructive_command_guard / cc-safety-net (README points there). Production is fenced by a separate plugin (row 26). |
 | 7 | Rules shipped | Mechanism rules only. A project's engineering standards stay in that project; one is linked as an example. |
 | 8 | Messaging | Native cross-session messaging (ListAgents/SendMessage, Claude Code ≥ 2.1.224). tmux `send-keys` only for `/clear` and `/goal`, which messages cannot run. |
 | 9 | Clear policy | Handshake. At the threshold the lead asks the lane to write its RESUME block. The lane reports clear-ready when it is idle, clean and pushed, and only then is it cleared. A `SessionStart` hook with the `clear` matcher re-injects RESUME and the goal. |
@@ -46,6 +46,7 @@ Owner grill, 2026-10-22. Each line is a settled decision; change one only with t
 | 24 | Repo and skill style | We adopt recommendations 1-12 of `research/mattpocock-skills-structure.md`, crediting mattpocock/skills (MIT): skill layout, the two description voices, the setup-skill phrasing, the README order, the two install paths, SCOPE.md, CREDITS.md and CHANGELOG.md. |
 | 25 | PR review | Every PR gets the in-repo reviewer agent first, then Greptile through the owner's existing account, until it scores 5/5. The owner merges. |
 | 21 | Plan fields | The plan template in `lanes-plancheck` is the single home of the required plan fields. The checker's default list comes from that template's headings, and skills point to it rather than listing fields. |
+| 26 | Production fence | Production fence: a separate plugin, lanes-prodfence, works alone; every session including the lead is refused any tool call naming a configured production marker; only the human acts on production (owner, 2026-10-22). |
 ## Platform facts this rests on
 
 These were checked against code.claude.com docs on 2026-10-22. They were then verified by experiment on 2.1.308 in
