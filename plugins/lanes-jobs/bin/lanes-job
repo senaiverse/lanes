@@ -3,7 +3,7 @@
 # lanes-job: run long commands in pooled tmux windows and read their result from a STATUS file.
 #   lanes-job run <name> [--slot <pool>] [--env <VAR>]... -- <cmd...>   start a job (exit 75 when the pool is full)
 #   lanes-job status <name>                            exit 0 finished, 3 running, 4 lost, 2 unknown
-#   lanes-job wait <name> [--timeout <seconds>]        block until STATUS exists (exit 124 on timeout)
+#   lanes-job wait <name> [--timeout <seconds>]        prints STATUS; exit 0 finished, 124 timeout, 4 lost, 2 unknown name
 #   lanes-job list                                     every job with its state
 #   lanes-job slot acquire|release <pool> [--pid <n>]  hand-managed pool slots for other scripts
 #   (_claim is internal: run.sh takes over its job's slot and record with it before the command starts.)
@@ -181,11 +181,17 @@ cmd_run() {
   slot="$(slot_take "$pool" "$$")" || die "pool '$pool' is full ($POOL jobs running)" "retry when one ends ('lanes-job list'), or raise LANES_POOL_SIZE" 75
   slot_path="$(lock_path "$pool" "$slot")"
 
+  # The record is built in a staging directory and renamed into place, so a reader never sees it half-written. The dot
+  # keeps it out of 'list', and check_name forbids a leading dot, so it never collides with a job.
+  local stage="$DATA/jobs/.$name.new"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  echo "$$" >"$stage/pid"
+  : >"$stage/log"
+  write_runner "$name" "$pool" "$slot" "$@" >"$stage/run.sh"
+  chmod +x "$stage/run.sh"
   rm -rf "$jobdir"
-  mkdir -p "$jobdir"
-  echo "$$" >"$jobdir/pid"
-  : >"$jobdir/log"
-  write_runner "$name" "$pool" "$slot" "$@"
+  mv "$stage" "$jobdir"
 
   # The window runs with the server's environment, so the caller's directory and PATH are passed in explicitly.
   tm has-session -t "=$SESSION" 2>/dev/null || tm new-session -d -s "$SESSION" -n idle || {
@@ -233,25 +239,24 @@ cmd_claim() {
   mv -f "$jobdir/pid.new" "$jobdir/pid"
 }
 
-# write_runner <name> <pool> <slot> <cmd...>: the pane script. It claims the job first (cmd_claim) and exits if that
-# fails. Its trap writes STATUS even when the job is killed (HUP from a closed window, INT, TERM); only SIGKILL of the
-# runner itself leaves no STATUS, and 'status' then reports LOST because the pid is gone.
+# write_runner <name> <pool> <slot> <cmd...>: prints the pane script. It claims the job first (cmd_claim) and exits if
+# that fails. Its trap writes STATUS even when the job is killed (HUP from a closed window, INT, TERM); only SIGKILL of
+# the runner itself leaves no STATUS, and 'status' then reports LOST because the pid is gone.
 write_runner() {
   local name="$1" pool="$2" slot="$3" jobdir="$DATA/jobs/$1" self v
   shift 3
   # The claim must use this launcher's state directory and mutex kind, which the tmux server's environment may lack.
   if [[ "$0" == */* ]]; then self="$(cd "${0%/*}" && pwd)/${0##*/}"; else self="$PWD/$0"; fi
-  {
-    printf '#!/usr/bin/env bash\nset -u\n'
-    printf 'cd %q || exit 1\nexport PATH=%q\n' "$PWD" "$PATH"
-    printf 'LANES_DATA_DIR=%q LANES_MUTEX_TIMEOUT=%q LANES_NO_FLOCK=%q %q _claim %q %q %q %q "$$" || exit 1\n' \
-      "$DATA" "$MUTEX_TIMEOUT" "${LANES_NO_FLOCK:-}" "$self" "$name" "$pool" "$slot" "$$"
-    for v in ${ENV_NAMES[@]+"${ENV_NAMES[@]}"}; do
-      [[ -z "${!v+x}" ]] || printf 'export %s=%q\n' "$v" "${!v}"
-    done
-    printf 'cmd=(%s)\n' "$(printf '%q ' "$@")"
-    printf 'log=%q status=%q slot=%q\n' "$jobdir/log" "$jobdir/STATUS" "$(lock_path "$pool" "$slot")"
-    cat <<'RUNNER'
+  printf '#!/usr/bin/env bash\nset -u\n'
+  printf 'cd %q || exit 1\nexport PATH=%q\n' "$PWD" "$PATH"
+  printf 'LANES_DATA_DIR=%q LANES_MUTEX_TIMEOUT=%q LANES_NO_FLOCK=%q %q _claim %q %q %q %q "$$" || exit 1\n' \
+    "$DATA" "$MUTEX_TIMEOUT" "${LANES_NO_FLOCK:-}" "$self" "$name" "$pool" "$slot" "$$"
+  for v in ${ENV_NAMES[@]+"${ENV_NAMES[@]}"}; do
+    [[ -z "${!v+x}" ]] || printf 'export %s=%q\n' "$v" "${!v}"
+  done
+  printf 'cmd=(%s)\n' "$(printf '%q ' "$@")"
+  printf 'log=%q status=%q slot=%q\n' "$jobdir/log" "$jobdir/STATUS" "$(lock_path "$pool" "$slot")"
+  cat <<'RUNNER'
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 start="$(now)"
 sig=0
@@ -276,8 +281,6 @@ rm -f "$slot"
 printf 'EXIT:%s\nSTART:%s\nEND:%s\nLOG:%s\n' "$rc" "$start" "$(now)" "$log" >"$status.tmp"
 mv -f "$status.tmp" "$status"
 RUNNER
-  } >"$jobdir/run.sh"
-  chmod +x "$jobdir/run.sh"
 }
 
 cmd_status() {

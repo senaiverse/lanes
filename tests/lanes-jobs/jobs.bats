@@ -62,6 +62,18 @@ load helper
   [[ "$output" == *"lanes-job:"* ]]
 }
 
+@test "a reader never sees a job record that is still being written" {
+  # A mkdir shim asks for the job's status the moment run creates a directory under jobs/, before its files exist.
+  mkdir -p "$WORK/bin"
+  printf '#!/usr/bin/env bash\n%q "$@" || exit\n[[ "$*" != */jobs/* ]] || %q status fresh >>%q 2>&1\nexit 0\n' \
+    "$(command -v mkdir)" "$JOB" "$WORK/seen" >"$WORK/bin/mkdir"
+  chmod +x "$WORK/bin/mkdir"
+  PATH="$WORK/bin:$PATH" "$JOB" run fresh -- true
+  "$JOB" wait fresh --timeout 20
+  [ -s "$WORK/seen" ]
+  [ "$(grep -c LOST "$WORK/seen")" -eq 0 ]
+}
+
 @test "a job whose runner died without a STATUS is reported LOST" {
   mkdir -p "$LANES_DATA_DIR/jobs/ghost"
   sleep 0.01 &
@@ -71,6 +83,20 @@ load helper
   run "$JOB" status ghost
   [ "$status" -eq 4 ]
   [[ "$output" == *"LOST"* ]]
+}
+
+@test "wait exits 4 for a lost job and 2 for an unknown name" {
+  mkdir -p "$LANES_DATA_DIR/jobs/ghost"
+  sleep 0.01 &
+  dead=$!
+  wait "$dead"
+  echo "$dead" >"$LANES_DATA_DIR/jobs/ghost/pid"
+  run "$JOB" wait ghost --timeout 5
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"LOST"* ]]
+  run "$JOB" wait nothing --timeout 5
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"lanes-job:"*"no job named"* ]]
 }
 
 @test "list shows each job with its state" {

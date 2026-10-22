@@ -1,12 +1,16 @@
 ---
 name: jobs
-description: Run long commands (test suites, builds, anything over about 2 minutes) as tmux jobs with lanes-job, and read the result from a STATUS file. Use before starting such a command, or when one is running and you need its result.
+description: Run heavy commands (test suites, builds) as lanes-job jobs that share a machine-wide limit with other sessions, and read the result from a STATUS file. Use before running a test suite, build or other command over about 2 minutes when other lane sessions share the machine; for a single long command with no shared cap, use a native background command.
 ---
 
-# Long commands as jobs
+# Heavy commands as pooled jobs
 
-A command that takes more than about 2 minutes (a test suite, a build, an install, a long script) runs as a job. The job
-outlives your turn, anyone can watch it in tmux, and its result is one small file instead of a log you must read.
+`lanes-job` exists for one thing native background commands cannot do: cap how many heavy jobs run at once across
+every session on the machine, so parallel lanes do not exhaust memory. Each job also outlives your session, shows in
+tmux, and leaves its result in one small STATUS file.
+
+For a single long command that needs no shared cap, run it as a native background command and wait for its
+completion notice. Use `lanes-job` when the work is heavy and other sessions may be running heavy work too.
 
 ## Start
 
@@ -29,7 +33,7 @@ lanes-job run <name> -- <command> [args...]
 ## Get the result
 
 ```bash
-lanes-job wait <name> --timeout 100   # blocks, prints STATUS, exit 0 when finished, 124 on timeout
+lanes-job wait <name> --timeout 100   # prints STATUS; exit 0 finished, 124 timeout, 4 lost, 2 unknown name
 lanes-job status <name>               # exit 0 finished, 3 running, 4 lost, 2 unknown
 lanes-job list
 ```
@@ -44,15 +48,13 @@ killed (`EXIT:143` for TERM, `129` for a closed window). `EXIT:0` means the comm
 
 ## Rules
 
-- Never poll the log with `tail` or `cat` to learn whether the job ended. Use `wait` (or read STATUS once).
-- Read the log only after `EXIT` is not 0, and then only its tail: `tail -n 60 <LOG path>`.
-- A wait that times out does not stop the job. Wait again, or do other work first.
+- Use `wait` (or read STATUS once) to learn whether a job ended; the log tells you only what it printed so far.
+- Read the log's tail only when `EXIT` is not 0: `tail -n 60 <LOG path>`.
+- A wait that times out leaves the job running. Wait again, or do other work first.
 - `LOST` means the job process vanished without a STATUS (SIGKILL, a restart). Start it again.
-- Do not start the same job again to "check" it. Rerunning a finished name overwrites its log and STATUS.
-- Commands under about 2 minutes run in the foreground; a job adds overhead for no gain.
+- Check a running or finished job with `status` or `wait`. Starting a finished name again replaces its log and STATUS.
+- Run commands under about 2 minutes in the foreground; a job adds overhead for no gain.
 
 ## Slots for your own scripts
 
-`lanes-job slot acquire <pool> [--pid <n>]` prints the slot number it took, or exits 75 when the pool is full.
-`lanes-job slot release <pool> [--pid <n>]` frees it, and exits 0 even when that pid holds no slot. The holder is the pid (default: the calling shell); a lock whose
-process is gone is reclaimed by the next caller.
+A script that is not a job can hold a slot in the same pools: see [SLOTS.md](SLOTS.md).
