@@ -1,0 +1,10 @@
+{
+  "name": "lanes-jobs",
+  "version": "0.1.0",
+  "description": "Run long commands in pooled tmux windows and read the result from a STATUS file instead of polling logs.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["tmux", "jobs", "tests", "builds"]
+}

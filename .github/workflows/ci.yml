@@ -25,9 +25,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux jq
 
-      - name: Install tmux, jq, bash and flock (macOS)
+      - name: Install tmux, jq and bash (macOS)
         if: runner.os == 'macOS'
-        run: brew install tmux jq bash flock
+        run: brew install tmux jq bash
 
       - name: Tests (shellcheck and bats)
         run: scripts/test.sh

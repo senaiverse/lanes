@@ -26,12 +26,18 @@
   It is keyed by lane name because `/clear` rotates `session_id`. Every session is launched as `claude --name <lane>`,
   and the lane name is the hook input's `session_title` (`docs/M0-FINDINGS.md` Q2, Q4). The core plugin owns this
   file. Other pieces only read it.
+- The registry also records `tmux_pid` and `pane_pid` at register, so `lanes clear` can prove the pane still holds
+  that session after a tmux or host restart reuses the pane id.
+- Core working state: `$DATA/lanes/state/` holds `<lane>.json` (activity, handshake record), `config.json` (plugin
+  options the hook records for `bin/`, which cannot see userConfig) and `away.json`. `$DATA/monitors/` holds each
+  watcher's single-instance lock and last-seen state. The core plugin owns both.
 - Hook commands call `"${CLAUDE_PLUGIN_ROOT}/bin/<tool>"` by absolute path, because `bin/` is not on PATH for hooks
   (M0 Q5). Skills and agents call the bare name.
 - Slot locks: `$DATA/locks/<pool>-<i>.lock`, a symlink whose target is the holder's pid. Creating it is atomic, and a
   dead holder's lock is replaced on the next acquire. A slot outlives one process (separate `acquire` and `release`
-  calls), which a flock cannot express. A short `flock` mutex guards each lock decision. On macOS without `flock`, an
-  atomic `mkdir` mutex with an owner-pid file stands in.
+  calls), which a flock cannot express. A short mutex guards each lock decision, the same on every platform so every
+  caller excludes every other: a symlink `$DATA/locks/.mutex.owner` → holder pid, created with one `ln -s`, so no
+  mutex exists without its owner, and a waiter breaks it only when that owner is dead.
 
 ## Layout and tests
 
