@@ -30,7 +30,9 @@ find_fields_file() {
   local dir top
   if [ -n "${LANES_PLAN_FIELDS:-}" ]; then printf '%s\n' "$LANES_PLAN_FIELDS"; return; fi
   dir="$(pwd -P)"
+  # Re-read through cd -P so the git root has the same form as `pwd -P`: on Git Bash, git prints C:/... and pwd /c/....
   top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -z "$top" ] || top="$(cd "$top" && pwd -P)"
   while :; do
     if [ -e "$dir/.lanes/plan-fields" ]; then printf '%s\n' "$dir/.lanes/plan-fields"; return; fi
     if [ -z "$top" ] || [ "$dir" = "$top" ] || [ "$dir" = "/" ]; then return; fi

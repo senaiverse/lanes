@@ -11,6 +11,11 @@
       "description": "Plan field checker (lanes-plancheck)."
     },
     {
+      "name": "lanes-review",
+      "source": "./plugins/lanes-review",
+      "description": "Adversarial reviewer agent, instructed not to edit; not sandboxed."
+    },
+    {
       "name": "lanes-guards",
       "source": "./plugins/lanes-guards",
       "description": "Multi-session guards: only the lead runs CI, merges and default-branch pushes; only the lead sends plans; no edits in the main checkout. Requires the core lanes plugin."
