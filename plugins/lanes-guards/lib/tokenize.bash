@@ -1,9 +1,9 @@
 # Shell tokenizer for lanes-guard, sourced by bin/lanes-guard (a library: no shebang, no set -e of its own).
 # tokenize <text> appends one SEP-joined string per simple command to CMDS, recursing into $( ), backticks and heredoc
-# bodies. Quotes, backslashes and line continuations are removed as the shell removes them. Beside CMDS it fills
-# CMD_STDIN[i] (the heredoc body or here-string word fed to command i) and CMD_PIPE[i] (the index of the command piped
-# into command i, or -1). Text it cannot parse (an unterminated quote, too much nesting) sets LOOSE and is kept in
-# LOOSE_TEXT for a loose pattern match.
+# bodies. Quotes ($'...' decoded), backslashes and line continuations are removed as the shell removes them. Beside CMDS
+# it fills CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_PIPE[i] (the index of the command
+# piped into command i, or -1) and CMD_RAW[i] (command i's source text). Text it cannot parse (an unterminated quote,
+# too much nesting) sets LOOSE and is kept in LOOSE_TEXT for a loose pattern match.
 # Limit: words are joined with SEP (0x1f) and split on it again, so a literal 0x1f byte in a command forges a word
 # boundary. The guard is a mistake guard, so the case is accepted.
 
@@ -84,12 +84,26 @@ _endcmd() {
   redir=0; herestr=0
   if [ "${#words[@]}" -gt 0 ]; then
     idx=${#CMDS[@]}
-    CMD_STDIN[idx]="$here_word"; CMD_PIPE[idx]="$pipe_from"
+    CMD_STDIN[idx]="$here_word"; CMD_PIPE[idx]="$pipe_from"; CMD_RAW[idx]="${s:cs:i-cs}"
     for k in "${!hd_delim[@]}"; do [ -n "${hd_cmd[k]:-}" ] || hd_cmd[k]=$idx; done
     CMDS+=("${words[*]}")
     pipe_from=-1
   fi
-  here_word=""; words=()
+  here_word=""; words=(); cs=$i
+}
+
+# _ansi_c reads the $'...' word at index i and appends its decoded text to w. The scan stops only at an unescaped quote,
+# so the body cannot close the quote inside eval, and $'...' expands nothing: bash decodes it as it will at run time.
+_ansi_c() {
+  local j=$((i + 2)) body
+  while [ "$j" -lt "$n" ] && [ "${s:j:1}" != "'" ]; do
+    if [ "${s:j:1}" = "\\" ]; then j=$((j + 1)); fi
+    j=$((j + 1))
+  done
+  if [ "$j" -ge "$n" ]; then LOOSE=1; LOOSE_TEXT+="${s:i}"$'\n'; w+="${s:i+2}"; i=$n; return 0; fi
+  body="${s:i+2:j-i-2}"
+  eval "body=\$'$body'"
+  w+="$body"; i=$((j + 1))
 }
 
 # _heredoc_bodies reads the pending heredoc bodies that start at index i (just after a newline).
@@ -135,7 +149,7 @@ _heredoc_operator() {
 tokenize() {
   TOKENIZE_CALLS=$((TOKENIZE_CALLS + 1))
   if [ "$TOKENIZE_CALLS" -gt "$MAX_TOKENIZE_CALLS" ]; then LOOSE=1; LOOSE_TEXT+="$1"$'\n'; return 0; fi
-  local s="$1" n="${#1}" i=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" pipe_from=-1 rest q j buf
+  local s="$1" n="${#1}" i=0 cs=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" pipe_from=-1 rest q j buf
   local -a words=() hd_delim=() hd_quoted=() hd_strip=() hd_cmd=()
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
@@ -174,11 +188,16 @@ tokenize() {
         if [ "$j" -ge "$n" ]; then LOOSE=1; LOOSE_TEXT+="${s:i}"$'\n'; fi
         w+="$buf"; have=1; i=$((j + 1)) ;;
       '$')
-        if [ "${s:i+1:1}" = '(' ]; then sub_in "$s" "$i"; i=$SUB_NEXT; else i=$((i + 1)); fi
-        w+='$'; have=1 ;;
+        case "${s:i+1:1}" in
+          '(') sub_in "$s" "$i"; i=$SUB_NEXT; w+='$' ;;
+          "'") _ansi_c ;;
+          '"') i=$((i + 1)) ;;
+          *) i=$((i + 1)); w+='$' ;;
+        esac
+        have=1 ;;
       '`') sub_in "$s" "$i"; i=$SUB_NEXT; w+='$'; have=1 ;;
       " "|$'\t') _flush; i=$((i + 1)) ;;
-      $'\n') _endcmd; i=$((i + 1)); _heredoc_bodies ;;
+      $'\n') _endcmd; i=$((i + 1)); _heredoc_bodies; cs=$i ;;
       "|")
         _endcmd
         if [ "${s:i+1:1}" = "|" ]; then pipe_from=-1; i=$((i + 2)); continue; fi

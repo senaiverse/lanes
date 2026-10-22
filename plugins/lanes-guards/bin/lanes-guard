@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lanes-guard <lead-only|plan-message|main-edit>: PreToolUse hook guards for a lead and its lanes.
-#   lead-only     Bash: refuse CI dispatch, merge and push-to-default commands unless the caller is the lead.
+#   lead-only     Bash: refuse CI dispatch, merge and any push but the explicit one-branch form, unless from the lead.
 #   plan-message  SendMessage: refuse a message that starts with the plan marker unless the caller is the lead.
 #   main-edit     Edit, Write, NotebookEdit: refuse a path inside the main checkout while linked worktrees exist.
 # Reads the hook JSON on stdin. A refusal is the PreToolUse decision JSON on stdout (code.claude.com/docs/en/hooks,
@@ -94,40 +94,73 @@ value_flags() {
   esac
 }
 
-# default_branches: the branch names a push must not target, one per line.
+# default_branches <git dir>: the branch names a push must not target, one per line.
 default_branches() {
   local configured head
   configured="$(setting default_branch "")"
   if [ -n "$configured" ]; then echo "$configured"; return 0; fi
-  head="$(git -C "$GIT_DIR" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)"
+  head="$(git -C "$1" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)"
   if [ -n "$head" ]; then echo "${head#origin/}"; else printf 'main\nmaster\n'; fi
 }
 
-is_default_branch() { default_branches | grep -Fxq -- "$1"; }
+# not_default <branch> <git dir>: true when the branch is not a default branch.
+not_default() { ! grep -Fxq -- "$1" <<<"$(default_branches "$2")"; }
 
-current_branch() { git -C "$GIT_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true; }
+# branch_name <ref>: the branch a refspec side names, or nothing for HEAD-like names, refs outside refs/heads/, and
+# words with a glob, brace, expansion or revision character. Those depend on the checkout or the shell, so are refused.
+branch_name() {
+  local name="${1#refs/heads/}" up
+  up="${name^^}"
+  [[ "$name" != refs/* && "$name" != @ && "$up" != HEAD && "$up" != *_HEAD ]] || return 0
+  [[ "$name" =~ ^[A-Za-z0-9._/@][A-Za-z0-9._/@+-]*$ ]] || return 0
+  printf '%s' "$name"
+}
 
-# push_hits_default <flag_all> <repo_given> <words after "push"...>: true when the push can update a default branch.
-# The first word is the remote unless --repo named it, and no refspec means the current branch.
-push_hits_default() {
-  local all="$1" repo_given="$2" ref dst
-  shift 2
-  if [ "$all" = 1 ]; then return 0; fi
-  if [ "$repo_given" = 0 ] && [ "$#" -gt 0 ]; then shift; fi
-  if [ "$#" -eq 0 ]; then is_default_branch "$(current_branch)"; return; fi
-  for ref in "$@"; do
-    ref="${ref#+}"
-    dst="${ref##*:}"
-    if [ "$dst" = HEAD ]; then dst="$(current_branch)"; fi
-    dst="${dst#refs/heads/}"
-    if is_default_branch "$dst"; then return 0; fi
+# push_allowed: true for `git [-C <dir>] push [-u|--set-upstream] [--force-with-lease[=...]] <remote> <branch>` with a
+# non-default <branch> or <branch>:<same branch>. Any other push depends on the checkout, git config or a pattern, so it
+# is the lead's; -C is allowed because the explicit branch does not depend on which checkout runs it.
+# A plain <branch> is mapped by remote.<r>.push, push.default=upstream and symrefs (git builtin/push.c
+# refspec_append_mapped), so it passes only when none of them, nor a GIT_CONFIG_* prefix, is set in the target checkout.
+push_allowed() {
+  local a x dir="$GIT_DIR" seen=0 src dst target
+  local -a pos=()
+  PUSH_HINT="push explicitly: git push <remote> <your-branch>"
+  [ "$VIA_XARGS" -eq 0 ] || return 1
+  for ((a = 1; a < ${#W[@]}; a++)); do
+    x="${W[a]}"
+    if [ "$seen" -eq 0 ]; then
+      case "$x" in
+        push) seen=1 ;;
+        -C)
+          a=$((a + 1)); x="${W[a]:-}"
+          [[ -n "$x" && "$x" != *'$'* ]] || return 1
+          case "$x" in /*) dir="$x" ;; *) dir="$dir/$x" ;; esac ;;
+        *) return 1 ;;
+      esac
+      continue
+    fi
+    case "$x" in
+      -u|--set-upstream|--force-with-lease|--force-with-lease=*) ;;
+      -*) return 1 ;;
+      *) pos+=("$x") ;;
+    esac
   done
-  return 1
+  [ "${#pos[@]}" -eq 2 ] && [[ "${pos[0]}" =~ ^[A-Za-z0-9._@:/%+-]+$ ]] || return 1
+  src="${pos[1]%%:*}"; dst="${pos[1]#*:}"
+  src="$(branch_name "$src")"; dst="$(branch_name "$dst")"
+  [ -n "$src" ] && [ "$src" = "$dst" ] || return 1
+  not_default "$src" "$dir" || return 1
+  target="$(git -C "$dir" symbolic-ref -q "refs/heads/$src" 2>/dev/null || true)"
+  if [[ "${pos[1]}" == *:* ]]; then not_default "${target#refs/heads/}" "$dir"; return; fi
+  PUSH_HINT="push explicitly: git push <remote> <name>:<name>"
+  [ -z "$target" ] && [ "$GIT_ENV_CONFIG" -eq 0 ] || return 1
+  [ -z "$(git -C "$dir" config --get-all "remote.${pos[0]}.push" 2>/dev/null || true)" ] || return 1
+  [[ ! "$(git -C "$dir" config push.default 2>/dev/null || true)" =~ ^(upstream|tracking)$ ]]
 }
 
 # match_command: tests one command (array W) against PATTERNS; sets MATCHED to the pattern text on a hit.
 match_command() {
-  local cmd="${W[0]}" base pat first a x need k flag_all repo_given
+  local cmd="${W[0]}" base pat first a x need k
   local -a pw pos
   base="${cmd##*/}"
   for pat in "${PATTERNS[@]}"; do
@@ -138,12 +171,10 @@ match_command() {
       # A command word the guard cannot resolve ($VAR, a substitution) is matched on the words after it.
       [[ "$cmd" == *'$'* ]] && [ "${#pw[@]}" -gt 1 ] || continue
     fi
-    pos=(); flag_all=0; repo_given=0
+    pos=()
     for ((a = 1; a < ${#W[@]}; a++)); do
       x="${W[a]}"
       if [[ "$x" == -?* ]]; then
-        if [ "$x" = "--all" ] || [ "$x" = "--mirror" ]; then flag_all=1; fi
-        if [ "$x" = "--repo" ] || [[ "$x" == --repo=* ]]; then repo_given=1; fi
         if [[ "$(value_flags "$first")" == *" $x "* ]]; then a=$((a + 1)); fi
       else
         pos+=("$x")
@@ -158,9 +189,7 @@ match_command() {
       MATCHED="$pat"; return 0
     fi
     for ((k = 0; k < need; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
-    if [ "${pw[${#pw[@]} - 1]}" = "@default" ]; then
-      push_hits_default "$flag_all" "$repo_given" "${pos[@]:need}" || continue
-    fi
+    if [ "${pw[${#pw[@]} - 1]}" = "@default" ] && push_allowed; then continue; fi
     MATCHED="$pat"; return 0
   done
   return 1
@@ -180,28 +209,43 @@ declare -A WRAPPERS=(
   [xargs]=" -I -L -n -P -s -d -E -a -J "
 )
 
-# stdin_script <index>: the text a shell with no script operand would read on stdin: its own heredoc or here-string,
-# else the heredoc of the command piped into it, else the arguments of a piped echo or printf.
-stdin_script() {
-  local p="${CMD_PIPE[$1]:--1}" w
+# shell_stdin <index>: checks the script a shell reading stdin runs. The guard reads it only from the shell's own
+# heredoc or here-string, a piped bare `cat` heredoc, or a piped `echo` of literal words. Any other producer, or text
+# with an expansion, adds the pipeline's raw text to LOOSE_TEXT, so it is refused when it names a lead-only pattern.
+shell_stdin() {
+  local p="${CMD_PIPE[$1]:--1}" text="" raw="" w lit=1
   local -a words
-  if [ -n "${CMD_STDIN[$1]:-}" ]; then printf '%s' "${CMD_STDIN[$1]}"; return 0; fi
-  [ "$p" -ge 0 ] || return 0
-  if [ -n "${CMD_STDIN[p]:-}" ]; then printf '%s' "${CMD_STDIN[p]}"; return 0; fi
-  IFS="$SEP" read -ra words <<<"${CMDS[p]}"
-  case "${words[0]##*/}" in
-    echo|printf) for w in "${words[@]:1}"; do printf '%s ' "$w"; done ;;
-  esac
+  if [ -n "${CMD_STDIN[$1]:-}" ]; then
+    text="${CMD_STDIN[$1]}"; raw="${CMD_RAW[$1]}$text"
+  elif [ "$p" -ge 0 ]; then
+    IFS="$SEP" read -ra words <<<"${CMDS[p]}"
+    case "${words[0]}" in
+      cat) if [ "${#words[@]}" -eq 1 ]; then text="${CMD_STDIN[p]:-}"; else lit=0; fi ;;
+      echo) for w in "${words[@]:1}"; do [[ "$w" != -* && "$w" != *\\* ]] || lit=0; text+="$w "; done ;;
+      *) lit=0 ;;
+    esac
+    while [ "$p" -ge 0 ]; do raw+="${CMD_RAW[p]}${CMD_STDIN[p]:-}"$'\n'; p="${CMD_PIPE[p]:--1}"; done
+  fi
+  # shellcheck disable=SC2016 # the patterns are literal text
+  [[ "$text" != *'$'* && "$text" != *'`'* ]] || lit=0
+  if [ "$lit" -eq 0 ]; then LOOSE=1; LOOSE_TEXT+="$raw"$'\n'; fi
+  if [ -n "$text" ]; then tokenize "$text"; fi
 }
+
+# is_stdin_path <word>: a script path that is the shell's stdin.
+is_stdin_path() { [[ "$1" =~ ^(/dev/stdin|/dev/fd/0|/proc/self/fd/0)$ ]]; }
 
 # check_command <index in CMDS>: strips wrappers, follows shells and eval into CMDS, and matches the real command.
 check_command() {
-  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script
+  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script GIT_ENV_CONFIG=0
   local -a W=()
   VIA_XARGS=0
   while [ -n "$rest" ]; do W+=("${rest%%"$SEP"*}"); rest="${rest#*"$SEP"}"; done
   while :; do
-    while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do drop 1; done
+    while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
+      if [[ "${W[0]}" =~ ^GIT_CONFIG_(COUNT|KEY_[0-9]+|PARAMETERS|GLOBAL|SYSTEM)= ]]; then GIT_ENV_CONFIG=1; fi
+      drop 1
+    done
     [ "${#W[@]}" -gt 0 ] || return 0
     base="${W[0]##*/}"
     if [ -n "${WRAPPERS[$base]+x}" ]; then
@@ -232,12 +276,12 @@ check_command() {
             *) break ;;
           esac
         done
-        if [ "$mode" = operand ] && [ "$k" -ge "${#W[@]}" ]; then mode=stdin; fi
-        if [ "$mode" = stdin ]; then script="$(stdin_script "$idx")"; fi
+        if [ "$mode" = operand ] && { [ "$k" -ge "${#W[@]}" ] || is_stdin_path "${W[k]}"; }; then mode=stdin; fi
+        if [ "$mode" = stdin ]; then shell_stdin "$idx"; fi
         if [ -n "$script" ]; then tokenize "$script"; fi
         return 0 ;;
       eval) drop 1; tokenize "${W[*]:-}"; return 0 ;;
-      source|.) return 0 ;;
+      source|.) if is_stdin_path "${W[1]:-}"; then shell_stdin "$idx"; fi; return 0 ;;
       *) match_command || true; return 0 ;;
     esac
   done
@@ -277,7 +321,8 @@ load_patterns() {
 
 guard_lead_only() {
   local cmd idx
-  CMDS=(); CMD_STDIN=(); CMD_PIPE=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
+  CMDS=(); CMD_STDIN=(); CMD_PIPE=(); CMD_RAW=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
+  PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   load_patterns
   if [ "$VALID" -eq 0 ]; then
     if loose_match "$INPUT"; then
@@ -300,7 +345,11 @@ guard_lead_only() {
   [ -n "$MATCHED" ] || exit 0
   lookup_caller
   [ "$ROLE" != lead ] || exit 0
-  refuse_not_lead lead-only "\`$MATCHED\` is lead-only (CI dispatch, merge and push to the default branch)" \
+  if [[ "$MATCHED" == *@default* ]]; then
+    refuse_not_lead lead-only "this \`git push\` form is lead-only: a lane pushes only one named non-default branch" \
+      "$PUSH_HINT (with -u or --force-with-lease if needed); ask the lead for any other push, or change lead_only_commands in .lanes/guards.md"
+  fi
+  refuse_not_lead lead-only "\`$MATCHED\` is lead-only" \
     "ask the lead to run it, or change lead_only_commands in .lanes/guards.md"
 }
 

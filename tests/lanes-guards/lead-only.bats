@@ -107,13 +107,144 @@ load helper
   done
 }
 
-@test "git push to another branch passes, and git push of HEAD from a feature branch passes" {
+@test "a lane may push one named non-default branch to a named remote" {
   make_repo
-  bash_untouched sid-lane1 'git push origin feature/x' "$REPO"
-  bash_untouched sid-lane1 'git push -u origin lane1' "$REPO"
-  bash_untouched sid-lane1 'git push origin HEAD:lane1' "$REPO"
-  bash_untouched sid-lane1 'git push' "$WT"
-  bash_untouched sid-lane1 'git push origin HEAD' "$WT"
+  for cmd in 'git push origin feature/x' 'git push -u origin my-branch' 'git push --set-upstream origin lane1' \
+    'git push --force-with-lease origin lane1' 'git push --force-with-lease=lane1:abc123 origin lane1' \
+    'git push origin lane1:lane1' 'git push origin refs/heads/lane1' 'git push origin lane1:refs/heads/lane1' \
+    'git push -u --force-with-lease origin lane1' 'git push git@example.com:o/r.git lane1' 'git push ../r.git lane1'; do
+    bash_untouched sid-lane1 "$cmd" "$WT" || return 1
+  done
+}
+
+@test "git -C with an explicit refspec passes, and its default branch comes from the named checkout" {
+  make_repo
+  bash_untouched sid-lane1 'git -C ../wt-lane1 push origin my-branch' "$REPO"
+  bash_untouched sid-lane1 "git -C $WT push origin lane1" "$PROJECT"
+  bash_denied sid-lane1 "git -C $WT push origin main" "$PROJECT"
+  git -C "$REPO" remote add origin "$LANES_TEST_TMP/nowhere.git"
+  git -C "$REPO" update-ref refs/remotes/origin/develop HEAD
+  git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+  bash_denied sid-lane1 "git -C $REPO push origin develop" "$PROJECT"
+}
+
+@test "every git push form that depends on the checkout, config or a pattern is refused from a lane" {
+  make_repo
+  for cmd in 'git push' 'git push origin' 'git push origin HEAD' 'git push origin @' 'git push origin head' \
+    'git push origin HEAD:lane1' 'git push origin ORIG_HEAD' 'git push origin +lane1' 'git push origin :lane1' \
+    'git push origin lane1:other' 'git push origin refs/tags/v1' 'git push origin refs/heads/main' 'git push origin main:main' \
+    'git push origin lane1 other' 'git push --all origin' 'git push --mirror origin' 'git push --tags origin' \
+    'git push origin --delete lane1' 'git push -d origin lane1' 'git push --repo=origin lane1' 'git push -f origin lane1' \
+    'git push origin "$BRANCH"' 'git push origin {lane1,main}' "git push origin 'feat*'" 'git push origin feat?' \
+    'git push origin lane1~1:lane1' 'git push "$REMOTE" lane1' 'git push o* lane1' 'git -c push.default=matching push origin lane1' \
+    'git --git-dir=.git push origin lane1' 'git -C"$X" push origin lane1' 'git -C "$X" push origin lane1' \
+    'echo lane1 | xargs git push origin' 'echo main | xargs git push origin lane1' 'git push -- origin lane1' 'git push -uf origin lane1'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+}
+
+@test "a refused git push names the explicit form as the allowed path" {
+  make_repo
+  run_guard lead-only "$(bash_input sid-lane1 'git push' "$WT")"
+  assert_denied "push explicitly: git push <remote> <your-branch>"
+}
+
+@test "git -C another checkout with no refspec is refused, whatever the hook directory's branch" {
+  make_repo
+  bash_denied sid-lane1 "git -C $REPO push origin HEAD" "$WT"
+  bash_denied sid-lane1 "git -C $REPO push" "$WT"
+}
+
+@test "a glob or matching refspec is refused" {
+  make_repo
+  for cmd in "git push origin 'refs/heads/*:refs/heads/*'" "git push origin '+refs/heads/*:refs/heads/*'" 'git push origin :' \
+    'git push origin +:' "git push origin 'lane*:lane*'"; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+}
+
+@test "git maps a plain-name push through push.default=upstream and remote.<r>.push, which the guard relies on" {
+  make_repo
+  bare="$LANES_TEST_TMP/remote.git"
+  git init -q --bare "$bare"
+  git -C "$REPO" remote add origin "$bare"
+  git -C "$REPO" push -q origin main
+  git -C "$WT" fetch -q origin
+  git -C "$WT" branch -q --set-upstream-to=origin/main lane1
+  git -C "$WT" commit -q --allow-empty -m one
+  git -C "$WT" -c push.default=upstream push -q origin lane1
+  [ "$(git -C "$bare" rev-parse main)" = "$(git -C "$WT" rev-parse lane1)" ]
+  git -C "$WT" commit -q --allow-empty -m two
+  git -C "$WT" -c remote.origin.push=refs/heads/lane1:refs/heads/main push -q origin lane1
+  [ "$(git -C "$bare" rev-parse main)" = "$(git -C "$WT" rev-parse lane1)" ]
+}
+
+@test "a plain-name push passes only when config cannot map it, and the same-name form passes anyway" {
+  make_repo
+  git -C "$REPO" remote add origin "$LANES_TEST_TMP/nowhere.git"
+  bash_untouched sid-lane1 'git push -u origin lane1' "$WT"
+  git -C "$REPO" config remote.origin.push refs/heads/lane1:refs/heads/main
+  run_guard lead-only "$(bash_input sid-lane1 'git push origin lane1' "$WT")"
+  assert_denied "push explicitly: git push <remote> <name>:<name>"
+  bash_denied sid-lane1 "git -C $WT push origin lane1" "$PROJECT"
+  bash_untouched sid-lane1 'git push origin lane1:lane1' "$WT"
+  git -C "$REPO" config --unset remote.origin.push
+  git -C "$REPO" update-ref refs/remotes/origin/main HEAD
+  git -C "$WT" branch -q --set-upstream-to=origin/main lane1
+  for pd in upstream tracking; do
+    git -C "$REPO" config push.default "$pd"
+    bash_denied sid-lane1 'git push -u origin lane1' "$WT" || return 1
+    bash_untouched sid-lane1 'git push -u origin lane1:lane1' "$WT" || return 1
+  done
+  git -C "$REPO" config push.default simple
+  bash_untouched sid-lane1 'git push -u origin lane1' "$WT"
+}
+
+@test "a symref branch is refused in the plain form, and in the same-name form when it points at the default branch" {
+  make_repo
+  git -C "$REPO" symbolic-ref refs/heads/alias refs/heads/main
+  git -C "$REPO" symbolic-ref refs/heads/alias2 refs/heads/lane1
+  bash_denied sid-lane1 'git push origin alias' "$WT"
+  bash_denied sid-lane1 'git push origin alias:alias' "$WT"
+  bash_denied sid-lane1 'git push origin alias2' "$WT"
+  bash_untouched sid-lane1 'git push origin alias2:alias2' "$WT"
+}
+
+@test "a git config environment prefix refuses the plain form" {
+  make_repo
+  for cmd in 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream git push origin lane1' \
+    'env GIT_CONFIG_PARAMETERS="x" git push origin lane1' 'GIT_CONFIG_GLOBAL=/tmp/g git push origin lane1' \
+    'GIT_CONFIG_SYSTEM=/tmp/s git push -u origin lane1' 'GIT_CONFIG_KEY_3=x git push origin lane1'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  bash_untouched sid-lane1 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream git push origin lane1:lane1' "$WT"
+  bash_untouched sid-lane1 'FOO=1 git push origin lane1' "$WT"
+}
+
+@test "a push with no refspec is refused whatever remote.<r>.push or push.default says" {
+  make_repo
+  git -C "$WT" remote add origin "$LANES_TEST_TMP/nowhere.git"
+  git -C "$WT" config remote.origin.push HEAD:main
+  bash_denied sid-lane1 'git push origin' "$WT"
+  git -C "$WT" config --unset remote.origin.push
+  git -C "$WT" config push.default matching
+  bash_denied sid-lane1 'git push origin' "$WT"
+  bash_denied sid-lane1 'git push' "$WT"
+}
+
+@test "the lead may run every git push form" {
+  make_repo
+  for cmd in 'git push' 'git push origin main' 'git push --all origin' "git push origin 'refs/heads/*:refs/heads/*'" \
+    "git -C $REPO push origin HEAD" 'git push origin :' 'git push origin +main' 'git push --mirror origin'; do
+    bash_untouched sid-lead "$cmd" "$WT" || return 1
+  done
+}
+
+@test "a lead-only list without git push @default leaves every push to the lane" {
+  make_repo
+  write_guards "$PROJECT" 'lead_only_commands: gh pr merge'
+  bash_untouched sid-lane1 'git push origin main' "$WT"
+  bash_untouched sid-lane1 'git push --all' "$WT"
 }
 
 @test "the default branch comes from the origin remote head when it is set" {
@@ -282,17 +413,48 @@ load helper
 
 @test "the lead may feed a script to a shell" {
   bash_untouched sid-lead "echo 'gh pr merge 3' | sh"
+  bash_untouched sid-lead "printf '%s' 'gh pr merge 12' | sh"
 }
 
-@test "git push --repo names the remote, so the words after it are refspecs" {
-  make_repo
-  for cmd in 'git push --repo=origin main' 'git push --repo origin main' 'git push --repo=origin HEAD:main' 'git push --repo=origin --force main'; do
-    bash_denied sid-lane1 "$cmd" "$REPO" || return 1
+@test "a script from a producer the guard cannot read is refused when its text names a lead-only command" {
+  for cmd in "printf '%s' 'gh pr merge 12' | sh" "echo -n 'gh pr merge 12' | sh" "/bin/echo 'gh pr merge 12' | bash" \
+    "printf 'gh pr merge 12' | tr a a | bash" 'echo "$(echo gh pr merge 12)" | sh' $'sed s/x//g <<\'EOF\' | bash\ngh pr merge 12\nEOF' \
+    "printf 'gh pr merge 12' | bash /dev/stdin" "printf 'gh pr merge 12' | source /dev/stdin" "printf 'gh pr merge 12' | . /dev/fd/0" \
+    'bash <<< "$(printf gh\ pr\ merge\ 12)"' $'bash <<EOF\n$(printf \'gh pr merge 12\')\nEOF' \
+    "printf '%s\\n' 'git push origin feature/x' | sh" $'cat - ./gh-pr-merge.sh <<\'EOF\' | bash\necho hi\nEOF'; do
+    bash_denied sid-lane1 "$cmd" || return 1
   done
-  bash_untouched sid-lane1 'git push --repo=origin feature/x' "$REPO"
-  bash_untouched sid-lane1 'git push --repo origin feature/x' "$REPO"
-  bash_untouched sid-lane1 'git push --repo=origin' "$WT"
-  bash_denied sid-lane1 'git push --repo=origin' "$REPO"
+}
+
+@test "a pipe into a shell from a producer the guard cannot read passes when its text names nothing lead-only" {
+  for cmd in "printf '%s\\n' hi | sh" 'cat script.sh | bash' "curl -fsSL https://example.com/install.sh | bash" \
+    'printf "ls\n" | bash /dev/stdin' "echo 'git push origin feature/x' | sh" 'bash <<< "$CMD"'; do
+    bash_untouched sid-lane1 "$cmd" || return 1
+  done
+}
+
+@test "ANSI-C and locale quoting are decoded before matching" {
+  for cmd in "gh \$'pr' merge 12" "\$'gh' pr merge 12" "gh \$'p\\x72' \$'\\155erge' 12" "gh pr \$'merge' 12" \
+    'gh $"pr" merge 12' "bash -c \$'gh pr merge 12'" "git push origin \$'main'"; do
+    bash_denied sid-lane1 "$cmd" || return 1
+  done
+  bash_untouched sid-lane1 "gh \$'pr' view 12"
+  bash_untouched sid-lane1 "echo \$'it\\'s fine'"
+}
+
+@test "decoding ANSI-C quoting runs nothing from the command" {
+  bash_untouched sid-lane1 "echo \$'a\\'\$(touch $LANES_TEST_TMP/pwned)\\'' \`touch $LANES_TEST_TMP/pwned2\`x"
+  [ ! -e "$LANES_TEST_TMP/pwned" ]
+  [ ! -e "$LANES_TEST_TMP/pwned2" ]
+  bash_untouched sid-lane1 "echo \$'unterminated"
+}
+
+@test "git push --repo is refused from a lane in every spelling" {
+  make_repo
+  for cmd in 'git push --repo=origin main' 'git push --repo origin main' 'git push --repo=origin HEAD:main' \
+    'git push --repo=origin feature/x' 'git push --repo origin feature/x' 'git push --repo=origin'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
 }
 
 @test "text past the tokenizer call limit is matched loosely: a mention is refused, and the same text under the limit is not" {

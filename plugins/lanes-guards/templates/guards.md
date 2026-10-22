@@ -12,8 +12,8 @@ default_branch:
 ```
 
 - `lead_only_commands`: commands only the lead may run, separated by `;`. This list replaces the default, so repeat any
-  default you keep. `git push @default` means a push to the default branch.
+  default you keep. `git push @default` means every push except `git push <remote> <one non-default branch>`.
 - `plan_marker`: a `SendMessage` starting with this text is refused unless the sender is the lead.
 - `main_checkout_guard`: `on` refuses Edit, Write and NotebookEdit inside the main checkout while linked worktrees exist.
 - `lead_exempt_main_checkout`: `yes` lets the lead edit the main checkout.
-- `default_branch`: the branch `@default` protects. Empty means the remote's head, else `main` and `master`.
+- `default_branch`: the branch a lane may never name in its explicit push. Empty means the remote's head, else `main` and `master`.

@@ -1,7 +1,7 @@
 {
   "name": "lanes-guards",
   "version": "0.1.0",
-  "description": "Multi-session guards for a lead and its lanes: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. For destructive commands (rm -rf, git reset --hard) use destructive_command_guard or cc-safety-net; this plugin does not cover them.",
+  "description": "Multi-session guards for a lead and its lanes: only the lead dispatches CI, merges and pushes anything but one named non-default branch; only the lead sends plan messages; no edits in the main checkout. For destructive commands (rm -rf, git reset --hard) use destructive_command_guard or cc-safety-net; this plugin does not cover them.",
   "author": { "name": "senaiverse" },
   "homepage": "https://github.com/senaiverse/lanes",
   "repository": "https://github.com/senaiverse/lanes",
@@ -11,7 +11,7 @@
     "lead_only_commands": {
       "type": "string",
       "title": "Lead-only commands",
-      "description": "Commands only the lead session may run, separated by semicolons. A project's .lanes/guards.md overrides this. git push @default means a push to the default branch.",
+      "description": "Commands only the lead session may run, separated by semicolons. A project's .lanes/guards.md overrides this. git push @default means every push except git push <remote> <one non-default branch>.",
       "default": "gh workflow run; gh pr merge; git push @default"
     },
     "plan_marker": {
@@ -35,7 +35,7 @@
     "default_branch": {
       "type": "string",
       "title": "Default branch",
-      "description": "The branch that git push @default protects. Empty means the remote's head, else main and master. A project's .lanes/guards.md overrides this."
+      "description": "The branch a lane may never name in its explicit git push. Empty means the remote's head, else main and master. A project's .lanes/guards.md overrides this."
     }
   }
 }
