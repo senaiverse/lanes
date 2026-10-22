@@ -135,6 +135,22 @@ commit_file() { # $1 file, $2 message
   assert_success
 }
 
+@test "a commit known only from another remote is still checked when pushed to a new branch" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  commit_file a.txt first
+  LANES_DENY_LIST="acme" git -C "$REPO" push -q origin main
+  PRIVATE="$LANES_TEST_TMP/private.git"; git init -q --bare "$PRIVATE"
+  git -C "$REPO" remote add private "$PRIVATE"
+  git -C "$REPO" checkout -q -b feature
+  git -C "$REPO" -c user.email=bob@acme.example commit -q --allow-empty -m private-work
+  LANES_DENY_LIST="zqxv" git -C "$REPO" push -q private feature
+  LANES_DENY_LIST="acme" run git -C "$REPO" push origin feature
+  assert_failure
+  assert_output --partial "author"
+  run git -C "$REMOTE" rev-parse --verify feature
+  assert_failure
+}
+
 @test "deleting a branch passes" {
   "$REPO/scripts/install-hooks.sh" >/dev/null
   commit_file a.txt first
