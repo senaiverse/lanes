@@ -39,12 +39,11 @@ windows_job() { awk '/^  windows:/{f=1;next} f&&/^  [a-z]/{f=0} f' "$CI"; }
   grep -qE 'uses: actions/checkout@[0-9a-f]{40} # v[0-9]' <<< "$job"
 }
 
-@test "the windows job runs the plancheck suite, and prodfence only when its suite directory exists" {
+@test "the windows job runs only the suites of plugins supported on native Windows" {
   local job
   job="$(windows_job)"
-  grep -q 'tests/lanes-plancheck' <<< "$job"
-  grep -qE '\[ -d tests/lanes-prodfence \]' <<< "$job"
-  grep -q 'scripts/test.sh' <<< "$job"
+  grep -q 'scripts/test.sh tests/lanes-plancheck' <<< "$job"
+  ! grep -q 'tests/lanes-prodfence' <<< "$job"
 }
 
 @test "git attributes keep LF in every shell file and the plan template so Windows checkouts run" {
@@ -62,6 +61,21 @@ windows_job() { awk '/^  windows:/{f=1;next} f&&/^  [a-z]/{f=0} f' "$CI"; }
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   [[ "$output" == *"only-suite-marker"* ]]
   [[ "$output" != *"every action is pinned"* ]]
+}
+
+@test "test.sh fails a test that runs past the per-test time limit instead of hanging" {
+  local suite="$BATS_TEST_TMPDIR/hang-suite"
+  mkdir -p "$suite"
+  printf '#!/usr/bin/env bats\n@test "hangs" { sleep 30; }\n' > "$suite/a.bats"
+  SECONDS=0
+  BATS_TEST_TIMEOUT=2 run "$BATS_TEST_DIRNAME/../../scripts/test.sh" "$suite"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"timeout"* ]] || { echo "$output" >&2; false; }
+  [ "$SECONDS" -lt 25 ]
+}
+
+@test "test.sh sets a per-test time limit by default" {
+  grep -q 'BATS_TEST_TIMEOUT:-' "$BATS_TEST_DIRNAME/../../scripts/test.sh"
 }
 
 @test "test.sh given a missing suite directory fails and names it" {

@@ -17,7 +17,7 @@ lanes/
       skills/lead/SKILL.md              lead procedure: plan into the journal, message lanes, run the clear handshake
       skills/lane/SKILL.md              lane procedure: build from a plan, keep RESUME current, answer clear-ready
       hooks/hooks.json                  SessionStart(startup|resume|clear|compact) → register pane + re-inject RESUME/goal
-      bin/lanes                         init | register | status | clear-ready | clear <lane>
+      bin/lanes                         register | status | request | clear-ready | clear | goal | away | journal-dir | monitor-lock | monitor-diff (init moves to /lanes:setup, row 28)
       bin/lanes-statusline              statusline wrapper: writes context % per session to the registry, prints a line
       templates/journal/                README, RULES.md (mechanism rules), tracker.md, next-lane.md, done-lane.md
     lanes-guards/     lead-only CI/merge, lead-only plan messages, no edits in the main checkout
@@ -129,7 +129,7 @@ Each guard's refusal message names the rule and the allowed path.
 ## M3 — lanes-jobs
 
 `lanes-job run <name> -- <cmd>` runs a command in a pooled tmux pane and writes STATUS (`EXIT:<code>`, start, end, log
-path). Slots are pid-symlink locks under `${CLAUDE_PLUGIN_DATA}` (`CONVENTIONS.md` "State"). Tests cover: pool exhausted, a job killed mid-run (STATUS still
+path). Slots are pid-symlink locks under the shared state dir (`CONVENTIONS.md` "Code" and "State"). Tests cover: pool exhausted, a job killed mid-run (STATUS still
 written by the trap), a stale lock after a crash, and two jobs with the same name.
 
 ## M4 — lanes-waves, lanes-plancheck, lanes-ci, lanes-review
