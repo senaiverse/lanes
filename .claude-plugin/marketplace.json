@@ -9,6 +9,11 @@
       "name": "lanes-plancheck",
       "source": "./plugins/lanes-plancheck",
       "description": "Plan field checker (lanes-plancheck)."
+    },
+    {
+      "name": "lanes-review",
+      "source": "./plugins/lanes-review",
+      "description": "Adversarial reviewer agent, instructed not to edit; not sandboxed."
     }
   ]
 }
