@@ -7,7 +7,11 @@ teardown() { lanes_test_teardown; }
 
 @test "setup gives a temp LANES_DATA_DIR that exists" {
   [ -d "$LANES_DATA_DIR" ]
-  case "$LANES_DATA_DIR" in "${TMPDIR:-/tmp}"/lanes-test.*) ;; *) false ;; esac
+  case "$LANES_DATA_DIR" in /tmp/lanes-test.*) ;; *) false ;; esac
+}
+
+@test "the tmux socket path stays under the 104-byte macOS limit even with a long TMPDIR" {
+  [ "${#TMUX_TMPDIR}" -lt 60 ]
 }
 
 @test "lanes_tmux runs on a private server, not the user's" {
