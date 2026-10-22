@@ -43,7 +43,8 @@
 - `scripts/deny-gate.sh` fails when the path or contents of a tracked or untracked non-ignored file contain a word from the
   private deny-list. It reads the list from
   `docs/PORT-SOURCES.local.md` when that file is present, or from `LANES_DENY_LIST` otherwise. It runs as the local
-  pre-push hook, not in CI (DECISIONS 23).
+  pre-push hook, not in CI (DECISIONS 23). The hook also checks the author, committer and message of every commit being
+  pushed (`deny-gate.sh --commits`).
 
 ## Process
 

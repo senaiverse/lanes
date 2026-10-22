@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
-# Blocks a push when the private deny-list matches a tracked or untracked file (name or contents).
-# The gate is fail-closed: with no usable list it refuses too. Install with scripts/install-hooks.sh.
+# Blocks a push when the private deny-list matches a tracked or untracked file (name or contents), or the
+# author, committer or message of a commit being pushed. Fail-closed: with no usable list it refuses too.
+# Git passes the destination remote name as $1 and feeds "<local ref> <local sha> <remote ref> <remote sha>"
+# lines on stdin. Install with scripts/install-hooks.sh.
 set -euo pipefail
+dest="${1:?pre-push: git passes the remote name as the first argument}"
 root="$(git rev-parse --show-toplevel)"
-exec "$root/scripts/deny-gate.sh" "$root"
+gate="$root/scripts/deny-gate.sh"
+zero="0000000000000000000000000000000000000000"
+
+rc=0
+"$gate" "$root" || rc=$?
+
+while read -r _ local_sha _ remote_sha; do
+  # A deleted ref pushes no commits. A new ref checks what the destination's tracking refs lack, so a commit
+  # fetched from another remote is still checked; with a URL destination nothing is excluded. An update checks
+  # the new range.
+  case "$local_sha" in "$zero"*) continue ;; esac
+  case "$remote_sha" in
+    "$zero"*) args=("$local_sha" --not --remotes="$dest") ;;
+    *) args=("$local_sha" --not "$remote_sha") ;;
+  esac
+  crc=0
+  "$gate" "$root" --commits "${args[@]}" || crc=$?
+  [ "$crc" -le "$rc" ] || rc="$crc"
+done
+exit "$rc"
