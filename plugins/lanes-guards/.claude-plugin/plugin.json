@@ -35,7 +35,7 @@
     "default_branch": {
       "type": "string",
       "title": "Default branch",
-      "description": "The branch a lane may never name in its explicit git push. Empty means the remote's head, else main and master. A project's .lanes/guards.md overrides this."
+      "description": "A branch a lane may never name in its explicit git push, beside the pushed remote's head. With neither known, a lane's push to that remote is refused. A project's .lanes/guards.md overrides this."
     }
   }
 }

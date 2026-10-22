@@ -94,17 +94,18 @@ value_flags() {
   esac
 }
 
-# default_branches <git dir>: the branch names a push must not target, one per line.
+# default_branches <git dir> <remote>: the branch names a push to that remote must not target, one per line: the
+# default_branch setting and the remote's head (refs/remotes/<remote>/HEAD). Nothing when neither is known.
 default_branches() {
   local configured head
   configured="$(setting default_branch "")"
-  if [ -n "$configured" ]; then echo "$configured"; return 0; fi
-  head="$(git -C "$1" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)"
-  if [ -n "$head" ]; then echo "${head#origin/}"; else printf 'main\nmaster\n'; fi
+  head="$(git -C "$1" symbolic-ref --short -q "refs/remotes/$2/HEAD" 2>/dev/null || true)"
+  [ -z "$configured" ] || echo "$configured"
+  [ -z "$head" ] || echo "${head#"$2"/}"
 }
 
-# not_default <branch> <git dir>: true when the branch is not a default branch.
-not_default() { ! grep -Fxq -- "$1" <<<"$(default_branches "$2")"; }
+# not_default <branch> <default list>: true when the branch is not in the list.
+not_default() { ! grep -Fxq -- "$1" <<<"$2"; }
 
 # branch_name <ref>: the branch a refspec side names, or nothing for HEAD-like names, refs outside refs/heads/, and
 # words with a glob, brace, expansion or revision character. Those depend on the checkout or the shell, so are refused.
@@ -117,15 +118,19 @@ branch_name() {
 }
 
 # push_allowed: true for `git [-C <dir>] push [-u|--set-upstream] [--force-with-lease[=...]] <remote> <branch>` with a
-# non-default <branch> or <branch>:<same branch>. Any other push depends on the checkout, git config or a pattern, so it
-# is the lead's; -C is allowed because the explicit branch does not depend on which checkout runs it.
+# configured <remote> whose default is known and a non-default <branch> or <branch>:<same branch>. Any other push depends
+# on the checkout, git config or a pattern, so it is the lead's. The checkout is the one cd and -C lead to (CMD_DIR).
 # A plain <branch> is mapped by remote.<r>.push, push.default=upstream and symrefs (git builtin/push.c
 # refspec_append_mapped), so it passes only when none of them, nor a GIT_CONFIG_* prefix, is set in the target checkout.
 push_allowed() {
-  local a x dir="$GIT_DIR" seen=0 src dst target
+  local a x dir="$CMD_DIR" seen=0 src dst target defaults
   local -a pos=()
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   [ "$VIA_XARGS" -eq 0 ] || return 1
+  if [ -z "$dir" ]; then
+    PUSH_HINT="the guard cannot tell which checkout this push runs in; push without cd, GIT_DIR or env -C: git -C <your-worktree> push <remote> <your-branch>"
+    return 1
+  fi
   for ((a = 1; a < ${#W[@]}; a++)); do
     x="${W[a]}"
     if [ "$seen" -eq 0 ]; then
@@ -145,13 +150,23 @@ push_allowed() {
       *) pos+=("$x") ;;
     esac
   done
-  [ "${#pos[@]}" -eq 2 ] && [[ "${pos[0]}" =~ ^[A-Za-z0-9._@:/%+-]+$ ]] || return 1
+  [ "${#pos[@]}" -eq 2 ] && [[ "${pos[0]}" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
   src="${pos[1]%%:*}"; dst="${pos[1]#*:}"
   src="$(branch_name "$src")"; dst="$(branch_name "$dst")"
   [ -n "$src" ] && [ "$src" = "$dst" ] || return 1
-  not_default "$src" "$dir" || return 1
+  # A URL, a path or an unknown name has no local head to name its default, so only a configured remote passes.
+  if [ -z "$(git -C "$dir" config --get "remote.${pos[0]}.url" 2>/dev/null || true)" ]; then
+    PUSH_HINT="push to a remote configured in the checkout: git push <remote> <your-branch>"
+    return 1
+  fi
+  defaults="$(default_branches "$dir" "${pos[0]}")"
+  if [ -z "$defaults" ]; then
+    PUSH_HINT="the default branch of remote ${pos[0]} is unknown: run \`git remote set-head ${pos[0]} --auto\` once, or set default_branch in .lanes/guards.md"
+    return 1
+  fi
+  not_default "$src" "$defaults" || return 1
   target="$(git -C "$dir" symbolic-ref -q "refs/heads/$src" 2>/dev/null || true)"
-  if [[ "${pos[1]}" == *:* ]]; then not_default "${target#refs/heads/}" "$dir"; return; fi
+  if [[ "${pos[1]}" == *:* ]]; then not_default "${target#refs/heads/}" "$defaults"; return; fi
   PUSH_HINT="push explicitly: git push <remote> <name>:<name>"
   [ -z "$target" ] && [ "$GIT_ENV_CONFIG" -eq 0 ] || return 1
   [ -z "$(git -C "$dir" config --get-all "remote.${pos[0]}.push" 2>/dev/null || true)" ] || return 1
@@ -235,15 +250,35 @@ shell_stdin() {
 # is_stdin_path <word>: a script path that is the shell's stdin.
 is_stdin_path() { [[ "$1" =~ ^(/dev/stdin|/dev/fd/0|/proc/self/fd/0)$ ]]; }
 
+# track_dir <command words...>: keeps RUN_DIR, the checkout later commands run in, through cd and pushd to a literal
+# target. An unresolvable target (none, -, ~, +N, a $ word), popd, or an export of GIT_DIR, GIT_COMMON_DIR or
+# GIT_CONFIG_* empties RUN_DIR, which refuses a later lane push.
+track_dir() {
+  local d
+  case "${1##*/}" in
+    cd|pushd)
+      shift
+      while [[ "${1:-}" =~ ^-[LPe@]+$ ]]; do shift; done
+      [ "${1:-}" != -- ] || shift
+      d="${1:-}"
+      if [ -z "$d" ] || [ -z "$RUN_DIR" ] || [[ "$d" == [-~+]* || "$d" == *'$'* ]]; then RUN_DIR=""; return 0; fi
+      case "$d" in /*) RUN_DIR="$d" ;; *) RUN_DIR="$RUN_DIR/$d" ;; esac ;;
+    popd) RUN_DIR="" ;;
+    export|declare|typeset|readonly)
+      for d in "${@:2}"; do [[ ! "$d" =~ ^GIT_(DIR|COMMON_DIR|CONFIG_[A-Z0-9_]+)= ]] || RUN_DIR=""; done ;;
+  esac
+}
+
 # check_command <index in CMDS>: strips wrappers, follows shells and eval into CMDS, and matches the real command.
 check_command() {
-  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script GIT_ENV_CONFIG=0
+  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script GIT_ENV_CONFIG=0 CMD_DIR="$RUN_DIR"
   local -a W=()
   VIA_XARGS=0
   while [ -n "$rest" ]; do W+=("${rest%%"$SEP"*}"); rest="${rest#*"$SEP"}"; done
   while :; do
     while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
       if [[ "${W[0]}" =~ ^GIT_CONFIG_(COUNT|KEY_[0-9]+|PARAMETERS|GLOBAL|SYSTEM)= ]]; then GIT_ENV_CONFIG=1; fi
+      if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then CMD_DIR=""; fi
       drop 1
     done
     [ "${#W[@]}" -gt 0 ] || return 0
@@ -254,6 +289,7 @@ check_command() {
         if [ "${W[0]}" = "--" ]; then drop 1; break; fi
         if [ "$base" = command ] && [[ "${W[0]}" =~ ^-[a-zA-Z]*[vV] ]]; then return 0; fi
         if [ "$base" = env ] && [[ "${W[0]}" =~ ^(-S|--split-string)$ ]]; then tokenize "${W[1]:-}"; return 0; fi
+        if [[ "$base:${W[0]}" =~ ^(env:-C|env:--chdir|sudo:-D|sudo:--chdir)(=.*)?$ ]]; then CMD_DIR=""; fi
         if [[ "${WRAPPERS[$base]}" == *" ${W[0]} "* ]]; then drop 2; else drop 1; fi
       done
       if [ "$base" = timeout ]; then drop 1; fi
@@ -282,7 +318,7 @@ check_command() {
         return 0 ;;
       eval) drop 1; tokenize "${W[*]:-}"; return 0 ;;
       source|.) if is_stdin_path "${W[1]:-}"; then shell_stdin "$idx"; fi; return 0 ;;
-      *) match_command || true; return 0 ;;
+      *) track_dir "${W[@]}"; match_command || true; return 0 ;;
     esac
   done
 }
@@ -322,6 +358,7 @@ load_patterns() {
 guard_lead_only() {
   local cmd idx
   CMDS=(); CMD_STDIN=(); CMD_PIPE=(); CMD_RAW=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
+  RUN_DIR="$SESSION_DIR"
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   load_patterns
   if [ "$VALID" -eq 0 ]; then
@@ -405,9 +442,9 @@ guard_main_edit() {
   enabled="$(setting main_checkout_guard off)"
   [[ "$enabled" =~ ^(on|yes|true|1)$ ]] || exit 0
 
-  listing="$(git -C "$GIT_DIR" worktree list --porcelain 2>/dev/null || true)"
+  listing="$(git -C "$SESSION_DIR" worktree list --porcelain 2>/dev/null || true)"
   if [ -z "$listing" ]; then
-    note "session directory $GIT_DIR is not a git checkout: main-checkout guard skipped"
+    note "session directory $SESSION_DIR is not a git checkout: main-checkout guard skipped"
     exit 0
   fi
   while IFS= read -r line; do
@@ -419,7 +456,7 @@ guard_main_edit() {
   # With only the main checkout there is nothing to protect.
   [ "${#roots[@]}" -ge 2 ] || exit 0
 
-  case "$path" in /*) ;; *) path="$GIT_DIR/$path" ;; esac
+  case "$path" in /*) ;; *) path="$SESSION_DIR/$path" ;; esac
   target="$(canon "$path")"
   main="${roots[0]}"
   under "$target" "$main" || exit 0
@@ -434,7 +471,7 @@ guard_main_edit() {
   fi
 
   rel="${target#"$main"/}"
-  top="$(git -C "$GIT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  top="$(git -C "$SESSION_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$top" ] && [ "$(canon "$top")" != "$main" ]; then hint="$(canon "$top")/$rel"; else hint="${roots[1]}/$rel (or another linked worktree)"; fi
   deny "lanes-guards rule main-edit: $path is inside the main checkout ($main) while lanes work in linked worktrees. Allowed path: the same file in a worktree, $hint. The lead may be exempted with lead_exempt_main_checkout: yes in .lanes/guards.md."
 }
@@ -472,7 +509,8 @@ if [ "$VALID" -eq 1 ]; then
   CWD="$(jstr cwd)"
 fi
 [ -n "$CWD" ] && [ -d "$CWD" ] || CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
-GIT_DIR="$CWD"
+# Not named GIT_DIR: git reads that variable from the environment, so an inherited export would retarget every git -C.
+SESSION_DIR="$CWD"
 ROLE="none"; CALLER_LANE=""; MATCHED=""
 find_config
 

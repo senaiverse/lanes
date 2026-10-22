@@ -16,4 +16,5 @@ default_branch:
 - `plan_marker`: a `SendMessage` starting with this text is refused unless the sender is the lead.
 - `main_checkout_guard`: `on` refuses Edit, Write and NotebookEdit inside the main checkout while linked worktrees exist.
 - `lead_exempt_main_checkout`: `yes` lets the lead edit the main checkout.
-- `default_branch`: the branch a lane may never name in its explicit push. Empty means the remote's head, else `main` and `master`.
+- `default_branch`: a branch a lane may never name in its explicit push, beside the pushed remote's head. Set it when a
+  remote has no head (`refs/remotes/<remote>/HEAD`); with neither, a lane's push to that remote is refused.

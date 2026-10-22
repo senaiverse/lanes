@@ -91,7 +91,8 @@ bash_untouched() {
   assert_untouched || { echo "command: $2"; return 1; }
 }
 
-# make_repo: a main checkout with one linked worktree for lane1 and one nested inside the main checkout.
+# make_repo: a main checkout with one linked worktree for lane1 and one nested inside the main checkout, and an origin
+# remote whose head is main, as a clone has.
 make_repo() {
   REPO="$LANES_TEST_TMP/repo"
   WT="$LANES_TEST_TMP/wt-lane1"
@@ -103,8 +104,19 @@ make_repo() {
   echo two >"$REPO/src/app.txt"
   git -C "$REPO" add -A
   git -C "$REPO" commit -q -m init
+  add_remote origin main
   git -C "$REPO" worktree add -q "$WT" -b lane1
   git -C "$REPO" worktree add -q "$REPO/.wt/nested" -b nested
   REPO="$(cd -P "$REPO" && pwd -P)"
   WT="$(cd -P "$WT" && pwd -P)"
+}
+
+# add_remote <name> [head branch] [repo]: a remote of the repo (default $REPO); with a head branch, its
+# refs/remotes/<name>/HEAD points there, as a clone or `git remote set-head` leaves it.
+add_remote() {
+  local repo="${3:-$REPO}"
+  git -C "$repo" remote add "$1" "$LANES_TEST_TMP/$1.git"
+  [ -n "${2:-}" ] || return 0
+  git -C "$repo" update-ref "refs/remotes/$1/$2" HEAD
+  git -C "$repo" symbolic-ref "refs/remotes/$1/HEAD" "refs/remotes/$1/$2"
 }

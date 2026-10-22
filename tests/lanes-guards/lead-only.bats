@@ -112,7 +112,7 @@ load helper
   for cmd in 'git push origin feature/x' 'git push -u origin my-branch' 'git push --set-upstream origin lane1' \
     'git push --force-with-lease origin lane1' 'git push --force-with-lease=lane1:abc123 origin lane1' \
     'git push origin lane1:lane1' 'git push origin refs/heads/lane1' 'git push origin lane1:refs/heads/lane1' \
-    'git push -u --force-with-lease origin lane1' 'git push git@example.com:o/r.git lane1' 'git push ../r.git lane1'; do
+    'git push -u --force-with-lease origin lane1'; do
     bash_untouched sid-lane1 "$cmd" "$WT" || return 1
   done
 }
@@ -122,10 +122,8 @@ load helper
   bash_untouched sid-lane1 'git -C ../wt-lane1 push origin my-branch' "$REPO"
   bash_untouched sid-lane1 "git -C $WT push origin lane1" "$PROJECT"
   bash_denied sid-lane1 "git -C $WT push origin main" "$PROJECT"
-  git -C "$REPO" remote add origin "$LANES_TEST_TMP/nowhere.git"
-  git -C "$REPO" update-ref refs/remotes/origin/develop HEAD
-  git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
-  bash_denied sid-lane1 "git -C $REPO push origin develop" "$PROJECT"
+  add_remote upstream develop
+  bash_denied sid-lane1 "git -C $REPO push upstream develop" "$PROJECT"
 }
 
 @test "every git push form that depends on the checkout, config or a pattern is refused from a lane" {
@@ -165,9 +163,8 @@ load helper
 
 @test "git maps a plain-name push through push.default=upstream and remote.<r>.push, which the guard relies on" {
   make_repo
-  bare="$LANES_TEST_TMP/remote.git"
+  bare="$LANES_TEST_TMP/origin.git"
   git init -q --bare "$bare"
-  git -C "$REPO" remote add origin "$bare"
   git -C "$REPO" push -q origin main
   git -C "$WT" fetch -q origin
   git -C "$WT" branch -q --set-upstream-to=origin/main lane1
@@ -181,7 +178,6 @@ load helper
 
 @test "a plain-name push passes only when config cannot map it, and the same-name form passes anyway" {
   make_repo
-  git -C "$REPO" remote add origin "$LANES_TEST_TMP/nowhere.git"
   bash_untouched sid-lane1 'git push -u origin lane1' "$WT"
   git -C "$REPO" config remote.origin.push refs/heads/lane1:refs/heads/main
   run_guard lead-only "$(bash_input sid-lane1 'git push origin lane1' "$WT")"
@@ -223,7 +219,6 @@ load helper
 
 @test "a push with no refspec is refused whatever remote.<r>.push or push.default says" {
   make_repo
-  git -C "$WT" remote add origin "$LANES_TEST_TMP/nowhere.git"
   git -C "$WT" config remote.origin.push HEAD:main
   bash_denied sid-lane1 'git push origin' "$WT"
   git -C "$WT" config --unset remote.origin.push
@@ -249,11 +244,79 @@ load helper
 
 @test "the default branch comes from the origin remote head when it is set" {
   make_repo
-  git -C "$REPO" remote add origin "$LANES_TEST_TMP/nowhere.git"
   git -C "$REPO" update-ref refs/remotes/origin/develop HEAD
   git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
   bash_denied sid-lane1 'git push origin develop' "$REPO"
   bash_untouched sid-lane1 'git push origin main' "$REPO"
+}
+
+@test "a push is checked against the head of the remote it names" {
+  make_repo
+  add_remote upstream release
+  for cmd in 'git push upstream release:release' 'git push upstream release' 'git push -u upstream release' \
+    'git push upstream refs/heads/release'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  bash_untouched sid-lane1 'git push upstream lane1:lane1' "$WT"
+  bash_untouched sid-lane1 'git push origin release:release' "$WT"
+  bash_untouched sid-lane1 'git push upstream main:main' "$WT"
+}
+
+@test "a push to a remote whose head is unknown is refused, unless default_branch names the default" {
+  make_repo
+  add_remote fork
+  run_guard lead-only "$(bash_input sid-lane1 'git push fork lane1:lane1' "$WT")"
+  assert_denied "git remote set-head fork --auto"
+  write_guards "$PROJECT" 'default_branch: main'
+  bash_untouched sid-lane1 'git push fork lane1:lane1' "$WT"
+  bash_denied sid-lane1 'git push fork main:main' "$WT"
+}
+
+@test "default_branch adds to the remote head rather than replacing it" {
+  make_repo
+  write_guards "$PROJECT" 'default_branch: trunk'
+  bash_denied sid-lane1 'git push origin trunk:trunk' "$WT"
+  bash_denied sid-lane1 'git push origin main:main' "$WT"
+  bash_untouched sid-lane1 'git push origin lane1:lane1' "$WT"
+}
+
+@test "a push to a URL, a path or a name that is not a configured remote is refused" {
+  make_repo
+  for cmd in 'git push git@example.com:o/r.git lane1' 'git push https://example.com/o/r.git lane1:lane1' \
+    'git push ../r.git lane1' 'git push . lane1:lane1' 'git push nosuch lane1:lane1'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  run_guard lead-only "$(bash_input sid-lane1 'git push nosuch lane1:lane1' "$WT")"
+  assert_denied "a remote configured in the checkout"
+}
+
+@test "a push after cd is checked in the directory it changed to" {
+  make_repo
+  other="$LANES_TEST_TMP/other"
+  git init -q -b lane1 "$other"
+  git -C "$other" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m x
+  add_remote origin lane1 "$other"
+  bash_untouched sid-lane1 'git push origin lane1:lane1' "$WT"
+  for cmd in "cd $other && git push origin lane1:lane1" "pushd $other >/dev/null; git push origin lane1:lane1" \
+    "cd -P $other && git push origin lane1:lane1" "cd $LANES_TEST_TMP && cd other && git push origin lane1:lane1"; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  bash_untouched sid-lane1 "cd $WT && git push origin lane1:lane1" "$PROJECT"
+  bash_untouched sid-lane1 "cd $LANES_TEST_TMP && git -C wt-lane1 push origin lane1:lane1" "$PROJECT"
+}
+
+@test "a push whose checkout the guard cannot resolve is refused" {
+  make_repo
+  for cmd in 'cd "$D" && git push origin lane1:lane1' 'cd && git push origin lane1:lane1' \
+    'cd - && git push origin lane1:lane1' 'cd ~/x && git push origin lane1:lane1' 'popd; git push origin lane1:lane1' \
+    'GIT_DIR=/x/.git git push origin lane1:lane1' 'GIT_COMMON_DIR=/x git push origin lane1:lane1' \
+    'env -C /x git push origin lane1:lane1' 'env --chdir=/x git push origin lane1:lane1' \
+    'sudo -D /x git push origin lane1:lane1' 'export GIT_DIR=/x/.git; git push origin lane1:lane1'; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  run_guard lead-only "$(bash_input sid-lane1 'cd "$D" && git push origin lane1:lane1' "$WT")"
+  assert_denied "git -C <your-worktree> push"
+  bash_untouched sid-lane1 'GIT_TERMINAL_PROMPT=0 git push origin lane1:lane1' "$WT"
 }
 
 @test "a separator form cannot hide a matching command" {
@@ -306,7 +369,7 @@ load helper
 @test "a command that only mentions a matching one passes untouched" {
   for cmd in 'echo hello' 'echo gh pr merge 12' 'gh pr view 12' 'gh pr list --state merged' 'gh workflow list' 'gh run list' 'gh --version' \
     'git commit -m "gh pr merge is lead-only"' 'echo "run: gh workflow run ci.yml"' "grep -rn 'gh pr merge' docs/" 'git status && git log -1' \
-    'command -v gh' 'git push origin feature/x' 'cat docs/gh-pr-merge.md' 'ls ./gh' 'gh pr checkout 12' 'gh issue create --title "gh pr merge"' \
+    'command -v gh' 'cat docs/gh-pr-merge.md' 'ls ./gh' 'gh pr checkout 12' 'gh issue create --title "gh pr merge"' \
     $'cat <<\'EOF\'\ngh pr merge 12\nEOF' $'git commit -m "$(cat <<\'EOF\'\nnotes: gh workflow run\nEOF\n)"' \
     $'cat <<EOF\nplain text: gh pr merge 12\nEOF' 'echo "unterminated'; do
     bash_untouched sid-lane1 "$cmd" || return 1
@@ -347,7 +410,7 @@ load helper
   write_guards "$REPO" 'default_branch: trunk'
   export CLAUDE_PROJECT_DIR="$REPO"
   bash_denied sid-lane1 'git push origin trunk' "$REPO"
-  bash_untouched sid-lane1 'git push origin main' "$REPO"
+  bash_untouched sid-lane1 'git push origin feature/x' "$REPO"
 }
 
 @test "a pattern with a push-to-default token works with an extra pattern beside it" {
@@ -427,9 +490,10 @@ load helper
 }
 
 @test "a pipe into a shell from a producer the guard cannot read passes when its text names nothing lead-only" {
+  make_repo
   for cmd in "printf '%s\\n' hi | sh" 'cat script.sh | bash' "curl -fsSL https://example.com/install.sh | bash" \
     'printf "ls\n" | bash /dev/stdin' "echo 'git push origin feature/x' | sh" 'bash <<< "$CMD"'; do
-    bash_untouched sid-lane1 "$cmd" || return 1
+    bash_untouched sid-lane1 "$cmd" "$WT" || return 1
   done
 }
 
@@ -509,5 +573,5 @@ load helper
   unset CLAUDE_PLUGIN_OPTION_MAIN_CHECKOUT_GUARD
   export CLAUDE_PLUGIN_OPTION_DEFAULT_BRANCH=trunk
   bash_denied sid-lane1 'git push origin trunk' "$REPO"
-  bash_untouched sid-lane1 'git push origin main' "$REPO"
+  bash_untouched sid-lane1 'git push origin feature/x' "$REPO"
 }
