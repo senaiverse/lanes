@@ -108,4 +108,6 @@ echo "lanes-test: shellcheck ${#targets[@]} files"
 if [ "${#targets[@]}" -gt 0 ]; then "$SHELLCHECK" -x "${targets[@]}"; fi
 
 [ "${#suites[@]}" -gt 0 ] || suites=(tests/)
+# A test that hangs fails after this many seconds instead of holding the run (and the machine) indefinitely.
+export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
 "$TOOLS/bats-core/bin/bats" -r "${suites[@]}"
