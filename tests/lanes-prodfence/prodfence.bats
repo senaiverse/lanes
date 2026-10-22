@@ -430,6 +430,62 @@ edit_of() {
   config "protected_paths: $real/deploy/prod/*" "## Markers" "- $MARKER"
   guard "$(edit_of "$link/deploy/prod/app.yaml")"
   assert_denied
+  # An absolute glob written through a symlink (macOS /tmp is /private/tmp) matches the file by its real path.
+  config "protected_paths: $link/deploy/prod/*" "## Markers" "- $MARKER"
+  guard "$(edit_of "$real/deploy/prod/app.yaml")"
+  assert_denied
+}
+
+@test "a relative glob whose directory is a symlink out of the project matches the target path" {
+  local ops="$LANES_TEST_TMP/ops"
+  mkdir -p "$ops/prod" "$PROJ/deploy"
+  : >"$ops/prod/app.yaml"
+  ln -s "$ops/prod" "$PROJ/deploy/prod"
+  default_config
+  guard "$(edit_of "$ops/prod/app.yaml")"
+  assert_denied
+  guard "$(bash_input "cat $ops/prod/app.yaml")"
+  assert_denied
+  guard "$(edit_of "$ops/staging.yaml")"
+  assert_allowed
+}
+
+@test "a .. after a symlinked directory is resolved where the symlink points, as the kernel does" {
+  local prod="$LANES_TEST_TMP/production"
+  mkdir -p "$prod/subdir"
+  : >"$prod/secret"
+  ln -s "$prod/subdir" "$PROJ/link"
+  ln -s "link/../secret" "$PROJ/alias"
+  config "protected_paths: $prod/secret" "## Markers" "- $MARKER"
+  guard "$(hook_input Read "$(jq -cn --arg f "$PROJ/alias" '{file_path: $f}')")"
+  assert_denied
+  guard "$(hook_input Read "$(jq -cn --arg f "$PROJ/link/../secret" '{file_path: $f}')")"
+  assert_denied
+  guard "$(hook_input Read "$(jq -cn --arg f "$PROJ/link/x" '{file_path: $f}')")"
+  assert_allowed
+}
+
+@test "a file tool path naming a marker is refused even with fence_file_content off" {
+  default_config
+  local tool
+  for tool in Read Edit Write; do
+    guard "$(hook_input "$tool" "$(jq -cn --arg f "$PROJ/config/$MARKER.env" '{file_path: $f, old_string: "a", new_string: "b", content: "x"}')")"
+    assert_denied
+    assert_output --partial "marker in tool_input.file_path"
+    refute_leaks
+  done
+  guard "$(hook_input NotebookEdit "$(jq -cn --arg f "$PROJ/nb/$PROJECT_MARKER.ipynb" '{notebook_path: $f, new_source: "x"}')")"
+  assert_denied
+  assert_output --partial "marker in tool_input.notebook_path"
+}
+
+@test "an empty JSON list in protected_paths or an option adds nothing and refuses nothing" {
+  config "protected_paths: []" "## Markers" "- $MARKER"
+  export CLAUDE_PLUGIN_OPTION_MARKERS="[]" CLAUDE_PLUGIN_OPTION_PROTECTED_PATHS="[]"
+  guard "$(bash_input "ls")"
+  assert_allowed
+  guard "$(bash_input "ping $MARKER")"
+  assert_denied
 }
 
 @test "a shell command naming a protected path is refused even with no marker" {
@@ -486,6 +542,29 @@ edit_of() {
   run --separate-stderr "$BIN" nope
   assert_failure 2
   [[ "$stderr" == *"usage"* ]]
+}
+
+@test "every refusal the skill quotes is what the guard prints, with <field> standing for the field" {
+  default_config
+  local printed=() quote pattern n=0
+  guard "$(bash_input "psql -h $MARKER")"
+  printed+=("$output")
+  guard "$(edit_of "$PROJ/deploy/prod/app.yaml")"
+  printed+=("$output")
+  config "unknown_key: x"
+  guard "$(bash_input "ls")"
+  printed+=("$stderr")
+  while IFS= read -r quote; do
+    n=$((n + 1))
+    pattern="${quote//<field>/*}"
+    local p found=0
+    for p in "${printed[@]}"; do
+      # shellcheck disable=SC2053  # the quote, with <field> as a wildcard, is matched as a pattern on purpose
+      [[ $p == *$pattern* ]] && found=1
+    done
+    [ "$found" -eq 1 ] || { echo "the skill quotes '$quote' but the guard never prints it" >&2; false; }
+  done < <(sed -n '/^## When a call is refused/,/^## /s/^- `\([^`]*\)`.*/\1/p' "$PLUGIN/skills/prodfence/SKILL.md")
+  [ "$n" -eq 3 ] || { echo "expected 3 quoted refusals in the skill, found $n" >&2; false; }
 }
 
 @test "hooks.json wires every guarded tool to the guard with onFailure block" {

@@ -93,7 +93,7 @@ split_list() {
   SPLIT=()
   v="$(trim "$1")"
   if [[ $v == '['* ]]; then
-    v="$(jq -er 'if type == "array" and all(.[]; type == "string") then .[] else error("not a list of strings") end' <<<"$v" 2>/dev/null)" \
+    v="$(jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a list of strings") end' <<<"$v" 2>/dev/null)" \
       || broken "a markers or protected_paths value starting with [ is not a JSON array of strings" "write it as a list separated by ';'"
   else
     v="${v//;/$'\n'}"
@@ -256,44 +256,81 @@ collapse() {
   printf '/%s' "${out[*]}"
 }
 
-# canon <path>: the real path, portably. Symlinks on the file are followed, the deepest existing directory is resolved
-# with cd -P, and a missing tail is kept as written, so a file that does not exist yet still gets its real parent.
+# canon <path>: the real path as the kernel resolves it, portably (no readlink -f, realpath or cd -P). Components are
+# walked left to right and each symlink is replaced by its target before the next "..", which climbs from where the
+# link points; a missing component is kept as written, so a file that does not exist yet still gets its real parent.
 canon() {
-  local p="$1" dir rest="" target hops=0 out
-  [[ $p == /* ]] || p="$CWD/$p"
-  p="$(collapse "$p")"
-  while [ -L "$p" ] && [ "$hops" -lt 40 ]; do
-    target="$(readlink "$p")"
-    [[ $target == /* ]] || target="${p%/*}/$target"
-    p="$(collapse "$target")"
-    hops=$((hops + 1))
+  local rest="$1" real="" part target hops=0
+  [[ $rest == /* ]] || rest="$CWD/$rest"
+  while :; do
+    rest="${rest#"${rest%%[!/]*}"}"
+    [ -n "$rest" ] || break
+    part="${rest%%/*}"
+    if [[ $rest == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+    case "$part" in
+      .) continue ;;
+      ..) real="${real%/*}"; continue ;;
+    esac
+    if [ -L "$real/$part" ] && [ "$hops" -lt 40 ]; then
+      target="$(readlink "$real/$part")"
+      [[ $target != /* ]] || real=""
+      rest="$target/$rest"
+      hops=$((hops + 1))
+      continue
+    fi
+    real="$real/$part"
   done
-  dir="$p"
-  while [ ! -d "$dir" ]; do
-    rest="/${dir##*/}$rest"
-    dir="${dir%/*}"
-    [ -n "$dir" ] || dir=/
-  done
-  dir="$(cd -P "$dir" 2>/dev/null && pwd -P)" || dir="${p%"$rest"}"
-  out="${dir%/}$rest"
-  printf '%s\n' "${out:-/}"
+  printf '%s\n' "${real:-/}"
 }
 
-# A glob matches the path as given or its real path, absolute or below the (real) project root; a glob without a slash
-# also matches the file name. Matching ignores case on every filesystem: a false refusal is cheap, a miss is not.
+# A glob with a literal directory is also kept by that directory's real path (a relative glob is read from the project
+# root), so a glob written through a symlink, or naming a symlinked directory, matches the file by its real path. A glob
+# without a wildcard is resolved whole. REAL_HEADS[i] is the real literal part, matched as text, and REAL_TAILS[i] the
+# rest of the glob, so REAL_HEADS[i] followed by REAL_TAILS[i] is the glob by its real path.
+REAL_HEADS=()
+REAL_TAILS=()
+real_globs() {
+  local g lit head tail
+  for g in ${GLOBS[@]+"${GLOBS[@]}"}; do
+    [[ $g == */* ]] || continue
+    lit="${g%%[\*\?\[]*}"
+    if [ "$lit" = "$g" ]; then
+      head="$g" tail=""
+    else
+      [[ $lit == */* ]] || continue
+      head="${lit%/*}"
+      tail="${g:${#head}}"
+    fi
+    [ -n "$head" ] || continue
+    [[ $head == /* ]] || head="$ROOT/$head"
+    head="$(canon "$head")"
+    REAL_HEADS+=("${head%/}${tail:+/}")
+    REAL_TAILS+=("${tail#/}")
+  done
+}
+
+# A glob matches the path as given, with ".." removed as text, or the real path of either, absolute or below the
+# (real) project root; a glob without a slash also matches the file name. Matching ignores case on every filesystem:
+# a false refusal is cheap, a miss is not.
 protected() {
-  local raw="$1" real g c hit=1 cands
+  local raw="$1" lex g c i hit=1 cands=()
   [ "${#GLOBS[@]}" -gt 0 ] || return 1
   [[ $raw == /* ]] || raw="$CWD/$raw"
-  real="$(canon "$raw")"
-  cands=("$raw" "$real")
-  [[ $raw != "$ROOT"/* ]] || cands+=("${raw#"$ROOT"/}")
-  [[ $real != "$REAL_ROOT"/* ]] || cands+=("${real#"$REAL_ROOT"/}")
+  lex="$(collapse "$raw")"
+  for c in "$raw" "$lex" "$(canon "$raw")" "$(canon "$lex")"; do
+    cands+=("$c")
+    [[ $c != "$ROOT"/* ]] || cands+=("${c#"$ROOT"/}")
+    [[ $c != "$REAL_ROOT"/* ]] || cands+=("${c#"$REAL_ROOT"/}")
+  done
   shopt -s nocasematch
-  for g in "${GLOBS[@]}"; do
-    for c in "${cands[@]}"; do
+  for c in "${cands[@]}"; do
+    for g in "${GLOBS[@]}"; do
       # shellcheck disable=SC2053  # the right-hand side is the configured glob, matched as a pattern on purpose
       if [[ $c == $g ]] || { [[ $g != */* ]] && [[ ${c##*/} == $g ]]; }; then hit=0; break 2; fi
+    done
+    for i in ${REAL_HEADS[@]+"${!REAL_HEADS[@]}"}; do
+      # shellcheck disable=SC2053  # the real head is literal, the tail is the configured glob
+      if [[ $c == "${REAL_HEADS[i]}"${REAL_TAILS[i]} ]]; then hit=0; break 2; fi
     done
   done
   shopt -u nocasematch
@@ -306,8 +343,11 @@ case "$TOOL" in
     target="$(jq -r '.tool_input | if (.file_path | type) == "string" then "file_path=\(.file_path)" elif (.notebook_path | type) == "string" then "notebook_path=\(.notebook_path)" else empty end' <<<"$INPUT")"
     [ -n "$target" ] || { echo "$ME: $TOOL input has no file_path: refusing the call: $REPORT" >&2; exit 2; }
     REAL_ROOT="$(canon "$ROOT")"
+    real_globs
     if protected "${target#*=}"; then deny "protected path" "tool_input.${target%%=*}"; fi
-    [ "$FILE_CONTENT" = on ] || exit 0
+    # The path is always matched against markers; the content written or replaced only with fence_file_content on.
+    [ "$FILE_CONTENT" = on ] \
+      || INPUT="$(jq -c '.tool_input |= with_entries(select(.key == "file_path" or .key == "notebook_path"))' <<<"$INPUT")"
     ;;
 esac
 
@@ -315,13 +355,19 @@ field="$(first_hit "${MARKERS[@]}")"
 [ -z "$field" ] || deny marker "$field"
 
 # A shell command that names no marker can still reach production through a protected file, so it is refused when it
-# mentions a protected path: each glob's literal text before its first wildcard, when that is not empty.
+# mentions a protected path: each glob's literal text before its first wildcard, when that is not empty, as written
+# and by its real directory.
 case "$TOOL" in
   Bash | PowerShell | Monitor)
     prefixes=()
     for g in ${GLOBS[@]+"${GLOBS[@]}"}; do
       g="${g%%[\*\?\[]*}"
       [ -z "$g" ] || prefixes+=("$g")
+    done
+    real_globs
+    for i in ${REAL_HEADS[@]+"${!REAL_HEADS[@]}"}; do
+      g="${REAL_TAILS[i]}"
+      prefixes+=("${REAL_HEADS[i]}${g%%[\*\?\[]*}")
     done
     if [ "${#prefixes[@]}" -gt 0 ]; then
       field="$(first_hit "${prefixes[@]}")"
