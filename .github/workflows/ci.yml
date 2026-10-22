@@ -58,8 +58,6 @@ jobs:
           bash --version | head -n 1
           jq --version
 
-      - name: Tests (shellcheck and bats) for the Windows-candidate plugins
-        run: |
-          suites=(tests/lanes-plancheck)
-          if [ -d tests/lanes-prodfence ]; then suites+=(tests/lanes-prodfence); fi
-          scripts/test.sh "${suites[@]}"
+      # Only plugins supported on native Windows (DECISIONS row 12) run here.
+      - name: Tests (shellcheck and bats) for the plugins supported on native Windows
+        run: scripts/test.sh tests/lanes-plancheck
