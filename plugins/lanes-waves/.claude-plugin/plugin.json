@@ -1,0 +1,14 @@
+{
+  "name": "lanes-waves",
+  "displayName": "Lanes Waves",
+  "version": "0.1.0",
+  "description": "Release waves for lane sessions: theme branches, one integration branch, review PRs by area, one merge. Requires the core `lanes` plugin and its `.lanes/RULES.md`.",
+  "author": {
+    "name": "senaiverse",
+    "url": "https://github.com/senaiverse"
+  },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["release", "waves", "integration-branch", "lanes", "tmux"]
+}
