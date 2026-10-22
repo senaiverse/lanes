@@ -135,6 +135,17 @@ load helper
   [ "$status" -eq 0 ]
 }
 
+@test "slot release exits 0 for a held slot in a larger pool, and is a no-op for a pid that holds none" {
+  export LANES_POOL_SIZE=2
+  run "$JOB" slot acquire p --pid $$
+  [ "$output" = "1" ]
+  run "$JOB" slot release p --pid $$
+  [ "$status" -eq 0 ]
+  [ ! -e "$LANES_DATA_DIR/locks/p-1.lock" ]
+  run "$JOB" slot release p --pid $$
+  [ "$status" -eq 0 ]
+}
+
 @test "slot acquire hands out distinct slots up to the pool size" {
   export LANES_POOL_SIZE=2
   run "$JOB" slot acquire p --pid $$
@@ -296,18 +307,173 @@ race_six() {
   [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
 }
 
+@test "two waiters that read the same dead mkdir-mutex owner never both hold the mutex" {
+  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+  fake_tmux hold
+  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
+  sleep 0.01 &
+  dead=$!
+  wait "$dead"
+  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  # Waiter B pauses after reading the dead owner; waiter A then breaks the mutex and holds it inside fake tmux.
+  write_hook '[ "$1" = before-break ] && [ ! -e "$HOOK_DIR/a.pid" ] || exit 0
+LANES_TEST_HOOK= "$JOB" run a -- true >"$HOOK_DIR/a.out" 2>&1 &
+echo "$!" >"$HOOK_DIR/a.pid"
+for _ in $(seq 200); do [ -e "$HOOK_DIR/inside" ] && exit 0; sleep 0.05; done
+exit 1'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" slot acquire p --pid $$
+  unset LANES_TEST_HOOK
+  [ -e "$WORK/inside" ]
+  [ "$(cat "$LANES_DATA_DIR/locks/.mutex.d/owner")" = "$(cat "$WORK/a.pid")" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"lanes-job:"*"mutex"* ]]
+  [ ! -e "$LANES_DATA_DIR/locks/p-1.lock" ]
+  touch "$WORK/go"
+  wait_for 10 bash -c '! kill -0 "$1" 2>/dev/null' _ "$(cat "$WORK/a.pid")"
+  [ ! -d "$LANES_DATA_DIR/locks/.mutex.d" ]
+}
+
+@test "two breakers of one dead mkdir-mutex owner never both hold the mutex" {
+  export LANES_NO_FLOCK=1 LANES_MUTEX_TIMEOUT=1 JOB
+  fake_tmux hold
+  mkdir -p "$LANES_DATA_DIR/locks/.mutex.d"
+  sleep 0.01 &
+  dead=$!
+  wait "$dead"
+  echo "$dead" >"$LANES_DATA_DIR/locks/.mutex.d/owner"
+  # Breaker B pauses after its own check of the dead owner, just before the move; breaker C runs meanwhile.
+  write_hook '[ "$1" = before-move ] && [ ! -e "$HOOK_DIR/c.pid" ] || exit 0
+LANES_TEST_HOOK= "$JOB" run c -- true >"$HOOK_DIR/c.out" 2>&1 &
+c=$!
+echo "$c" >"$HOOK_DIR/c.pid"
+for _ in $(seq 200); do { [ -e "$HOOK_DIR/inside" ] || ! kill -0 "$c" 2>/dev/null; } && exit 0; sleep 0.05; done
+exit 1'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" slot acquire p --pid $$
+  unset LANES_TEST_HOOK
+  touch "$WORK/go"
+  [ -e "$WORK/c.pid" ]
+  # B took the mutex and the slot, so C must never have got inside, and it gave up loudly.
+  [ "$status" -eq 0 ]
+  [ ! -e "$WORK/inside" ]
+  [[ "$(cat "$WORK/c.out")" == *"lanes-job:"*"mutex"* ]]
+}
+
 # fake_tmux <mode>: a tmux on PATH that behaves per mode (see the script).
 fake_tmux() {
   mkdir -p "$WORK/bin"
   cat >"$WORK/bin/tmux" <<'FAKE'
 #!/usr/bin/env bash
 args=" $* "
+case "$FAKE_TMUX_MODE" in
+  hold) # the caller holds its mutex here until the test creates "go"
+    touch "$FAKE_TMUX_DIR/inside"
+    for _ in $(seq 400); do [ -e "$FAKE_TMUX_DIR/go" ] && break; sleep 0.05; done
+    exit 1 ;;
+  noclaim) # a window opens, but its runner never takes ownership
+    [[ "$args" == *" new-window "* ]] && echo @1
+    [[ "$args" == *" kill-window "* ]] && touch "$FAKE_TMUX_DIR/killed"
+    exit 0 ;;
+esac
 [[ "$args" == *" has-session "* ]] && { [ "$FAKE_TMUX_MODE" = window ] && exit 0; exit 1; }
 if [ "$FAKE_TMUX_MODE" = steal ]; then echo 999999 >"$LANES_DATA_DIR/locks/.mutex.d/owner"; fi
 exit 1
 FAKE
   chmod +x "$WORK/bin/tmux"
-  export PATH="$WORK/bin:$PATH" FAKE_TMUX_MODE="$1"
+  export PATH="$WORK/bin:$PATH" FAKE_TMUX_MODE="$1" FAKE_TMUX_DIR="$WORK"
+}
+
+# launcher_killed_after_window: the launcher dies by SIGKILL right after it opens the window, before any handoff.
+launcher_killed_after_window() {
+  export LANES_POOL_SIZE=1
+  write_hook '[ "$1" = after-window ] || exit 0
+echo "$PPID" >"$HOOK_DIR/launcher"
+kill -9 "$PPID"'
+  local jd="$LANES_DATA_DIR/jobs/live" runner pidfile slot
+  export LANES_TEST_HOOK="$WORK/hook"
+  # The command records, at its own start, its runner's pid and who the job record and the slot name as owner.
+  run "$JOB" run live -- bash -c 'echo "$PPID $(cat "$1") $(readlink "$2")"; sleep 60' _ "$jd/pid" "$LANES_DATA_DIR/locks/jobs-1.lock"
+  unset LANES_TEST_HOOK
+  [ "$status" -eq 137 ]
+  wait_for 10 test -s "$jd/log"
+  read -r runner pidfile slot <"$jd/log"
+  [ "$runner" != "$(cat "$WORK/launcher")" ]
+  [ "$pidfile" = "$runner" ]
+  [ "$slot" = "$runner" ]
+  run "$JOB" status live
+  [ "$status" -eq 3 ]
+  run "$JOB" run live -- true
+  [[ "$output" == *"lanes-job:"*"already running"* ]]
+  run "$JOB" run other -- true
+  [ "$status" -eq 75 ]
+}
+
+@test "a launcher killed right after it opens the window leaves the job owned by its live runner (flock)" {
+  command -v flock >/dev/null 2>&1 || skip "flock not installed"
+  launcher_killed_after_window
+}
+
+@test "a launcher killed right after it opens the window leaves the job owned by its live runner (mkdir fallback)" {
+  export LANES_NO_FLOCK=1
+  launcher_killed_after_window
+}
+
+# late_claim_hook: kill the first launcher right after it opens its window, and hold the first runner's claim until
+# the test creates "claim-go". The tmux server keeps the environment it started with, so the runner sees the hook.
+late_claim_hook() {
+  write_hook 'case "$1" in
+  after-window) mkdir "$HOOK_DIR/killed-once" 2>/dev/null && kill -9 "$PPID" ;;
+  before-claim)
+    mkdir "$HOOK_DIR/paused-once" 2>/dev/null || exit 0
+    for _ in $(seq 200); do [ -e "$HOOK_DIR/claim-go" ] && exit 0; sleep 0.05; done ;;
+esac
+exit 0'
+  export LANES_TEST_HOOK="$WORK/hook"
+  run "$JOB" run live -- touch "$WORK/ran"
+  [ "$status" -eq 137 ]
+  wait_for 10 test -d "$WORK/paused-once"
+}
+
+# live_windows <n>: the private tmux server has exactly n windows named "live".
+live_windows() {
+  [ "$(tmux -L "$LANES_TMUX_SOCKET" list-windows -t "=lanes-jobs" -F '#W' | grep -cx live)" -eq "$1" ]
+}
+
+@test "a runner whose dead launcher's slot was reclaimed never starts its command" {
+  export LANES_POOL_SIZE=1
+  late_claim_hook
+  sleep 60 &
+  holder=$!
+  run "$JOB" slot acquire jobs --pid "$holder"
+  [ "$output" = "1" ]
+  touch "$WORK/claim-go"
+  wait_for 10 live_windows 0
+  kill "$holder"
+  [ ! -e "$WORK/ran" ]
+  [ "$(readlink "$LANES_DATA_DIR/locks/jobs-1.lock")" = "$holder" ]
+}
+
+@test "a runner whose name was run again after its launcher died never starts its command" {
+  late_claim_hook
+  run "$JOB" run live --slot other -- sleep 60
+  [ "$status" -eq 0 ]
+  second="$(cat "$LANES_DATA_DIR/jobs/live/pid")"
+  touch "$WORK/claim-go"
+  wait_for 10 live_windows 1
+  [ ! -e "$WORK/ran" ]
+  [ "$(cat "$LANES_DATA_DIR/jobs/live/pid")" = "$second" ]
+}
+
+@test "a runner that never takes ownership is cleaned up and the launch fails loudly" {
+  export LANES_CLAIM_TIMEOUT=1
+  fake_tmux noclaim
+  run "$JOB" run ghost -- true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"lanes-job:"*"ownership"* ]]
+  [ ! -e "$LANES_DATA_DIR/jobs/ghost" ]
+  [ -z "$(ls "$LANES_DATA_DIR/locks" | grep -v '^\.mutex')" ]
+  [ -e "$WORK/killed" ]
 }
 
 @test "a mutex another process now owns is not freed by the first holder" {

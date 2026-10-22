@@ -17,6 +17,8 @@ lanes-job run <name> -- <command> [args...]
 - `<name>`: letters, digits, `.`, `_`, `-`; it starts with a letter or digit. One running job per name.
 - `--slot <pool>` picks the pool (default `jobs`). Each pool runs at most `LANES_POOL_SIZE` jobs at once (default 2).
 - A full pool is refused with exit 75 and nothing starts. Wait for a running job to end, then retry. Do not loop on it.
+- `run` returns once the job's own process owns its slot, so a launcher that dies afterwards cannot lose the job. If
+  that handoff does not happen within `LANES_CLAIM_TIMEOUT` seconds (default 10), `run` fails and nothing starts.
 - The command runs in your current directory with your `PATH`. Other shell variables do not follow you: the job sees
   the environment of the dedicated tmux server, which keeps what it had when the first job started. Pass a variable
   with `--env NAME` (copies its current value; repeat for several) or set it for one command:
@@ -51,5 +53,5 @@ killed (`EXIT:143` for TERM, `129` for a closed window). `EXIT:0` means the comm
 ## Slots for your own scripts
 
 `lanes-job slot acquire <pool> [--pid <n>]` prints the slot number it took, or exits 75 when the pool is full.
-`lanes-job slot release <pool> [--pid <n>]` frees it. The holder is the pid (default: the calling shell); a lock whose
+`lanes-job slot release <pool> [--pid <n>]` frees it, and exits 0 even when that pid holds no slot. The holder is the pid (default: the calling shell); a lock whose
 process is gone is reclaimed by the next caller.

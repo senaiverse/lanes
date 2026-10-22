@@ -6,11 +6,13 @@
 #   lanes-job wait <name> [--timeout <seconds>]        block until STATUS exists (exit 124 on timeout)
 #   lanes-job list                                     every job with its state
 #   lanes-job slot acquire|release <pool> [--pid <n>]  hand-managed pool slots for other scripts
+#   (_claim is internal: run.sh takes over its job's slot and record with it before the command starts.)
 # State lives in $DATA/jobs/<name>/{log,STATUS,pid,run.sh} and $DATA/locks/<pool>-<i>.lock.
 set -euo pipefail
 
 SESSION="lanes-jobs"
 MUTEX_TIMEOUT="${LANES_MUTEX_TIMEOUT:-10}"
+CLAIM_TIMEOUT="${LANES_CLAIM_TIMEOUT:-10}"
 DATA="${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}"
 POOL="${LANES_POOL_SIZE:-2}"
 
@@ -52,14 +54,15 @@ mutex_acquire() {
     flock -w "$MUTEX_TIMEOUT" 9 || die "could not take the lock mutex" "another lanes-job is stuck; retry"
   else
     MUTEX_DIR="$DATA/locks/.mutex.d"
-    local waited=0 holder
+    local waited=0 limit=$((MUTEX_TIMEOUT * 10)) holder
     until mkdir "$MUTEX_DIR" 2>/dev/null; do
       holder="$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)"
-      if [[ -n "$holder" ]] && ! pid_alive "$holder"; then
-        mutex_break
-      elif ((waited >= MUTEX_TIMEOUT * 10)); then
-        [[ -z "$holder" ]] || die "could not take the lock mutex (held by pid $holder)" "another lanes-job is stuck; retry"
-        mutex_break
+      if ((waited > limit)); then
+        die "could not take the lock mutex (owner pid ${holder:-unknown})" "if no lanes-job is running, remove $MUTEX_DIR"
+      elif [[ -n "$holder" ]] && ! pid_alive "$holder"; then
+        mutex_break "$holder"
+      elif [[ -z "$holder" ]] && ((waited == limit)); then
+        mutex_break ""
       fi
       waited=$((waited + 1))
       sleep 0.1
@@ -70,9 +73,16 @@ mutex_acquire() {
   trap mutex_release EXIT
 }
 
-# mutex_break: move the stale directory aside in one rename, so only one waiter removes it.
+# mutex_break <owner read>: breakers of one mutex instance serialize on an atomic mkdir of a marker named for the
+# owner they read, inside that instance, and the winner breaks it only if the instance still names that owner. So a
+# waiter holding a stale reading never moves aside a newer instance that a live process now owns.
 mutex_break() {
-  mv "$MUTEX_DIR" "$MUTEX_DIR.stale.$$" 2>/dev/null && rm -rf "$MUTEX_DIR.stale.$$" || true
+  test_hook before-break
+  mkdir "$MUTEX_DIR/break.${1//[^0-9]/_}" 2>/dev/null || return 0
+  [[ "$(cat "$MUTEX_DIR/owner" 2>/dev/null || true)" == "$1" ]] || return 0
+  test_hook before-move
+  mv "$MUTEX_DIR" "$MUTEX_DIR.stale.$$"
+  rm -rf "$MUTEX_DIR.stale.$$"
 }
 
 mutex_release() {
@@ -85,6 +95,11 @@ mutex_release() {
 }
 
 pid_alive() { [[ "$1" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null; }
+
+# test_hook <point>: when LANES_TEST_HOOK is set (tests only), run it at a named point to pin an interleaving.
+test_hook() {
+  [[ -z "${LANES_TEST_HOOK:-}" ]] || "$LANES_TEST_HOOK" "$1" 9>&-
+}
 
 lock_path() { printf '%s/locks/%s-%s.lock' "$DATA" "$1" "$2"; }
 
@@ -116,13 +131,16 @@ retarget() {
   mv -f "$1.new" "$1"
 }
 
+# job_pid <name>: the pid the job record names as owner (the launcher until the runner claims it), or empty.
+job_pid() { cat "$DATA/jobs/$1/pid" 2>/dev/null || true; }
+
 job_state() {
   local dir="$DATA/jobs/$1"
   if [[ ! -d "$dir" ]]; then
     echo unknown
   elif [[ -s "$dir/STATUS" ]]; then
     echo finished
-  elif pid_alive "$(cat "$dir/pid" 2>/dev/null || true)"; then
+  elif pid_alive "$(job_pid "$1")"; then
     echo running
   else
     echo lost
@@ -152,7 +170,7 @@ cmd_run() {
   check_pool_size
 
   mutex_acquire
-  local jobdir="$DATA/jobs/$name" slot slot_path pane_pid
+  local jobdir="$DATA/jobs/$name" slot slot_path window i
   [[ "$(job_state "$name")" != running ]] || die "job '$name' is already running" "wait for it with 'lanes-job wait $name' or pick another name"
   slot="$(slot_take "$pool" "$$")" || die "pool '$pool' is full ($POOL jobs running)" "retry when one ends ('lanes-job list'), or raise LANES_POOL_SIZE" 75
   slot_path="$(lock_path "$pool" "$slot")"
@@ -161,38 +179,72 @@ cmd_run() {
   mkdir -p "$jobdir"
   echo "$$" >"$jobdir/pid"
   : >"$jobdir/log"
-  write_runner "$jobdir" "$slot_path" "$@"
+  write_runner "$name" "$pool" "$slot" "$@"
 
   # The window runs with the server's environment, so the caller's directory and PATH are passed in explicitly.
   tm has-session -t "=$SESSION" 2>/dev/null || tm new-session -d -s "$SESSION" -n idle || {
     rm -rf "$slot_path" "$jobdir"
     die "could not start the tmux session '$SESSION'" "check that tmux works ('tmux new-session -d')"
   }
-  pane_pid="$(tm new-window -d -t "=$SESSION:" -n "$name" -c "$PWD" -P -F '#{pane_pid}' "$(printf '%q' "$jobdir/run.sh")")" || {
+  window="$(tm new-window -d -t "=$SESSION:" -n "$name" -c "$PWD" -P -F '#{window_id}' "$(printf '%q' "$jobdir/run.sh")")" || {
     rm -rf "$slot_path" "$jobdir"
     die "could not start a window for '$name'" "check that tmux works"
   }
-  # From here the slot and the pid file name the pane process, so a crash of this launcher releases nothing early.
-  retarget "$slot_path" "$pane_pid"
-  echo "$pane_pid" >"$jobdir/pid.new"
-  mv -f "$jobdir/pid.new" "$jobdir/pid"
+  test_hook after-window
+
+  # The runner moves the slot and the job record to its own pid (cmd_claim) before its command starts, so a launcher
+  # that dies from here on leaves a job that a live process owns. Wait for that handoff, bounded.
+  mutex_release
+  for ((i = 0; i < CLAIM_TIMEOUT * 10; i++)); do
+    [[ "$(job_pid "$name")" == "$$" ]] || break
+    sleep 0.1
+  done
+  # Under the mutex a claim and this cancel exclude each other, so exactly one of them happens.
+  mutex_acquire
+  if [[ "$(job_pid "$name")" == "$$" ]]; then
+    tm kill-window -t "$window" 2>/dev/null || true
+    rm -rf "$slot_path" "$jobdir"
+    die "the runner for '$name' did not take ownership within ${CLAIM_TIMEOUT}s; the job was not started" "check that tmux can run scripts from $DATA/jobs, or raise LANES_CLAIM_TIMEOUT"
+  fi
   echo "JOB $name LOG $jobdir/log STATUS $jobdir/STATUS SLOT $pool-$slot"
 }
 
-# write_runner <jobdir> <slot lock path> <cmd...>: the pane script. Its trap writes STATUS even when the job is
-# killed (HUP from a closed window, INT, TERM); only SIGKILL of the runner itself leaves no STATUS, and 'status' then
-# reports LOST because the pid is gone.
+# cmd_claim <name> <pool> <slot> <launcher pid> <runner pid>: internal, run by run.sh before its command. Under the
+# mutex it moves the slot and the job record from the launcher to the runner, only while both still name the
+# launcher; otherwise the launch was cancelled or its slot reclaimed, and it fails so the command never runs.
+cmd_claim() {
+  [[ $# -eq 5 && "$3" =~ ^[0-9]+$ && "$4" =~ ^[0-9]+$ && "$5" =~ ^[0-9]+$ ]] || usage
+  check_name "$1" "job name"
+  check_name "$2" "pool name"
+  local jobdir="$DATA/jobs/$1" slot_path launcher="$4" runner="$5"
+  slot_path="$(lock_path "$2" "$3")"
+  test_hook before-claim
+  mutex_acquire
+  [[ "$(readlink "$slot_path" 2>/dev/null || true)" == "$launcher" && "$(job_pid "$1")" == "$launcher" ]] ||
+    die "job '$1' no longer belongs to this launch" "its launcher gave up or its slot was reclaimed; run it again"
+  retarget "$slot_path" "$runner"
+  echo "$runner" >"$jobdir/pid.new"
+  mv -f "$jobdir/pid.new" "$jobdir/pid"
+}
+
+# write_runner <name> <pool> <slot> <cmd...>: the pane script. It claims the job first (cmd_claim) and exits if that
+# fails. Its trap writes STATUS even when the job is killed (HUP from a closed window, INT, TERM); only SIGKILL of the
+# runner itself leaves no STATUS, and 'status' then reports LOST because the pid is gone.
 write_runner() {
-  local jobdir="$1" slot_path="$2" v
-  shift 2
+  local name="$1" pool="$2" slot="$3" jobdir="$DATA/jobs/$1" self v
+  shift 3
+  # The claim must use this launcher's state directory and mutex kind, which the tmux server's environment may lack.
+  if [[ "$0" == */* ]]; then self="$(cd "${0%/*}" && pwd)/${0##*/}"; else self="$PWD/$0"; fi
   {
     printf '#!/usr/bin/env bash\nset -u\n'
     printf 'cd %q || exit 1\nexport PATH=%q\n' "$PWD" "$PATH"
+    printf 'LANES_DATA_DIR=%q LANES_MUTEX_TIMEOUT=%q LANES_NO_FLOCK=%q %q _claim %q %q %q %q "$$" || exit 1\n' \
+      "$DATA" "$MUTEX_TIMEOUT" "${LANES_NO_FLOCK:-}" "$self" "$name" "$pool" "$slot" "$$"
     for v in ${ENV_NAMES[@]+"${ENV_NAMES[@]}"}; do
       [[ -z "${!v+x}" ]] || printf 'export %s=%q\n' "$v" "${!v}"
     done
     printf 'cmd=(%s)\n' "$(printf '%q ' "$@")"
-    printf 'log=%q status=%q slot=%q\n' "$jobdir/log" "$jobdir/STATUS" "$slot_path"
+    printf 'log=%q status=%q slot=%q\n' "$jobdir/log" "$jobdir/STATUS" "$(lock_path "$pool" "$slot")"
     cat <<'RUNNER'
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 start="$(now)"
@@ -294,9 +346,10 @@ cmd_slot() {
   case "$action" in
     acquire) slot_take "$pool" "$pid" || die "pool '$pool' is full ($POOL slots held)" "retry later, or raise LANES_POOL_SIZE" 75 ;;
     release)
+      # Release is idempotent: a pid that holds no slot releases nothing and still succeeds.
       for ((i = 1; i <= POOL; i++)); do
         path="$(lock_path "$pool" "$i")"
-        [[ "$(readlink "$path" 2>/dev/null || true)" == "$pid" ]] && rm -f "$path"
+        if [[ "$(readlink "$path" 2>/dev/null || true)" == "$pid" ]]; then rm -f "$path"; fi
       done
       ;;
     *) usage ;;
@@ -312,5 +365,6 @@ case "$sub" in
   wait) cmd_wait "$@" ;;
   list) cmd_list "$@" ;;
   slot) cmd_slot "$@" ;;
+  _claim) cmd_claim "$@" ;;
   *) usage ;;
 esac
