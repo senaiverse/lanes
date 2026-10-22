@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Checks that each plan file carries every required field as a level-2 heading with a non-empty body.
+# The required fields are the level-2 headings of this plugin's templates/plan.md, the single home of the list.
+# A project overrides them with .lanes/plan-fields (one heading per line), found by walking up from the current
+# directory to the git root, or the file named by LANES_PLAN_FIELDS. Exit 0 complete, 1 incomplete or unreadable, 2 misuse.
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
+set -euo pipefail
+
+die() {
+  printf 'lanes-plancheck: %s\n' "$1" >&2
+  exit 2
+}
+
+# Normalised lines from stdin: CRs, edge blanks and empty lines removed.
+clean_lines() { tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true; }
+
+# The script path with symlinks resolved, so the template is found when bin/ is reached through a link.
+script_path() {
+  local p="${BASH_SOURCE[0]}" dir target
+  while [ -L "$p" ]; do
+    dir="$(cd -P "$(dirname "$p")" && pwd)"
+    target="$(readlink "$p")"
+    case "$target" in /*) p="$target" ;; *) p="$dir/$target" ;; esac
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$p")" && pwd)" "$(basename "$p")"
+}
+
+# Prints the fields file to use, or nothing. Outside a git repository only the current directory is searched.
+find_fields_file() {
+  local dir top
+  if [ -n "${LANES_PLAN_FIELDS:-}" ]; then printf '%s\n' "$LANES_PLAN_FIELDS"; return; fi
+  dir="$(pwd -P)"
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  while :; do
+    if [ -e "$dir/.lanes/plan-fields" ]; then printf '%s\n' "$dir/.lanes/plan-fields"; return; fi
+    if [ -z "$top" ] || [ "$dir" = "$top" ] || [ "$dir" = "/" ]; then return; fi
+    dir="$(dirname "$dir")"
+  done
+}
+
+if [ "$#" -eq 0 ]; then
+  die "usage: lanes-plancheck <plan.md>...: pass at least one plan file"
+fi
+
+FIELDS_FILE="$(find_fields_file)"
+if [ -n "$FIELDS_FILE" ]; then
+  [ ! -d "$FIELDS_FILE" ] || die "$FIELDS_FILE is a directory: make it a file with one heading per line, or remove it to use the template's fields"
+  [ -r "$FIELDS_FILE" ] || die "cannot read $FIELDS_FILE: fix its permissions or unset LANES_PLAN_FIELDS"
+  fields="$(clean_lines <"$FIELDS_FILE")"
+  [ -n "$fields" ] || die "$FIELDS_FILE lists no headings: add one heading per line or delete the file to use the template's fields"
+  dup="$(printf '%s\n' "$fields" | tr '[:upper:]' '[:lower:]' | awk '++seen[$0] == 2')"
+  [ -z "$dup" ] || die "duplicate field in $FIELDS_FILE: $dup: list each heading once (names compare ignoring case)"
+else
+  template="$(dirname "$(script_path)")/../templates/plan.md"
+  [ -r "$template" ] || die "cannot read the plan template $template: reinstall the plugin or provide .lanes/plan-fields"
+  fields="$({ grep '^## ' "$template" || true; } | sed -e 's/^##[[:space:]]*//' | clean_lines)"
+  [ -n "$fields" ] || die "the plan template $template has no level-2 headings: restore it or provide .lanes/plan-fields"
+fi
+
+# awk walks the plan once. Headings inside code fences are text; a fence is closed only by its own marker
+# (backticks or tildes). A level-1 or level-2 heading ends the open section; deeper headings and their text
+# belong to it. HTML comments are not content.
+check_plan() {
+  LANES_FIELDS="$fields" LANES_FILE="$1" awk '
+    BEGIN {
+      n = split(ENVIRON["LANES_FIELDS"], names, "\n")
+      for (i = 1; i <= n; i++) key[tolower(names[i])] = i
+      file = ENVIRON["LANES_FILE"]
+    }
+    { sub(/\r$/, "") }
+    /^[ \t]*(```|~~~)/ {
+      mark = substr($0, match($0, /[`~]/), 1)
+      if (fence == "") fence = mark
+      else if (fence == mark) fence = ""
+    }
+    fence == "" &&/^#+([ \t]|$)/ {
+      level = match($0, /^#+/) ? RLENGTH : 0
+      if (level <= 2) {
+        cur = 0
+        if (level == 2) {
+          title = $0
+          sub(/^##[ \t]*/, "", title)
+          sub(/[ \t]+#+[ \t]*$/, "", title)
+          sub(/[ \t]+$/, "", title)
+          if (tolower(title) in key) cur = key[tolower(title)]
+        }
+        next
+      }
+    }
+    cur {
+      line = $0
+      text = ""
+      while (line != "") {
+        if (incomment) {
+          p = index(line, "-->")
+          if (!p) { line = ""; break }
+          line = substr(line, p + 3); incomment = 0
+        } else {
+          p = index(line, "<!--")
+          if (!p) { text = text line; break }
+          text = text substr(line, 1, p - 1)
+          line = substr(line, p + 4); incomment = 1
+        }
+      }
+      if (text ~ /[^ \t]/) filled[cur] = 1
+    }
+    END {
+      for (i = 1; i <= n; i++) if (!(i in filled)) printf "%s: missing field: %s\n", file, names[i]
+    }
+  ' "$1"
+}
+
+status=0
+for plan in "$@"; do
+  if [ ! -f "$plan" ] || [ ! -r "$plan" ]; then
+    printf 'lanes-plancheck: cannot read %s: pass the path of an existing plan file\n' "$plan" >&2
+    status=1
+    continue
+  fi
+  report="$(check_plan "$plan")"
+  if [ -n "$report" ]; then
+    printf '%s\n' "$report" >&2
+    status=1
+  fi
+done
+
+[ "$status" -ne 0 ] || printf 'lanes-plancheck: %s plan(s) complete\n' "$#"
+exit "$status"

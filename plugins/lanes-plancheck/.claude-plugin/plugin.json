@@ -1,0 +1,10 @@
+{
+  "name": "lanes-plancheck",
+  "version": "0.1.0",
+  "description": "Checks that a plan file carries its required fields before a lane builds it.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["plan", "lint", "workflow"]
+}

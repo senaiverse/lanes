@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install tmux and jq (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux jq
+
+      - name: Install tmux, jq, bash and flock (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux jq bash flock
+
+      - name: Tests (shellcheck and bats)
+        run: scripts/test.sh
+
+      - name: Bash 3.2 guard (macOS system bash)
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash --version | head -n 1
+          .tools/bats-core/bin/bats tests/scaffold/bash-version.bats | tee "$RUNNER_TEMP/bash32.log"
+          if grep -q '# skip' "$RUNNER_TEMP/bash32.log"; then echo "the /bin/bash test was skipped: /bin/bash is not Bash 3.2" >&2; exit 1; fi

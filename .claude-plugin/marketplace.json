@@ -1,0 +1,14 @@
+{
+  "name": "lanes",
+  "description": "Run several Claude sessions in tmux: a lead plans, lanes build, a journal carries state, lanes are cleared at a context threshold and resume.",
+  "owner": {
+    "name": "senaiverse"
+  },
+  "plugins": [
+    {
+      "name": "lanes-plancheck",
+      "source": "./plugins/lanes-plancheck",
+      "description": "Plan field checker (lanes-plancheck)."
+    }
+  ]
+}

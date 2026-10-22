@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Blocks a push when the private deny-list matches a tracked or untracked file (name or contents).
+# The gate is fail-closed: with no usable list it refuses too. Install with scripts/install-hooks.sh.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+exec "$root/scripts/deny-gate.sh" "$root"
