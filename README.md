@@ -4,7 +4,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-d9a441.svg)](https://code.claude.com/docs/en/plugins)
 
-![lanes: one lead plans, lanes build in parallel, each clears at its context limit and carries on from its note](assets/social-preview.png)
+![Illustration: a lead hands work to three lanes; when lane-api reaches 70% context it writes a RESUME note, is cleared, and resumes from the note while the others keep building](assets/how-it-works.svg)
 
 One AI session plans. Several others build in parallel. When a builder's memory fills up, it writes a note, gets
 wiped, and carries on from that note.
