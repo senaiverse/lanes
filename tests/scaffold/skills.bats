@@ -150,6 +150,8 @@ copy_plugins() {
 
 @test "(f) a subcommand the script does not have is caught" {
   copy_plugins
+  mkdir -p "$COPY/plugins/lanes-plancheck/bin"
+  printf '#!/usr/bin/env bash\necho "usage: lanes-plancheck <plan>"\n' >"$COPY/plugins/lanes-plancheck/bin/lanes-plancheck"
   printf '\nRun `lanes-plancheck frobnicate` first.\n' >>"$COPY/plugins/lanes-plancheck/skills/plancheck/SKILL.md"
   run check_root "$COPY"
   assert_output --partial "lanes-plancheck frobnicate"
@@ -157,7 +159,8 @@ copy_plugins() {
 
 @test "(f) a subcommand in the script's case dispatch passes" {
   copy_plugins
-  printf 'case "$1" in\n  start) ;;\nesac\n' >>"$COPY/plugins/lanes-plancheck/bin/lanes-plancheck"
+  mkdir -p "$COPY/plugins/lanes-plancheck/bin"
+  printf 'case "$1" in\n  start) ;;\nesac\n' >"$COPY/plugins/lanes-plancheck/bin/lanes-plancheck"
   printf '\nRun `lanes-plancheck start` first.\n' >>"$COPY/plugins/lanes-plancheck/skills/plancheck/SKILL.md"
   run check_root "$COPY"
   assert_output ""
