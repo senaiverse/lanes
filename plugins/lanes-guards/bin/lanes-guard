@@ -91,20 +91,24 @@ refuse_not_lead() {
 # parse can lift that (exempt), so a word the parser loses or misreads costs a false refusal; only its short list of
 # data rules can let a mention through.
 
-declare -A CNT=() PWORDS=() DATA_SUB=() SUB_BAD=()
-PATTERNS=(); PAT_WORDS=()
+declare -A CNT=() PWORDS=() DATA_SUB=()
+PATTERNS=(); PAT_WORDS=(); PAT_PUSH=()
 
-# load_patterns: PATTERNS from the setting, split on ";", with each pattern's words as the mention check reads them.
+# load_patterns: PATTERNS from the setting, split on ";", each with its words read by norm_words, as command text is.
+# PAT_PUSH[i] is 1 for the `git push @default` pattern, the only one the allowed push form lifts.
 load_patterns() {
-  local raw p w x
+  local raw p x
   local -a ws
+  local -A known
   raw="$(setting lead_only_commands "$DEFAULT_PATTERNS")"
   while IFS= read -r p; do
     p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-    w="${p,,}"; w="${w//@default/ }"; w="${w//[^a-z0-9_-]/ }"
-    read -ra ws <<<"$w"
+    x="${p,,}"; norm_words "${x//@default/ }"
+    ws=(); known=()
+    for x in "${NORM[@]}"; do [ -n "${known[$x]+x}" ] || { known[$x]=1; ws+=("$x"); }; done
     [ "${#ws[@]}" -gt 0 ] || continue
     PATTERNS+=("$p"); PAT_WORDS+=("${ws[*]}")
+    if [ "${ws[*]}" = "git push" ] && [[ "${p,,}" == *@default* ]]; then PAT_PUSH+=(1); else PAT_PUSH+=(0); fi
     for x in "${ws[@]}"; do PWORDS[$x]=1; done
   done <<<"${raw//;/$'\n'}"
   return 0
@@ -128,20 +132,30 @@ decode_ansi() {
   REPLY="$out$s"
 }
 
-# count_tokens <kind> <text>: adds the pattern words in text to CNT[<kind>:<word>]. The text is read as a shell may:
-# $'...' decoded, line continuations joined, lowercased, quotes dropped (`g""h`), and read twice, once with backslashes
-# dropped (`g\h`) and once with each escape as a break (`printf 'x\ngh'`). A hyphen inside a word is a break too
-# (`gh-pr-merge.sh`), and a short-option token ending in a pattern word counts as that word (`-S'gh pr'`).
-count_tokens() {
-  local t w p
-  local -a parts
-  decode_ansi "$2"
+# norm_words <text>: sets NORM to the words of text as a shell may read them, the one reading for patterns, raw
+# text, parsed words and data alike: $'...' decoded, line continuations joined, lowercased, quotes dropped (`g""h`),
+# read twice, once with backslashes dropped (`g\h`) and once with each escape as a break (`printf 'x\ngh'`), split on
+# anything but [a-z0-9_-], and a hyphen inside a word read as a break (`gh-pr-merge.sh`, `deploy-prod`).
+norm_words() {
+  local t w
+  local -a parts ws
+  decode_ansi "$1"
   t="${REPLY//$'\\\n'/}"; t="${t,,}"
   t=${t//[\"\']/}
   t="${t//\\/} ${t//\\?/ }"
   read -ra parts <<<"${t//[^a-z0-9_-]/ }"
+  NORM=()
   for w in "${parts[@]}"; do
-    if [[ "$w" != -* && "$w" == *-* ]]; then count_tokens "$1" "${w//-/ }"; continue; fi
+    if [[ "$w" != -* && "$w" == *-* ]]; then read -ra ws <<<"${w//-/ }"; NORM+=("${ws[@]}"); else NORM+=("$w"); fi
+  done
+}
+
+# count_tokens <kind> <text>: adds the pattern words among norm_words of text to CNT[<kind>:<word>]. A short-option
+# token ending in a pattern word counts as that word (`-S'gh pr'`).
+count_tokens() {
+  local w p
+  norm_words "$2"
+  for w in "${NORM[@]}"; do
     if [[ "$w" == -[!-]* && -z "${PWORDS[$w]+x}" ]]; then
       for p in "${!PWORDS[@]}"; do if [[ "$w" == *"$p" ]]; then w="$p"; break; fi; done
     fi
@@ -149,8 +163,8 @@ count_tokens() {
   done
 }
 
-# mentions <raw|pool>: sets MATCHED to the first pattern with every word in the raw text, or in what is left of it
-# once proven data is taken out (pool).
+# mentions <raw|pool>: sets MATCHED (and MATCHED_PUSH, its PAT_PUSH) to the first pattern with every word in the raw
+# text, or in what is left of it once proven data, and for the push pattern an allowed push, is taken out (pool).
 mentions() {
   local i w n
   local -a ws
@@ -158,10 +172,25 @@ mentions() {
     read -ra ws <<<"${PAT_WORDS[i]}"
     for w in "${ws[@]}"; do
       n=${CNT[raw:$w]:-0}
-      [ "$1" = raw ] || n=$((n - ${CNT[data:$w]:-0}))
+      if [ "$1" = pool ]; then
+        n=$((n - ${CNT[data:$w]:-0}))
+        if [ "${PAT_PUSH[i]}" -eq 1 ]; then n=$((n - ${CNT[push:$w]:-0})); fi
+      fi
       [ "$n" -gt 0 ] || continue 2
     done
-    MATCHED="${PATTERNS[i]}"; return 0
+    MATCHED="${PATTERNS[i]}"; MATCHED_PUSH="${PAT_PUSH[i]}"; return 0
+  done
+  return 1
+}
+
+# own_pattern <head>: true when every word of head (a command name and the subcommand words its exemption keys on) is
+# a word of one configured pattern. That command may be the lead-only one, so it gets no exemption.
+own_pattern() {
+  local i h
+  norm_words "$1"
+  for ((i = 0; i < ${#PATTERNS[@]}; i++)); do
+    for h in "${NORM[@]}"; do [[ " ${PAT_WORDS[i]} " == *" $h "* ]] || continue 2; done
+    return 0
   done
   return 1
 }
@@ -261,12 +290,19 @@ split_words() {
 # is_assignment <word>
 is_assignment() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*\+?= ]]; }
 
-# printer: true when W only prints its words, a file or its stdin: echo, cat, or printf without -v.
-printer() { case "${W[0]##*/}" in echo|cat) ;; printf) [[ "${W[1]:-}" != -v* ]] ;; *) false ;; esac; }
+# printer: true when W only prints its words, a file or its stdin: echo, cat, or printf whose first word is no option
+# and no expansion (`printf -v c`, `printf $V c` and `printf {-v,} c` assign a variable a later `$c` runs).
+printer() {
+  case "${W[0]##*/}" in
+    echo|cat) ;;
+    printf) [[ "${W[1]:-}" != -* && "${W[1]:-}" != *[\$\{*?[]* ]] ;;
+    *) false ;;
+  esac
+}
 
 # note_changes <index>: for command idx, sets DIR_UNSURE when it may change the checkout or config later pushes read
 # (cd, pushd, popd, eval, source, a $ command word, a GIT_DIR assignment, an export of git config), GIT_ENV_CONFIG for
-# a git config assignment, FUNC_DEF for a function, and SUB_BAD for a substitution that does more than print.
+# a git config assignment, FUNC_DEF for a function, and HAS_COPROC for a coprocess, whose pipe takes later output.
 note_changes() {
   local -a W
   local d
@@ -277,14 +313,12 @@ note_changes() {
     drop 1
   done
   [ "${#W[@]}" -gt 0 ] || return 0
-  if [ -n "${CMD_SUB[$1]}" ] && { ! printer || [[ "${CMD_RAW[$1]}" == *'>'* || "${CMD_RAW[$1]}" == *'<('* ]]; }; then
-    SUB_BAD[${CMD_SUB[$1]}]=1
-  fi
   while [[ "${W[0]}" =~ ^(builtin|command|exec|-.*)$ ]] && [ "${#W[@]}" -gt 1 ]; do drop 1; done
   if [[ "${W[0]}" == *'$'* ]]; then DIR_UNSURE=1; fi
   case "${W[0]##*/}" in
     cd|pushd|popd|eval|source|.) DIR_UNSURE=1 ;;
     function) FUNC_DEF=1 ;;
+    coproc) HAS_COPROC=1 ;;
     export|declare|typeset|readonly|local)
       for d in "${W[@]:1}"; do if [[ "$d" =~ ^(GIT_DIR|GIT_COMMON_DIR|$GIT_CONFIG_ENV)= ]]; then DIR_UNSURE=1; fi; done ;;
   esac
@@ -302,13 +336,23 @@ data_words() {
   done
 }
 
-# classify <index>: counts command idx's words and stdin as parsed text, and the part it proves harmless as data: the
-# arguments of git commit and gh pr|issue create|comment|edit, grep's and rg's operands, an allowed push, and what a
-# printer prints where nothing reads it (on a line with no pipe, redirection or process substitution, or into a
-# substitution that is itself data).
+# may_exempt <index> <head>: the one gate of every data exemption. Command idx's output reaches no other command: no
+# pipe after it and no output redirection or process substitution at its level (CMD_OUT), no coprocess on the line,
+# and a substitution it runs in is data of an exempted command (DATA_SUB), not one whose output runs. And no
+# configured pattern names the command itself (own_pattern).
+may_exempt() {
+  local sub="${CMD_SUB[$1]}"
+  [ -z "${CMD_OUT[$1]:-}" ] && [ "$HAS_COPROC" -eq 0 ] || return 1
+  [ -z "$sub" ] || [ -n "${DATA_SUB[$sub]+x}" ] || return 1
+  ! own_pattern "$2"
+}
+
+# classify <index>: counts command idx's words and stdin as parsed text, and what it proves harmless. Past may_exempt,
+# data: the arguments of git commit and gh pr|issue create|comment|edit, grep's and rg's operands, and a printer's
+# words and stdin. Push words: an allowed push, which only the git push @default pattern discounts.
 classify() {
   local -a W
-  local w sub="${CMD_SUB[$1]}" stdin="${CMD_STDIN[$1]:-}" i
+  local w stdin="${CMD_STDIN[$1]:-}" i
   split_words "${CMDS[$1]}"
   for w in "${W[@]}"; do count_tokens parsed "$w"; done
   if [ -n "$stdin" ]; then count_tokens parsed "$stdin"; fi
@@ -316,25 +360,28 @@ classify() {
   [ "${#W[@]}" -gt 0 ] || return 0
   case "${W[0]##*/}" in
     git)
-      if [ "${W[1]:-}" = commit ]; then data_words "${W[@]:2}"
-      elif [[ " ${W[*]} " == *" push "* ]] && push_allowed; then data_words "${W[@]}"
+      if [ "${W[1]:-}" = commit ]; then
+        if may_exempt "$1" 'git commit'; then data_words "${W[@]:2}"; fi
+      elif [[ " ${W[*]} " == *" push "* ]] && push_allowed; then
+        for w in "${W[@]}"; do count_tokens push "$w"; done
       fi ;;
-    gh) if [[ "${W[1]:-} ${W[2]:-}" =~ ^(pr|issue)\ (create|comment|edit)$ ]]; then data_words "${W[@]:3}"; fi ;;
+    gh)
+      if [[ "${W[1]:-} ${W[2]:-}" =~ ^(pr|issue)\ (create|comment|edit)$ ]] && may_exempt "$1" "gh ${W[1]} ${W[2]}"; then
+        data_words "${W[@]:3}"
+      fi ;;
     grep|rg)
       # rg --pre runs a command on each file.
-      [[ " ${W[*]} " != *" --pre"* ]] || return 0
+      [[ " ${W[*]} " != *" --pre"* ]] && may_exempt "$1" "${W[0]##*/}" || return 0
       for ((i = 1; i < ${#W[@]}; i++)); do
         if [ "${W[i]}" = -- ]; then data_words "${W[@]:i+1}"; break; fi
         if [[ "${W[i]}" != -* ]]; then data_words "${W[i]}"; fi
       done ;;
     *)
-      printer || return 0
-      if [ -z "$sub" ] && [ "$QUIET" -eq 1 ] || { [ -n "$sub" ] && [ -n "${DATA_SUB[$sub]+x}" ] && [ -z "${SUB_BAD[$sub]+x}" ]; }; then
-        data_words "${W[@]:1}"
-        # An unquoted heredoc body runs its substitutions, which nothing here parses.
-        # shellcheck disable=SC2016 # the patterns are literal text
-        if [[ "$stdin" != *'$('* && "$stdin" != *'`'* ]]; then count_tokens data "$stdin"; fi
-      fi ;;
+      printer && may_exempt "$1" "${W[0]##*/}" || return 0
+      data_words "${W[@]:1}"
+      # An unquoted heredoc body runs its substitutions, which nothing here parses.
+      # shellcheck disable=SC2016 # the patterns are literal text
+      if [[ "$stdin" != *'$('* && "$stdin" != *'`'* ]]; then count_tokens data "$stdin"; fi ;;
   esac
 }
 
@@ -343,16 +390,14 @@ classify() {
 # a printer), and once proven data is taken out no pattern may be left.
 exempt() {
   local cmd="$1" idx w lead_cd='^[[:space:]]*cd[[:space:]]+(-[LP][[:space:]]+)?(/[A-Za-z0-9._/@+-]*)[[:space:]]*&&(.*)$'
-  CMDS=(); CMD_STDIN=(); CMD_RAW=(); CMD_SUB=(); LOOSE=0; TOKENIZE_CALLS=0; SUB_SERIAL=0; FUNC_DEF=0
-  DIR_UNSURE=0; GIT_ENV_CONFIG=0; RUN_DIR="$SESSION_DIR"; DATA_SUB=(); SUB_BAD=()
+  CMDS=(); CMD_STDIN=(); CMD_SUB=(); CMD_OUT=(); LOOSE=0; TOKENIZE_CALLS=0; SUB_SERIAL=0; FUNC_DEF=0
+  HAS_COPROC=0; DIR_UNSURE=0; GIT_ENV_CONFIG=0; RUN_DIR="$SESSION_DIR"; DATA_SUB=()
   # `cd <absolute path> && rest` runs all of rest there when the cd succeeds. ".." is refused: the shell resolves it
   # against the path as written, git -C against the symlink target.
   if [[ "$cmd" =~ $lead_cd ]] && [[ "/${BASH_REMATCH[2]}/" != */../* ]]; then
     RUN_DIR="${BASH_REMATCH[2]}"; cmd="${BASH_REMATCH[3]}"
     count_tokens parsed "$RUN_DIR"; count_tokens data "$RUN_DIR"
   fi
-  QUIET=1
-  if [[ "$cmd" == *[\|\>]* || "$cmd" == *'<('* ]]; then QUIET=0; fi
   tokenize "$cmd"
   [ "$LOOSE" -eq 0 ] || return 1
   for ((idx = 0; idx < ${#CMDS[@]}; idx++)); do note_changes "$idx"; done
@@ -367,7 +412,7 @@ exempt() {
 
 guard_lead_only() {
   local cmd
-  MATCHED=""
+  MATCHED=""; MATCHED_PUSH=0
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   load_patterns
   if [ "$VALID" -eq 0 ]; then
@@ -388,12 +433,12 @@ guard_lead_only() {
   lookup_caller
   [ "$ROLE" != lead ] || exit 0
   if exempt "$cmd"; then exit 0; fi
-  if [[ "$MATCHED" == *@default* ]]; then
+  if [ "$MATCHED_PUSH" -eq 1 ]; then
     refuse_not_lead lead-only "this \`git push\` form is lead-only: a lane pushes only one named non-default branch" \
       "$PUSH_HINT (with -u or --force-with-lease if needed), as its own command or after one leading cd; ask the lead for any other push, or change lead_only_commands in .lanes/guards.md"
   fi
   refuse_not_lead lead-only "the command names \`$MATCHED\`, which is lead-only, and the guard cannot prove each mention is only text" \
-    "ask the lead to run it. Text that names it passes as a git commit message, a gh pr or issue title or body, an echo, printf or cat with nothing reading its output, or a grep or rg pattern; or change lead_only_commands in .lanes/guards.md"
+    "ask the lead to run it. Text that names it passes as a git commit message, a gh pr or issue title or body, an echo, printf or cat, or a grep or rg pattern, when no pipe, redirection or substitution takes that command's output; or change lead_only_commands in .lanes/guards.md"
 }
 
 guard_plan_message() {

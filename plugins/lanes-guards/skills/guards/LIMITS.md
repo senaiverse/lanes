@@ -2,18 +2,23 @@
 
 - The lead-only rule matches words, not commands. A lane's command is refused when its text holds every word of a
   lead-only pattern, in any order and anywhere on the line (`gh`, `pr` and `merge` for `gh pr merge`; `git` and `push`
-  for `git push @default`). The text is read lowercased, with `$'...'` decoded, line continuations joined, and quotes,
-  backslashes and inner hyphens read both as nothing and as breaks.
+  for `git push @default`). Patterns and command text are read the same way: lowercased, with `$'...'` decoded, line
+  continuations joined, quotes and backslashes read both as nothing and as breaks, and a hyphen inside a word read as
+  a break (`make deploy-prod` is the words `make`, `deploy` and `prod`).
 - Only a full parse lifts a refusal, and only when it proves every mention harmless: the arguments of `git commit`
-  and of `gh pr|issue create|comment|edit`, the operands of `grep` and of `rg` without `--pre`, the arguments and stdin
-  of `echo`, `printf` (not `-v`) and `cat` when nothing reads their output (no `|`, `>` or `<(` on the line, or a
-  substitution that is itself such an argument), and the one allowed push form. A data command behind a wrapper
+  and of `gh pr|issue create|comment|edit`, the operands of `grep` and of `rg` without `--pre`, and the arguments and
+  stdin of `echo`, `cat` and `printf` (not when its first word is an option or an expansion). Each of these counts
+  only when its output reaches no other command: no pipe after it, no output redirection, process substitution or
+  coprocess beside it, and any substitution it runs in is itself such an argument. And none counts for a command a
+  configured pattern names (`git commit` under `git commit --amend`). The one allowed push form lifts only
+  `git push @default`; a pattern such as plain `git push` refuses every push. A data command behind a wrapper
   (`timeout 60 git push ...`, `sudo git commit ...`) is not data. Nothing is proven when the parse fails, when a
   pattern word sits somewhere the parser does not read (a comment, a redirection target, a heredoc delimiter), or when
   the line defines a function.
 - So some normal commands are refused because they name all of a pattern's words: `gh pr view 5 && git merge x`,
-  `gh workflow view ci.yml && gh run view 12`, `echo 'gh pr merge' | cat`, `bash -c 'git push origin feat'`,
-  `timeout 60 git push origin feat`. Split such a line into separate commands, or ask the lead.
+  `gh workflow view ci.yml && gh run view 12`, `echo 'gh pr merge' | cat`, `grep -rn 'gh pr merge' docs | head`,
+  `bash -c 'git push origin feat'`, `timeout 60 git push origin feat`. Split such a line into separate commands, or
+  ask the lead.
 - Words the text never holds are not seen: a variable set before the line or outside it, a script file (`bash
   script.sh`, `cat - ./x.sh | bash`), a git or gh alias, `ssh`, a file a previous command wrote. It is a mistake guard,
   not a sandbox.

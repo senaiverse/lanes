@@ -10,8 +10,9 @@ rephrase the command to get past the guard.
 
 - `lead-only`: from a lane, a Bash command whose text names every word of a `lead_only_commands` pattern, anywhere
   and however quoted (default `gh workflow run`, `gh pr merge`, `git push @default`). It passes only when the guard
-  proves each mention is text (a commit message, a gh pr or issue title or body, an echo, printf or cat nobody reads,
-  a grep or rg pattern) or the one lane push: `git [-C <dir>] push [-u] [--force-with-lease[=...]] <remote> <branch>`
+  proves each mention is text (a commit message, a gh pr or issue title or body, an echo, printf or cat, a grep or rg
+  pattern, each with no pipe, redirection or substitution taking its output) or, for `git push @default`, the one lane
+  push: `git [-C <dir>] push [-u] [--force-with-lease[=...]] <remote> <branch>`
   with one non-default branch, plain or as `<name>:<name>`, as its own command, after at most one leading
   `cd <absolute path> &&`.
 - `plan-message`: from a lane, a `SendMessage` that starts with the plan marker (default `PLAN:`).

@@ -1,10 +1,10 @@
 # Shell tokenizer for lanes-guard, sourced by bin/lanes-guard (a library: no shebang, no set -e of its own).
 # tokenize <text> appends one SEP-joined string per simple command to CMDS, recursing into $( ) and backticks. Quotes
 # ($'...' decoded), backslashes and line continuations are removed as the shell removes them. Beside CMDS it fills
-# CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_RAW[i] (command i's source text) and
-# CMD_SUB[i] (the serial of the innermost substitution command i runs in, or empty). A substitution leaves SUBMARK
-# serial SUBMARK in its word. `name ()` sets FUNC_DEF. Text it cannot parse (an unterminated quote, too much nesting)
-# sets LOOSE.
+# CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_SUB[i] (the serial of the innermost
+# substitution command i runs in, or empty) and CMD_OUT[i] (set when command i's output may reach another command or a
+# file, see tokenize). A substitution leaves SUBMARK serial SUBMARK in its word. `name ()` sets FUNC_DEF. Text it
+# cannot parse (an unterminated quote, too much nesting) sets LOOSE.
 # Limit: words are joined with SEP (0x1f) and split on it again, so a literal 0x1f byte in a command forges a word
 # boundary. The guard only exempts from a parse, so a forged boundary can cause a refusal, not a bypass.
 
@@ -71,11 +71,11 @@ _endcmd() {
   redir=0; herestr=0
   if [ "${#words[@]}" -gt 0 ]; then
     idx=${#CMDS[@]}
-    CMD_STDIN[idx]="$here_word"; CMD_RAW[idx]="${s:cs:i-cs}"; CMD_SUB[idx]="${CUR_SUB:-}"
+    CMD_STDIN[idx]="$here_word"; CMD_SUB[idx]="${CUR_SUB:-}"
     for k in "${!hd_delim[@]}"; do [ -n "${hd_cmd[k]:-}" ] || hd_cmd[k]=$idx; done
-    CMDS+=("${words[*]}")
+    CMDS+=("${words[*]}"); level+=("$idx")
   fi
-  here_word=""; words=(); cs=$i
+  here_word=""; words=()
 }
 
 # _ansi_c reads the $'...' word at index i and appends its decoded text to w. The scan stops only at an unescaped quote,
@@ -131,11 +131,14 @@ _heredoc_operator() {
   i=$j
 }
 
+# tokenize also sets CMD_OUT for the commands of this text level (not of its substitutions) that a pipe follows, and
+# for all of them when the level holds an output redirection or a process substitution: a group (`{ a; b; } | sh`) or
+# `exec >f` reaches commands the operator is not next to. Operators inside quotes or heredoc bodies do not count.
 tokenize() {
   TOKENIZE_CALLS=$((TOKENIZE_CALLS + 1))
   if [ "$TOKENIZE_CALLS" -gt "$MAX_TOKENIZE_CALLS" ]; then LOOSE=1; return 0; fi
-  local s="$1" n="${#1}" i=0 cs=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" rest q j buf
-  local -a words=() hd_delim=() hd_strip=() hd_cmd=()
+  local s="$1" n="${#1}" i=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" rest q j k buf piped=0 out_all=0
+  local -a words=() hd_delim=() hd_strip=() hd_cmd=() level=()
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
     case "$c" in
@@ -182,10 +185,15 @@ tokenize() {
         have=1 ;;
       '`') sub_in "$s" "$i"; i=$SUB_NEXT; w+="$SUB_MARK"; have=1 ;;
       " "|$'\t') _flush; i=$((i + 1)) ;;
-      $'\n') _endcmd; i=$((i + 1)); _heredoc_bodies; cs=$i ;;
+      $'\n') _endcmd; i=$((i + 1)); _heredoc_bodies ;;
       "|")
         _endcmd; i=$((i + 1))
-        if [ "${s:i:1}" = "|" ] || [ "${s:i:1}" = "&" ]; then i=$((i + 1)); fi ;;
+        if [ "${s:i:1}" = "|" ]; then
+          i=$((i + 1))
+        else
+          piped=${#level[@]}
+          if [ "${s:i:1}" = "&" ]; then i=$((i + 1)); fi
+        fi ;;
       "(")
         _flush
         if [ "${#words[@]}" -eq 1 ] && [[ "${s:i+1}" =~ ^[[:space:]]*\) ]]; then FUNC_DEF=1; fi
@@ -198,7 +206,7 @@ tokenize() {
           w+="#"; i=$((i + 1))
         fi ;;
       "<"|">")
-        if [ "${s:i+1:1}" = '(' ]; then _endcmd; i=$((i + 1)); continue; fi
+        if [ "${s:i+1:1}" = '(' ]; then out_all=1; _endcmd; i=$((i + 1)); continue; fi
         if [ "$have" -eq 1 ] && [[ "$w" =~ ^[0-9]+$ ]]; then w=""; have=0; else _flush; fi
         if [ "${s:i:3}" = '<<<' ]; then
           redir=1; herestr=1; i=$((i + 3))
@@ -208,10 +216,14 @@ tokenize() {
           j=$i
           while [ "${s:j:1}" = "<" ] || [ "${s:j:1}" = ">" ]; do j=$((j + 1)); done
           if [ "${s:j:1}" = "&" ] || [ "${s:j:1}" = "|" ]; then j=$((j + 1)); fi
+          if [[ "${s:i:j-i}" == *'>'* ]]; then out_all=1; fi
           redir=1; i=$j
         fi ;;
       *) w+="$c"; have=1; i=$((i + 1)) ;;
     esac
   done
   _endcmd
+  for ((k = 0; k < ${#level[@]}; k++)); do
+    if [ "$out_all" -eq 1 ] || [ "$k" -lt "$piped" ]; then CMD_OUT[level[k]]=1; fi
+  done
 }

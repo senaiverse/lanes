@@ -438,7 +438,43 @@ HIDING_FORMS=(
   'echo g\h g\h p\r p\r m\erge m\erge; gh pr merge 12'
   # data commands that run something
   "rg --pre 'gh pr merge 1' x ." 'gh pr create --title x && gh pr merge 1' $'cat - ./gh-pr-merge.sh <<\'EOF\' | bash\necho hi\nEOF'
+  # data commands whose output reaches another command, a file or a substitution that runs it
+  "grep -e 'gh pr merge' commands.txt | sh" "rg -N 'gh pr merge 12' notes.txt | bash" "grep -h 'gh pr merge' f > out.sh"
+  "git commit -m 'gh pr merge 12' | sh" "gh pr comment 5 --body 'gh pr merge 12' | sh" 'echo "$(grep -h "gh pr merge" f)" | sh'
+  "x=\$(grep -h 'gh pr merge' f); \$x" "\$(grep -h 'gh pr merge' f)" "sh -c \"\$(grep -h 'gh pr merge' f)\""
+  '{ true; echo gh pr merge 12; } > out.sh' 'exec >out.sh; echo gh pr merge 12' 'coproc { true; echo gh pr merge 12; }; sh <&"${COPROC[0]}"'
+  "printf \$V c 'gh pr merge 12'; \$c" "printf \"\$V\" c 'gh pr merge 12'; \$c" "printf {-v,} c 'gh pr merge 12'; \$c"
 )
+
+# Hiding forms under a project's own lead_only_commands, one "<lead_only_commands>|<command>" per line, run in a lane
+# worktree.
+CONFIG_HIDING_FORMS=(
+  'make deploy-prod|make deploy-prod' 'make deploy-prod|echo ok; make deploy-prod --jobs=2'
+  'git push|git push origin lane1' 'git push|git push -u origin lane1:lane1'
+  'git push @default; git push --force-with-lease|git push --force-with-lease origin lane1'
+  'git commit --amend|git commit --amend -m wip' 'gh pr edit --add-reviewer|gh pr edit 5 --add-reviewer bob'
+  'grep -r /etc|grep -r secret /etc' 'cat secrets|cat secrets.txt'
+)
+
+@test "every known hiding form under a project's own patterns is refused" {
+  make_repo
+  for e in "${CONFIG_HIDING_FORMS[@]}"; do
+    write_guards "$PROJECT" "lead_only_commands: ${e%%|*}"
+    bash_denied sid-lane1 "${e#*|}" "$WT" || { echo "lead_only_commands: ${e%%|*}"; return 1; }
+  done
+}
+
+@test "a project's patterns are read as command text is, and exemptions still lift mentions of other patterns" {
+  make_repo
+  write_guards "$PROJECT" 'lead_only_commands: make deploy-prod; git push @default; git commit --amend'
+  for cmd in 'make deploy' 'make deploy-staging' 'echo run make deploy-prod later' 'grep -n deploy-prod Makefile' \
+    'git push origin lane1' 'git commit -m wip'; do
+    bash_untouched sid-lane1 "$cmd" "$WT" || return 1
+  done
+  write_guards "$PROJECT" 'lead_only_commands: git push'
+  run_guard lead-only "$(bash_input sid-lane1 'git push origin lane1' "$WT")"
+  assert_denied 'names `git push`'
+}
 
 @test "every known hiding form is refused" {
   for cmd in "${HIDING_FORMS[@]}"; do
@@ -455,7 +491,8 @@ HIDING_FORMS=(
     'cat docs/gh-pr-merge.md' 'ls ./gh' 'gh pr checkout 12' 'gh run list --workflow ci.yml' 'echo gh pr merge # a note' \
     $'cat <<\'EOF\'\ngh pr merge 12\nEOF' $'cat <<EOF\nplain text: gh pr merge 12\nEOF' 'echo "unterminated' \
     $'git commit -m "$(cat <<\'EOF\'\nnotes: gh workflow run\nEOF\n)"' \
-    $'gh pr create --title t --body "$(cat <<\'EOF\'\nsteps: gh workflow run ci.yml\nEOF\n)"'; do
+    $'gh pr create --title t --body "$(cat <<\'EOF\'\nsteps: gh workflow run ci.yml\nEOF\n)"' \
+    'echo "a|b > c: gh pr merge"' 'git commit -m "$(grep -h "gh pr merge" notes.txt)"'; do
     bash_untouched sid-lane1 "$cmd" || return 1
   done
 }
@@ -472,7 +509,8 @@ HIDING_FORMS=(
 @test "a normal command the parse cannot prove harmless is refused when its text names a lead-only command" {
   make_repo
   for cmd in 'gh pr view 5 && git merge origin/main' "echo 'gh pr merge 3' | cat" 'gh workflow view ci.yml && gh run view 12' \
-    'timeout 60 git push origin lane1' "bash -c 'git push origin lane1'" "echo 'git push origin feature/x' | sh"; do
+    'timeout 60 git push origin lane1' "bash -c 'git push origin lane1'" "echo 'git push origin feature/x' | sh" \
+    "grep -rn 'gh pr merge' docs | head -5"; do
     bash_denied sid-lane1 "$cmd" "$WT" || return 1
   done
 }
