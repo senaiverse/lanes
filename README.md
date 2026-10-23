@@ -255,6 +255,12 @@ claude --name lane-ui
 Each session registers itself in a small file, so the lead knows which pane is which lane. The lead and the lanes
 use the lead and lane skills.
 
+**How many lanes?** Any number: there is exactly one lead, and every other named session is a lane. To add one, open
+a pane and start `claude --name <new-lane>`; nothing to configure. Two to four lanes is a good start. Past about five,
+merge conflicts between lanes and the lead's review load tend to cost more than the extra parallel work gains.
+Heavy commands are capped separately: `lanes-jobs` runs at most two at once across all panes by default
+(`LANES_POOL_SIZE`).
+
 **2. Plan (v0.1 preview).** You tell the lead what you want. The lead asks you questions one at a time, each with a
 recommended answer. When the plan is clear, it writes the work into the journal as items, one per lane. Before a
 lane starts, `lanes-plancheck` confirms the plan has its goal, its "done when" and the rest. This step works today if
