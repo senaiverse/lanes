@@ -1,13 +1,15 @@
 # Shell tokenizer for lanes-guard, sourced by bin/lanes-guard (a library: no shebang, no set -e of its own).
-# tokenize <text> appends one SEP-joined string per simple command to CMDS, recursing into $( ), backticks and heredoc
-# bodies. Quotes ($'...' decoded), backslashes and line continuations are removed as the shell removes them. Beside CMDS
-# it fills CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_PIPE[i] (the index of the command
-# piped into command i, or -1) and CMD_RAW[i] (command i's source text). Text it cannot parse (an unterminated quote,
-# too much nesting) sets LOOSE and is kept in LOOSE_TEXT for a loose pattern match.
+# tokenize <text> appends one SEP-joined string per simple command to CMDS, recursing into $( ) and backticks. Quotes
+# ($'...' decoded), backslashes and line continuations are removed as the shell removes them. Beside CMDS it fills
+# CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_RAW[i] (command i's source text) and
+# CMD_SUB[i] (the serial of the innermost substitution command i runs in, or empty). A substitution leaves SUBMARK
+# serial SUBMARK in its word. `name ()` sets FUNC_DEF. Text it cannot parse (an unterminated quote, too much nesting)
+# sets LOOSE.
 # Limit: words are joined with SEP (0x1f) and split on it again, so a literal 0x1f byte in a command forges a word
-# boundary. The guard is a mistake guard, so the case is accepted.
+# boundary. The guard only exempts from a parse, so a forged boundary can cause a refusal, not a bypass.
 
 SEP=$'\x1f'
+SUBMARK=$'\x1e'
 MAX_TOKENIZE_CALLS=200
 
 # read_close <text> <index after the opener> <close char, ")" or a backtick>: sets REPLY_END to the matching closer.
@@ -36,33 +38,18 @@ read_close() {
     fi
     i=$((i + 1))
   done
-  LOOSE=1; LOOSE_TEXT+="${s:$2}"$'\n'; REPLY_END=$n
+  LOOSE=1; REPLY_END=$n
 }
 
-# sub_in <text> <index of "$" or backtick>: tokenizes the substitution that starts there; sets SUB_NEXT past it.
+# sub_in <text> <index of "$" or backtick>: tokenizes the substitution that starts there under a new serial; sets
+# SUB_NEXT past it and SUB_MARK to the mark its word carries.
 sub_in() {
-  local s="$1" i="$2" e open=1 close='`'
+  local s="$1" i="$2" e open=1 close='`' CUR_SUB
   if [ "${s:i:1}" = '$' ]; then open=2; close=")"; fi
+  SUB_SERIAL=$((SUB_SERIAL + 1)); CUR_SUB=$SUB_SERIAL
   read_close "$s" $((i + open)) "$close"; e=$REPLY_END
   tokenize "${s:i+open:e-i-open}"
-  SUB_NEXT=$((e + 1))
-}
-
-# subst_only <text>: tokenizes only the substitutions inside text (an unquoted heredoc body runs them).
-subst_only() {
-  local s="$1" i=0 n="${#1}" c
-  # shellcheck disable=SC2016 # the patterns are literal text
-  [[ "$s" == *'$('* || "$s" == *'`'* ]] || return 0
-  while [ "$i" -lt "$n" ]; do
-    c="${s:i:1}"
-    if [ "$c" = "\\" ]; then
-      i=$((i + 2))
-    elif [ "$c" = '`' ] || { [ "$c" = '$' ] && [ "${s:i+1:1}" = '(' ]; }; then
-      sub_in "$s" "$i"; i=$SUB_NEXT
-    else
-      i=$((i + 1))
-    fi
-  done
+  SUB_NEXT=$((e + 1)); SUB_MARK="\$$SUBMARK$CUR_SUB$SUBMARK"
 }
 
 # _flush, _endcmd and the heredoc helpers work on tokenize's locals through bash's dynamic scope.
@@ -84,10 +71,9 @@ _endcmd() {
   redir=0; herestr=0
   if [ "${#words[@]}" -gt 0 ]; then
     idx=${#CMDS[@]}
-    CMD_STDIN[idx]="$here_word"; CMD_PIPE[idx]="$pipe_from"; CMD_RAW[idx]="${s:cs:i-cs}"
+    CMD_STDIN[idx]="$here_word"; CMD_RAW[idx]="${s:cs:i-cs}"; CMD_SUB[idx]="${CUR_SUB:-}"
     for k in "${!hd_delim[@]}"; do [ -n "${hd_cmd[k]:-}" ] || hd_cmd[k]=$idx; done
     CMDS+=("${words[*]}")
-    pipe_from=-1
   fi
   here_word=""; words=(); cs=$i
 }
@@ -100,7 +86,7 @@ _ansi_c() {
     if [ "${s:j:1}" = "\\" ]; then j=$((j + 1)); fi
     j=$((j + 1))
   done
-  if [ "$j" -ge "$n" ]; then LOOSE=1; LOOSE_TEXT+="${s:i}"$'\n'; w+="${s:i+2}"; i=$n; return 0; fi
+  if [ "$j" -ge "$n" ]; then LOOSE=1; w+="${s:i+2}"; i=$n; return 0; fi
   body="${s:i+2:j-i-2}"
   eval "body=\$'$body'"
   w+="$body"; i=$((j + 1))
@@ -121,36 +107,35 @@ _heredoc_bodies() {
       body+="$line"$'\n'
     done
     if [ -n "${hd_cmd[k]:-}" ]; then CMD_STDIN[hd_cmd[k]]="$body"; fi
-    if [ "${hd_quoted[k]}" = 0 ]; then subst_only "$body"; fi
   done
-  hd_delim=(); hd_quoted=(); hd_strip=(); hd_cmd=()
+  hd_delim=(); hd_strip=(); hd_cmd=()
 }
 
 # _heredoc_operator reads "<<[-] DELIM" at index i and queues the heredoc; it leaves i after the delimiter.
 _heredoc_operator() {
-  local j=$((i + 2)) strip=0 quoted=0 d="" ch rest
+  local j=$((i + 2)) strip=0 d="" ch rest
   if [ "${s:j:1}" = "-" ]; then strip=1; j=$((j + 1)); fi
   while [ "${s:j:1}" = " " ] || [ "${s:j:1}" = $'\t' ]; do j=$((j + 1)); done
   while [ "$j" -lt "$n" ]; do
     ch="${s:j:1}"
     case "$ch" in
       " "|$'\t'|$'\n'|";"|"|"|"&"|"("|")"|"<"|">") break ;;
-      "'") quoted=1; rest="${s:j+1}"; rest="${rest%%"'"*}"; d+="$rest"; j=$((j + ${#rest} + 2)); continue ;;
-      '"') quoted=1; rest="${s:j+1}"; rest="${rest%%'"'*}"; d+="$rest"; j=$((j + ${#rest} + 2)); continue ;;
-      "\\") quoted=1; d+="${s:j+1:1}"; j=$((j + 2)); continue ;;
+      "'") rest="${s:j+1}"; rest="${rest%%"'"*}"; d+="$rest"; j=$((j + ${#rest} + 2)); continue ;;
+      '"') rest="${s:j+1}"; rest="${rest%%'"'*}"; d+="$rest"; j=$((j + ${#rest} + 2)); continue ;;
+      "\\") d+="${s:j+1:1}"; j=$((j + 2)); continue ;;
       *) d+="$ch" ;;
     esac
     j=$((j + 1))
   done
-  hd_delim+=("$d"); hd_quoted+=("$quoted"); hd_strip+=("$strip")
+  hd_delim+=("$d"); hd_strip+=("$strip")
   i=$j
 }
 
 tokenize() {
   TOKENIZE_CALLS=$((TOKENIZE_CALLS + 1))
-  if [ "$TOKENIZE_CALLS" -gt "$MAX_TOKENIZE_CALLS" ]; then LOOSE=1; LOOSE_TEXT+="$1"$'\n'; return 0; fi
-  local s="$1" n="${#1}" i=0 cs=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" pipe_from=-1 rest q j buf
-  local -a words=() hd_delim=() hd_quoted=() hd_strip=() hd_cmd=()
+  if [ "$TOKENIZE_CALLS" -gt "$MAX_TOKENIZE_CALLS" ]; then LOOSE=1; return 0; fi
+  local s="$1" n="${#1}" i=0 cs=0 c nx ch w="" have=0 redir=0 herestr=0 here_word="" rest q j buf
+  local -a words=() hd_delim=() hd_strip=() hd_cmd=()
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"
     case "$c" in
@@ -163,7 +148,7 @@ tokenize() {
         if [[ "$rest" == *"'"* ]]; then
           q="${rest%%"'"*}"; w+="$q"; have=1; i=$((i + ${#q} + 2))
         else
-          LOOSE=1; LOOSE_TEXT+="$rest"$'\n'; w+="$rest"; have=1; i=$n
+          LOOSE=1; w+="$rest"; have=1; i=$n
         fi ;;
       '"')
         j=$((i + 1)); buf=""
@@ -180,30 +165,32 @@ tokenize() {
             esac
             j=$((j + 2))
           elif [ "$ch" = '`' ] || { [ "$ch" = '$' ] && [ "${s:j+1:1}" = '(' ]; }; then
-            sub_in "$s" "$j"; buf+='$'; j=$SUB_NEXT
+            sub_in "$s" "$j"; buf+="$SUB_MARK"; j=$SUB_NEXT
           else
             buf+="$ch"; j=$((j + 1))
           fi
         done
-        if [ "$j" -ge "$n" ]; then LOOSE=1; LOOSE_TEXT+="${s:i}"$'\n'; fi
+        if [ "$j" -ge "$n" ]; then LOOSE=1; fi
         w+="$buf"; have=1; i=$((j + 1)) ;;
       '$')
         case "${s:i+1:1}" in
-          '(') sub_in "$s" "$i"; i=$SUB_NEXT; w+='$' ;;
+          '(') sub_in "$s" "$i"; i=$SUB_NEXT; w+="$SUB_MARK" ;;
           "'") _ansi_c ;;
           '"') i=$((i + 1)) ;;
           *) i=$((i + 1)); w+='$' ;;
         esac
         have=1 ;;
-      '`') sub_in "$s" "$i"; i=$SUB_NEXT; w+='$'; have=1 ;;
+      '`') sub_in "$s" "$i"; i=$SUB_NEXT; w+="$SUB_MARK"; have=1 ;;
       " "|$'\t') _flush; i=$((i + 1)) ;;
       $'\n') _endcmd; i=$((i + 1)); _heredoc_bodies; cs=$i ;;
       "|")
-        _endcmd
-        if [ "${s:i+1:1}" = "|" ]; then pipe_from=-1; i=$((i + 2)); continue; fi
-        pipe_from=$((${#CMDS[@]} - 1)); i=$((i + 1))
-        if [ "${s:i:1}" = "&" ]; then i=$((i + 1)); fi ;;
-      ";"|"&"|"("|")") _endcmd; pipe_from=-1; i=$((i + 1)) ;;
+        _endcmd; i=$((i + 1))
+        if [ "${s:i:1}" = "|" ] || [ "${s:i:1}" = "&" ]; then i=$((i + 1)); fi ;;
+      "(")
+        _flush
+        if [ "${#words[@]}" -eq 1 ] && [[ "${s:i+1}" =~ ^[[:space:]]*\) ]]; then FUNC_DEF=1; fi
+        _endcmd; i=$((i + 1)) ;;
+      ";"|"&"|")") _endcmd; i=$((i + 1)) ;;
       "#")
         if [ "$have" -eq 0 ]; then
           rest="${s:i}"; rest="${rest%%$'\n'*}"; i=$((i + ${#rest}))

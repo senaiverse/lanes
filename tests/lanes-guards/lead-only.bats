@@ -369,7 +369,7 @@ other_checkout() {
   make_repo
   other_checkout
   bash_untouched sid-lane1 "cd $WT && git push origin lane1:lane1" "$OTHER"
-  bash_untouched sid-lane1 "cd -P $WT && bash -c 'git push origin lane1:lane1'" "$OTHER"
+  bash_untouched sid-lane1 "cd -P $WT && git add -A && git commit -qm 'push it' && git push origin lane1:lane1" "$OTHER"
   bash_denied sid-lane1 "cd $OTHER && git push origin lane1:lane1" "$WT"
   # A failed cd before ";" leaves the push in the session directory; a relative path may resolve through CDPATH.
   bash_denied sid-lane1 "cd $WT; git push origin lane1:lane1" "$OTHER"
@@ -386,79 +386,95 @@ other_checkout() {
     "GIT_CONFIG_GLOBAL=/tmp/g eval 'git push origin lane1'" "GIT_CONFIG_PARAMETERS=x env -S 'git push origin lane1'"; do
     bash_denied sid-lane1 "$cmd" "$WT" || return 1
   done
-  bash_untouched sid-lane1 "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git push origin lane1:lane1'" "$WT"
 }
 
-@test "a separator form cannot hide a matching command" {
-  for cmd in 'echo ok && gh pr merge 12' 'echo ok; gh pr merge 12' 'false || gh pr merge 12' 'echo ok | gh pr merge 12' \
-    'sleep 1 & gh pr merge 12' $'echo ok\ngh pr merge 12' '(gh pr merge 12)' '{ gh pr merge 12; }' \
-    'if true; then gh pr merge 12; fi' 'echo $(gh pr merge 12)' 'echo `gh pr merge 12`' 'echo "$(gh pr merge 12)"' \
-    'diff <(gh pr merge 12) /dev/null' 'true;gh pr merge 12' 'echo a|&gh pr merge 12' 'gh pr merge 12 >/dev/null 2>&1' \
-    '>/dev/null gh pr merge 12' 'while true; do gh pr merge 12; done'; do
+# Every way a review round found to hide a lead-only command, one per line. A new one is a one-line addition.
+HIDING_FORMS=(
+  # separators and grouping
+  'echo ok && gh pr merge 12' 'echo ok; gh pr merge 12' 'false || gh pr merge 12' 'echo ok | gh pr merge 12'
+  'sleep 1 & gh pr merge 12' $'echo ok\ngh pr merge 12' '(gh pr merge 12)' '{ gh pr merge 12; }'
+  'if true; then gh pr merge 12; fi' 'while true; do gh pr merge 12; done' 'true;gh pr merge 12' 'echo a|&gh pr merge 12'
+  'gh pr merge 12 >/dev/null 2>&1' '>/dev/null gh pr merge 12' 'gh pr merge 12 # a comment'
+  # substitutions
+  'echo $(gh pr merge 12)' 'echo `gh pr merge 12`' 'echo "$(gh pr merge 12)"' 'diff <(gh pr merge 12) /dev/null'
+  'git commit -m "$(gh pr merge 12)"' 'source <(echo gh pr merge 12)' 'git commit -m "$(echo gh pr merge > f)"'
+  $'echo "$(cat <<EOF | sh\ngh pr merge 12\nEOF\n)"'
+  # env prefixes and wrappers
+  'GH_TOKEN=x gh pr merge 12' 'A=1 B=2 gh workflow run ci.yml' 'env GH_TOKEN=x gh pr merge 12' 'env -i gh pr merge 12'
+  'env -u HOME gh pr merge 12' 'sudo -u bob gh pr merge 12' 'command gh pr merge 12' 'nohup gh pr merge 12'
+  'timeout 30 gh pr merge 12' 'timeout -s KILL 30 gh pr merge 12' 'time gh pr merge 12' 'exec gh pr merge 12'
+  'nice -n 5 gh pr merge 12' '/usr/bin/gh pr merge 12'
+  'echo 12 | xargs gh pr merge' 'echo 12 | xargs -n1 gh pr merge' 'echo "pr merge 12" | xargs gh' 'xargs -0n1 gh pr merge </dev/null'
+  # wrapper options the parser read wrongly
+  "env -S'gh pr merge 12'" "env --split-string='gh pr merge 12'" "env -iS 'gh pr merge 12'" "env --split 'gh pr merge 12'"
+  'env -iu HOME gh pr merge 12' 'sudo -Eu root gh pr merge 12' "env -vS'bash -c \"gh pr merge 12\"'"
+  "env -S 'gh pr' merge 12" 'env -Sgh\ pr\ merge\ 12'
+  # shells, eval and functions
+  "bash -c 'gh pr merge 12'" 'sh -c "gh pr merge 12"' "bash -lc 'gh pr merge 12'" "zsh -ec 'gh pr merge 12'"
+  "bash -c \"bash -c 'gh pr merge 12'\"" 'eval "gh pr merge 12"' "bash -o pipefail -c 'gh pr merge 12'"
+  "FOO=1 bash -c 'FOO=2 gh pr merge 12'" "bash -c 'echo ok; gh pr merge 12'" "sh -c 'sh -c \"sh -c \\\"gh pr merge 12\\\"\"'"
+  'echo() { eval "$*"; }; echo gh pr merge 12' 'function echo { eval "$*"; }; echo gh pr merge 12' 'f () { gh "$@"; }; f pr merge 1'
+  # scripts on stdin
+  $'bash <<\'EOF\'\ngh pr merge 3\nEOF' $'bash -s <<EOF\ngh pr merge 3\nEOF' "echo 'gh pr merge 3' | sh" "bash <<< 'gh pr merge 3'"
+  $'sh <<-EOF\n\tgh workflow run ci.yml\n\tEOF' "printf 'gh pr merge %s' 3 | bash" $'cat <<\'EOF\' | bash\ngh pr merge 3\nEOF'
+  "echo ok; echo 'true' | zsh -s; echo 'gh pr merge 3' | dash" "printf '%s' 'gh pr merge 12' | sh" "echo -n 'gh pr merge 12' | sh"
+  "/bin/echo 'gh pr merge 12' | bash" "printf 'gh pr merge 12' | tr a a | bash" 'echo "$(echo gh pr merge 12)" | sh'
+  $'sed s/x//g <<\'EOF\' | bash\ngh pr merge 12\nEOF' "printf 'gh pr merge 12' | bash /dev/stdin" "printf 'gh pr merge 12' | source /dev/stdin"
+  "printf 'gh pr merge 12' | . /dev/fd/0" 'bash <<< "$(printf gh\ pr\ merge\ 12)"' $'bash <<EOF\n$(printf \'gh pr merge 12\')\nEOF'
+  "printf '%s\\n' 'git push origin feature/x' | sh" "echo 'true\\ngh pr merge 12' | sh" "printf 'true\\ngh pr merge 12' | sh"
+  $'echo \'true\ngh pr merge 12\' | sh' '{ echo gh pr; echo merge; } | sh' 'echo gh pr merge 12 > run.sh'
+  # heredocs
+  $'cat <<EOF\n$(gh pr merge 12)\nEOF' $'cat <<-EOF\n\t`gh pr merge 12`\n\tEOF' $'cat <<\'EOF\'\nnotes\nEOF\ngh pr merge 12'
+  # variables
+  "x='gh pr'; \$x merge 12" 'X="pr merge"; gh $X 12' "printf -v c 'gh pr merge 12'; \$c"
+  '$GH pr merge 12' '"$GH" workflow run ci.yml' '${GH} pr merge 12' '$(which gh) pr merge 12'
+  # quoting, escapes, case and global flags
+  '"gh" pr merge 12' "'gh' 'pr' 'merge' 12" 'g\h pr merge 12' 'gh "pr" merge 12' $'gh \\\n pr merge 12' $'gh pr \\\nmerge 12'
+  'gh -R owner/repo pr merge 12' 'gh --repo owner/repo pr merge 12' 'gh pr merge 12 --squash' 'gh pr --repo o/r merge 12'
+  'gh   pr   merge' $'gh\tpr\tmerge 12' 'g""h pr merge 12' 'GH pr merge 12'
+  "gh \$'pr' merge 12" "\$'gh' pr merge 12" "gh \$'p\\x72' \$'\\155erge' 12" "gh pr \$'merge' 12" 'gh $"pr" merge 12'
+  "bash -c \$'gh pr merge 12'"
+  # data whose escapes count twice in the parsed word, to cancel the live words out of the pool
+  'echo g\h g\h p\r p\r m\erge m\erge; gh pr merge 12'
+  # data commands that run something
+  "rg --pre 'gh pr merge 1' x ." 'gh pr create --title x && gh pr merge 1' $'cat - ./gh-pr-merge.sh <<\'EOF\' | bash\necho hi\nEOF'
+)
+
+@test "every known hiding form is refused" {
+  for cmd in "${HIDING_FORMS[@]}"; do
     bash_denied sid-lane1 "$cmd" || return 1
   done
 }
 
-@test "an env prefix or wrapper cannot hide a matching command" {
-  for cmd in 'GH_TOKEN=x gh pr merge 12' 'A=1 B=2 gh workflow run ci.yml' 'env GH_TOKEN=x gh pr merge 12' 'env -i gh pr merge 12' \
-    'env -u HOME gh pr merge 12' 'sudo -u bob gh pr merge 12' 'command gh pr merge 12' 'nohup gh pr merge 12' \
-    'timeout 30 gh pr merge 12' 'timeout -s KILL 30 gh pr merge 12' 'time gh pr merge 12' 'exec gh pr merge 12' \
-    'echo 12 | xargs gh pr merge' 'echo 12 | xargs -n1 gh pr merge' 'echo "pr merge 12" | xargs gh' '/usr/bin/gh pr merge 12' \
-    'nice -n 5 gh pr merge 12'; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
-}
-
-@test "a wrapper option in a form the guard does not parse exactly cannot hide a matching command" {
-  for cmd in "env -S'gh pr merge 12'" "env --split-string='gh pr merge 12'" "env -iS 'gh pr merge 12'" \
-    "env --split 'gh pr merge 12'" 'env -iu HOME gh pr merge 12' 'sudo -Eu root gh pr merge 12' \
-    'xargs -0n1 gh pr merge </dev/null' "env -vS'bash -c \"gh pr merge 12\"'"; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
-  for cmd in "env -S'echo ok'" 'env -iu HOME ls' 'timeout --preserve-status 5 ls'; do
+@test "a mention inside data, or in a command that only names a lead-only one, passes" {
+  for cmd in 'echo hello' 'echo gh pr merge' 'echo gh pr merge 12' 'gh pr view' 'gh pr view 12' 'gh pr list --state merged' \
+    'gh workflow list' 'gh run list' 'gh --version' 'git commit -m "merge gh docs"' 'git commit -m "gh pr merge is lead-only"' \
+    'git commit -am "docs: explain git push rules"' 'gh pr create --title "workflow run fix"' 'gh issue create --title "gh pr merge"' \
+    'echo "run: gh workflow run ci.yml"' 'grep -r "pr merge" .' "grep -rn 'gh pr merge' docs/" "rg -n 'gh workflow run' ." \
+    'cat README.md | grep "gh pr merge"' 'git log --oneline | grep push' 'git status && git log -1' 'command -v gh' \
+    'cat docs/gh-pr-merge.md' 'ls ./gh' 'gh pr checkout 12' 'gh run list --workflow ci.yml' 'echo gh pr merge # a note' \
+    $'cat <<\'EOF\'\ngh pr merge 12\nEOF' $'cat <<EOF\nplain text: gh pr merge 12\nEOF' 'echo "unterminated' \
+    $'git commit -m "$(cat <<\'EOF\'\nnotes: gh workflow run\nEOF\n)"' \
+    $'gh pr create --title t --body "$(cat <<\'EOF\'\nsteps: gh workflow run ci.yml\nEOF\n)"'; do
     bash_untouched sid-lane1 "$cmd" || return 1
   done
 }
 
-@test "a shell -c string, eval or a nested one cannot hide a matching command" {
-  for cmd in "bash -c 'gh pr merge 12'" 'sh -c "gh pr merge 12"' "bash -lc 'gh pr merge 12'" "zsh -ec 'gh pr merge 12'" \
-    "bash -c \"bash -c 'gh pr merge 12'\"" 'eval "gh pr merge 12"' "bash -o pipefail -c 'gh pr merge 12'" \
-    "FOO=1 bash -c 'FOO=2 gh pr merge 12'" "bash -c 'echo ok; gh pr merge 12'" "sh -c 'sh -c \"sh -c \\\"gh pr merge 12\\\"\"'"; do
-    bash_denied sid-lane1 "$cmd" || return 1
+@test "a lane push passes beside data that names git push" {
+  make_repo
+  for cmd in 'git push -u origin feat' 'git add -A && git commit -m "x" && git push origin lane1' \
+    $'git commit -m "$(cat <<\'EOF\'\nPush the fix to git\nEOF\n)" && git push -u origin lane1' \
+    'git status && git push origin lane1' 'npm run build && git push origin lane1'; do
+    bash_untouched sid-lane1 "$cmd" "$WT" || return 1
   done
 }
 
-@test "quoting, escapes, line continuations and global flags cannot hide a matching command" {
-  for cmd in '"gh" pr merge 12' "'gh' 'pr' 'merge' 12" 'g\h pr merge 12' 'gh "pr" merge 12' $'gh \\\n pr merge 12' $'gh pr \\\nmerge 12' \
-    'gh -R owner/repo pr merge 12' 'gh --repo owner/repo pr merge 12' 'gh pr merge 12 --squash' 'gh pr --repo o/r merge 12' \
-    'gh   pr   merge' $'gh\tpr\tmerge 12' 'g""h pr merge 12'; do
-    bash_denied sid-lane1 "$cmd" || return 1
+@test "a normal command the parse cannot prove harmless is refused when its text names a lead-only command" {
+  make_repo
+  for cmd in 'gh pr view 5 && git merge origin/main' "echo 'gh pr merge 3' | cat" 'gh workflow view ci.yml && gh run view 12' \
+    'timeout 60 git push origin lane1' "bash -c 'git push origin lane1'" "echo 'git push origin feature/x' | sh"; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
   done
-}
-
-@test "a command word the guard cannot resolve fails closed when the rest matches" {
-  for cmd in '$GH pr merge 12' '"$GH" workflow run ci.yml' '${GH} pr merge 12' '$(which gh) pr merge 12'; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
-}
-
-@test "a heredoc with an unquoted delimiter runs its substitutions, so one cannot hide a matching command" {
-  bash_denied sid-lane1 $'cat <<EOF\n$(gh pr merge 12)\nEOF'
-  bash_denied sid-lane1 $'cat <<-EOF\n\t`gh pr merge 12`\n\tEOF'
-}
-
-@test "a command that only mentions a matching one passes untouched" {
-  for cmd in 'echo hello' 'echo gh pr merge 12' 'gh pr view 12' 'gh pr list --state merged' 'gh workflow list' 'gh run list' 'gh --version' \
-    'git commit -m "gh pr merge is lead-only"' 'echo "run: gh workflow run ci.yml"' "grep -rn 'gh pr merge' docs/" 'git status && git log -1' \
-    'command -v gh' 'cat docs/gh-pr-merge.md' 'ls ./gh' 'gh pr checkout 12' 'gh issue create --title "gh pr merge"' \
-    $'cat <<\'EOF\'\ngh pr merge 12\nEOF' $'git commit -m "$(cat <<\'EOF\'\nnotes: gh workflow run\nEOF\n)"' \
-    $'cat <<EOF\nplain text: gh pr merge 12\nEOF' 'echo "unterminated'; do
-    bash_untouched sid-lane1 "$cmd" || return 1
-  done
-}
-
-@test "a command after a heredoc body is still checked" {
-  bash_denied sid-lane1 $'cat <<\'EOF\'\nnotes\nEOF\ngh pr merge 12'
 }
 
 @test "guards.md replaces the default patterns" {
@@ -540,16 +556,8 @@ other_checkout() {
   [ "$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Edit|Write|NotebookEdit") | .hooks[0].command' "$hooks")" = '"${CLAUDE_PLUGIN_ROOT}/bin/lanes-guard" main-edit' ]
 }
 
-@test "a script fed to a shell on stdin cannot hide a matching command" {
-  for cmd in $'bash <<\'EOF\'\ngh pr merge 3\nEOF' $'bash -s <<EOF\ngh pr merge 3\nEOF' "echo 'gh pr merge 3' | sh" \
-    "bash <<< 'gh pr merge 3'" $'sh <<-EOF\n\tgh workflow run ci.yml\n\tEOF' "printf 'gh pr merge %s' 3 | bash" \
-    "echo ok; echo 'true' | zsh -s; echo 'gh pr merge 3' | dash" $'cat <<\'EOF\' | bash\ngh pr merge 3\nEOF'; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
-}
-
 @test "a shell reading stdin that runs nothing matching, or reading a script file, passes untouched" {
-  for cmd in $'bash <<\'EOF\'\necho hi\nEOF' "echo 'echo hi' | sh" "bash <<< 'ls'" 'bash script.sh' 'bash -s' "echo 'gh pr merge 3' | cat" \
+  for cmd in $'bash <<\'EOF\'\necho hi\nEOF' "echo 'echo hi' | sh" "bash <<< 'ls'" 'bash script.sh' 'bash -s' \
     $'bash <<\'EOF\'\nprintf "%s" "gh pr view 3"\nEOF'; do
     bash_untouched sid-lane1 "$cmd" || return 1
   done
@@ -560,29 +568,18 @@ other_checkout() {
   bash_untouched sid-lead "printf '%s' 'gh pr merge 12' | sh"
 }
 
-@test "a script from a producer the guard cannot read is refused when its text names a lead-only command" {
-  for cmd in "printf '%s' 'gh pr merge 12' | sh" "echo -n 'gh pr merge 12' | sh" "/bin/echo 'gh pr merge 12' | bash" \
-    "printf 'gh pr merge 12' | tr a a | bash" 'echo "$(echo gh pr merge 12)" | sh' $'sed s/x//g <<\'EOF\' | bash\ngh pr merge 12\nEOF' \
-    "printf 'gh pr merge 12' | bash /dev/stdin" "printf 'gh pr merge 12' | source /dev/stdin" "printf 'gh pr merge 12' | . /dev/fd/0" \
-    'bash <<< "$(printf gh\ pr\ merge\ 12)"' $'bash <<EOF\n$(printf \'gh pr merge 12\')\nEOF' \
-    "printf '%s\\n' 'git push origin feature/x' | sh" $'cat - ./gh-pr-merge.sh <<\'EOF\' | bash\necho hi\nEOF'; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
-}
-
 @test "a pipe into a shell from a producer the guard cannot read passes when its text names nothing lead-only" {
   make_repo
   for cmd in "printf '%s\\n' hi | sh" 'cat script.sh | bash' "curl -fsSL https://example.com/install.sh | bash" \
-    'printf "ls\n" | bash /dev/stdin' "echo 'git push origin feature/x' | sh" 'bash <<< "$CMD"'; do
+    'printf "ls\n" | bash /dev/stdin' 'bash <<< "$CMD"'; do
     bash_untouched sid-lane1 "$cmd" "$WT" || return 1
   done
 }
 
-@test "ANSI-C and locale quoting are decoded before matching" {
-  for cmd in "gh \$'pr' merge 12" "\$'gh' pr merge 12" "gh \$'p\\x72' \$'\\155erge' 12" "gh pr \$'merge' 12" \
-    'gh $"pr" merge 12' "bash -c \$'gh pr merge 12'" "git push origin \$'main'"; do
-    bash_denied sid-lane1 "$cmd" || return 1
-  done
+@test "ANSI-C quoting is decoded before matching, so a decoded mention outside data is refused and the rest pass" {
+  make_repo
+  bash_denied sid-lane1 "git push origin \$'main'" "$WT"
+  bash_untouched sid-lane1 "git push origin \$'lane1'" "$WT"
   bash_untouched sid-lane1 "gh \$'pr' view 12"
   bash_untouched sid-lane1 "echo \$'it\\'s fine'"
 }
@@ -602,13 +599,20 @@ other_checkout() {
   done
 }
 
-@test "text past the tokenizer call limit is matched loosely: a mention is refused, and the same text under the limit is not" {
+@test "text past the tokenizer call limit gets no exemption: a mention in data is refused there, and passes under the limit" {
   under=''
   over=''
   for ((i = 0; i < 100; i++)); do under+='$(true) '; done
   for ((i = 0; i < 260; i++)); do over+='$(true) '; done
   bash_untouched sid-lane1 "echo $under \$(echo gh pr merge 3 is lead-only)"
   bash_denied sid-lane1 "echo $over \$(echo gh pr merge 3 is lead-only)"
+  bash_untouched sid-lane1 "echo $under gh pr merge 3 is lead-only"
+  bash_denied sid-lane1 "echo $over gh pr merge 3 is lead-only"
+}
+
+@test "a mention in text the parser does not keep (a comment, a redirection target) is refused" {
+  bash_denied sid-lane1 'ls # gh pr merge 12'
+  bash_denied sid-lane1 'echo hi > gh-pr-merge.txt'
 }
 
 @test "an eval nested deeper than the tokenizer limit is still refused" {

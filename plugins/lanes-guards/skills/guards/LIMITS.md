@@ -1,5 +1,22 @@
 # What the lanes guards do not do
 
+- The lead-only rule matches words, not commands. A lane's command is refused when its text holds every word of a
+  lead-only pattern, in any order and anywhere on the line (`gh`, `pr` and `merge` for `gh pr merge`; `git` and `push`
+  for `git push @default`). The text is read lowercased, with `$'...'` decoded, line continuations joined, and quotes,
+  backslashes and inner hyphens read both as nothing and as breaks.
+- Only a full parse lifts a refusal, and only when it proves every mention harmless: the arguments of `git commit`
+  and of `gh pr|issue create|comment|edit`, the operands of `grep` and of `rg` without `--pre`, the arguments and stdin
+  of `echo`, `printf` (not `-v`) and `cat` when nothing reads their output (no `|`, `>` or `<(` on the line, or a
+  substitution that is itself such an argument), and the one allowed push form. A data command behind a wrapper
+  (`timeout 60 git push ...`, `sudo git commit ...`) is not data. Nothing is proven when the parse fails, when a
+  pattern word sits somewhere the parser does not read (a comment, a redirection target, a heredoc delimiter), or when
+  the line defines a function.
+- So some normal commands are refused because they name all of a pattern's words: `gh pr view 5 && git merge x`,
+  `gh workflow view ci.yml && gh run view 12`, `echo 'gh pr merge' | cat`, `bash -c 'git push origin feat'`,
+  `timeout 60 git push origin feat`. Split such a line into separate commands, or ask the lead.
+- Words the text never holds are not seen: a variable set before the line or outside it, a script file (`bash
+  script.sh`, `cat - ./x.sh | bash`), a git or gh alias, `ssh`, a file a previous command wrote. It is a mistake guard,
+  not a sandbox.
 - A lane's `git push` passes only in the explicit form in SKILL.md. A push with no refspec, `--all`, `--mirror`, `--repo`,
   `--delete`, a glob, `HEAD`, `+`, `:`, several refspecs, another option, or a word with `$` is refused rather than
   predicted, because git config or the checkout decides what it pushes.
@@ -8,22 +25,13 @@
   the push is refused: run `git remote set-head <remote> --auto` once, or set `default_branch`.
 - The checkout is the session directory, or the path of one leading `cd <absolute path> &&` with no `..`, then `-C`.
   Any other directory change anywhere on the line, nested or not and before or after the push, refuses every lane push
-  on it: `cd`, `pushd`, `popd`, a command word with `$`, a `GIT_DIR` or `GIT_COMMON_DIR` assignment, an `export` of one
-  of those or of a `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` variable, `env -C` or `sudo -D`.
+  on it: `cd`, `pushd`, `popd`, `eval`, `source`, `.`, a command word with `$`, a `GIT_DIR` or `GIT_COMMON_DIR`
+  assignment, or an `export` of one of those or of a `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` variable.
 - git maps a plain `<name>` through `remote.<remote>.push`, `push.default=upstream` (or `tracking`) and a symref
   branch, so the plain form passes only when none of those is set in the target checkout and the line assigns no
-  `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` (which move the global config). Otherwise use `git push <remote> <name>:<name>`, which passes unless `<name>` is a symref to a
-  default branch. A config change made earlier in the same command line, or a variable exported before the session,
-  is not seen.
-- It parses `&&`, `;`, `|`, env prefixes, `bash -c`, `eval`, `$(...)`, backticks, quotes (`$'...'` decoded) and line
-  continuations. It reads a script fed to a shell by its own heredoc or here-string, a piped bare `cat` heredoc or a
-  piped `echo` of literal words. Any other producer (`printf`, `cat file`, `curl`) is refused when its text names a
-  lead-only command, and otherwise passes. It does not follow a variable it cannot resolve, `ssh`, `find -exec`, a
-  script file or process substitution. It is a mistake guard, not a sandbox.
-- Value-taking global flags are known for `gh` and `git` only. For a wrapper (`env`, `sudo`, `timeout`, `xargs` and
-  the others in its list), a lone letter, a number and its listed value options are parsed; any other option form (a
-  cluster such as `-iu`, an attached value such as `-S'...'`, a long option) adds the rest of the command to the loose
-  match. A wrapper outside the list (`stdbuf`, `flock`, `watch`) is not followed.
+  `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` (which move the global config). Otherwise use
+  `git push <remote> <name>:<name>`, which passes unless `<name>` is a symref to a default branch. A config change made
+  earlier in the same command line, or a variable exported before the session, is not seen.
 - Malformed hook input passes with a stderr note, unless the text still names a lead-only command. The same holds when
   `jq` is not installed: a call naming a lead-only command is refused (exit 2), anything else passes with a note.
 - Destructive commands (`rm -rf`, `git reset --hard`) are not covered: use destructive_command_guard or cc-safety-net.

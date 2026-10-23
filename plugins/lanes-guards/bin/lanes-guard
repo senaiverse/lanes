@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # lanes-guard <lead-only|plan-message|main-edit>: PreToolUse hook guards for a lead and its lanes.
-#   lead-only     Bash: refuse CI dispatch, merge and any push but the explicit one-branch form, unless from the lead.
+#   lead-only     Bash: refuse a command whose text names a lead-only pattern (CI dispatch, merge, push), unless from
+#                 the lead or a full parse proves each mention is data or the one allowed push form.
 #   plan-message  SendMessage: refuse a message that starts with the plan marker unless the caller is the lead.
 #   main-edit     Edit, Write, NotebookEdit: refuse a path inside the main checkout while linked worktrees exist.
 # Reads the hook JSON on stdin. A refusal is the PreToolUse decision JSON on stdout (code.claude.com/docs/en/hooks,
@@ -85,16 +86,87 @@ refuse_not_lead() {
   esac
 }
 
-# ---- command matching --------------------------------------------------------------------------------------------
+# ---- mentions ----------------------------------------------------------------------------------------------------
+# A command is refused when its text holds every word of a lead-only pattern, in any order and anywhere. Only a full
+# parse can lift that (exempt), so a word the parser loses or misreads costs a false refusal; only its short list of
+# data rules can let a mention through.
 
-# value_flags <tool>: option names that take a separate value, so the value is not mistaken for a subcommand word.
-value_flags() {
-  case "$1" in
-    gh) echo " -R --repo " ;;
-    git) echo " -C -c --git-dir --work-tree --namespace --exec-path --super-prefix --config-env -o --push-option --repo --receive-pack --exec " ;;
-    *) echo " " ;;
-  esac
+declare -A CNT=() PWORDS=() DATA_SUB=() SUB_BAD=()
+PATTERNS=(); PAT_WORDS=()
+
+# load_patterns: PATTERNS from the setting, split on ";", with each pattern's words as the mention check reads them.
+load_patterns() {
+  local raw p w x
+  local -a ws
+  raw="$(setting lead_only_commands "$DEFAULT_PATTERNS")"
+  while IFS= read -r p; do
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    w="${p,,}"; w="${w//@default/ }"; w="${w//[^a-z0-9_-]/ }"
+    read -ra ws <<<"$w"
+    [ "${#ws[@]}" -gt 0 ] || continue
+    PATTERNS+=("$p"); PAT_WORDS+=("${ws[*]}")
+    for x in "${ws[@]}"; do PWORDS[$x]=1; done
+  done <<<"${raw//;/$'\n'}"
+  return 0
 }
+
+# decode_ansi <text>: sets REPLY to text with each $'...' decoded as bash decodes it. The scan stops only at an
+# unescaped quote, so eval sees one $'...' word, which expands nothing; an unterminated one stays as it is.
+decode_ansi() {
+  local s="$1" out="" body j n
+  while [[ "$s" == *"\$'"* ]]; do
+    out+="${s%%"\$'"*}"; s="${s#*"\$'"}"
+    j=0; n=${#s}
+    while [ "$j" -lt "$n" ] && [ "${s:j:1}" != "'" ]; do
+      if [ "${s:j:1}" = "\\" ]; then j=$((j + 1)); fi
+      j=$((j + 1))
+    done
+    if [ "$j" -ge "$n" ]; then out+="\$'"; break; fi
+    body="${s:0:j}"; eval "body=\$'$body'"
+    out+="$body"; s="${s:j+1}"
+  done
+  REPLY="$out$s"
+}
+
+# count_tokens <kind> <text>: adds the pattern words in text to CNT[<kind>:<word>]. The text is read as a shell may:
+# $'...' decoded, line continuations joined, lowercased, quotes dropped (`g""h`), and read twice, once with backslashes
+# dropped (`g\h`) and once with each escape as a break (`printf 'x\ngh'`). A hyphen inside a word is a break too
+# (`gh-pr-merge.sh`), and a short-option token ending in a pattern word counts as that word (`-S'gh pr'`).
+count_tokens() {
+  local t w p
+  local -a parts
+  decode_ansi "$2"
+  t="${REPLY//$'\\\n'/}"; t="${t,,}"
+  t=${t//[\"\']/}
+  t="${t//\\/} ${t//\\?/ }"
+  read -ra parts <<<"${t//[^a-z0-9_-]/ }"
+  for w in "${parts[@]}"; do
+    if [[ "$w" != -* && "$w" == *-* ]]; then count_tokens "$1" "${w//-/ }"; continue; fi
+    if [[ "$w" == -[!-]* && -z "${PWORDS[$w]+x}" ]]; then
+      for p in "${!PWORDS[@]}"; do if [[ "$w" == *"$p" ]]; then w="$p"; break; fi; done
+    fi
+    [ -z "${PWORDS[$w]+x}" ] || CNT[$1:$w]=$((${CNT[$1:$w]:-0} + 1))
+  done
+}
+
+# mentions <raw|pool>: sets MATCHED to the first pattern with every word in the raw text, or in what is left of it
+# once proven data is taken out (pool).
+mentions() {
+  local i w n
+  local -a ws
+  for ((i = 0; i < ${#PATTERNS[@]}; i++)); do
+    read -ra ws <<<"${PAT_WORDS[i]}"
+    for w in "${ws[@]}"; do
+      n=${CNT[raw:$w]:-0}
+      [ "$1" = raw ] || n=$((n - ${CNT[data:$w]:-0}))
+      [ "$n" -gt 0 ] || continue 2
+    done
+    MATCHED="${PATTERNS[i]}"; return 0
+  done
+  return 1
+}
+
+# ---- exemptions --------------------------------------------------------------------------------------------------
 
 # default_branches <git dir> <remote>: the branch names a push to that remote must not target, one per line: the
 # default_branch setting and the remote's head (refs/remotes/<remote>/HEAD). Nothing when neither is known.
@@ -176,48 +248,6 @@ push_allowed() {
   [[ ! "$(git -C "$dir" config push.default 2>/dev/null || true)" =~ ^(upstream|tracking)$ ]]
 }
 
-# match_command: tests one command (array W) against PATTERNS; sets MATCHED to the pattern text on a hit.
-match_command() {
-  local cmd="${W[0]}" base pat first a x need k
-  local -a pw pos
-  base="${cmd##*/}"
-  for pat in "${PATTERNS[@]}"; do
-    read -ra pw <<<"$pat"
-    [ "${#pw[@]}" -gt 0 ] || continue
-    first="${pw[0]}"
-    if [ "$base" != "$first" ]; then
-      # A command word the guard cannot resolve ($VAR, a substitution) is matched on the words after it.
-      [[ "$cmd" == *'$'* ]] && [ "${#pw[@]}" -gt 1 ] || continue
-    fi
-    pos=()
-    for ((a = 1; a < ${#W[@]}; a++)); do
-      x="${W[a]}"
-      if [[ "$x" == -?* ]]; then
-        if [[ "$(value_flags "$first")" == *" $x "* ]]; then a=$((a + 1)); fi
-      else
-        pos+=("$x")
-      fi
-    done
-    need=$((${#pw[@]} - 1))
-    if [ "${pw[need]}" = "@default" ]; then need=$((need - 1)); fi
-    if [ "${#pos[@]}" -lt "$need" ]; then
-      # xargs appends words at run time, so a prefix of the pattern may still complete.
-      [ "$VIA_XARGS" -eq 1 ] || continue
-      for ((k = 0; k < ${#pos[@]}; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
-      MATCHED="$pat"; return 0
-    fi
-    for ((k = 0; k < need; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
-    # A push is judged once the whole line is read (check_pushes), since a later or nested command may change its checkout.
-    if [ "${pw[${#pw[@]} - 1]}" = "@default" ] && [ "$VIA_XARGS" -eq 0 ]; then
-      printf -v x '%s'"$SEP" "${W[@]}"
-      PUSHES+=("${x%"$SEP"}"); PUSH_PATS+=("$pat")
-      continue
-    fi
-    MATCHED="$pat"; return 0
-  done
-  return 1
-}
-
 # drop <n>: removes the first n words of W.
 drop() { if [ "${#W[@]}" -le "$1" ]; then W=(); else W=("${W[@]:$1}"); fi; }
 
@@ -231,163 +261,118 @@ split_words() {
 # is_assignment <word>
 is_assignment() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*\+?= ]]; }
 
-# WRAPPERS: commands that run the rest of their line, each with the options that take a separate value.
-declare -A WRAPPERS=(
-  [command]=" " [builtin]=" " [nohup]=" " [setsid]=" " [time]=" " [exec]=" -a " [nice]=" -n "
-  [timeout]=" -s -k --signal --kill-after " [env]=" -u --unset -C --chdir "
-  [sudo]=" -u -g -h -p -C -D -r -t -U -T " [doas]=" -u -g -h -p -C -D -r -t -U -T "
-  [xargs]=" -I -L -n -P -s -d -E -a -J "
-)
+# printer: true when W only prints its words, a file or its stdin: echo, cat, or printf without -v.
+printer() { case "${W[0]##*/}" in echo|cat) ;; printf) [[ "${W[1]:-}" != -v* ]] ;; *) false ;; esac; }
 
-# shell_stdin <index>: checks the script a shell reading stdin runs. The guard reads it only from the shell's own
-# heredoc or here-string, a piped bare `cat` heredoc, or a piped `echo` of literal words. Any other producer, or text
-# with an expansion, adds the pipeline's raw text to LOOSE_TEXT, so it is refused when it names a lead-only pattern.
-shell_stdin() {
-  local p="${CMD_PIPE[$1]:--1}" text="" raw="" w lit=1
-  local -a words
-  if [ -n "${CMD_STDIN[$1]:-}" ]; then
-    text="${CMD_STDIN[$1]}"; raw="${CMD_RAW[$1]}$text"
-  elif [ "$p" -ge 0 ]; then
-    IFS="$SEP" read -ra words <<<"${CMDS[p]}"
-    case "${words[0]}" in
-      cat) if [ "${#words[@]}" -eq 1 ]; then text="${CMD_STDIN[p]:-}"; else lit=0; fi ;;
-      echo) for w in "${words[@]:1}"; do [[ "$w" != -* && "$w" != *\\* ]] || lit=0; text+="$w "; done ;;
-      *) lit=0 ;;
-    esac
-    while [ "$p" -ge 0 ]; do raw+="${CMD_RAW[p]}${CMD_STDIN[p]:-}"$'\n'; p="${CMD_PIPE[p]:--1}"; done
-  fi
-  # shellcheck disable=SC2016 # the patterns are literal text
-  [[ "$text" != *'$'* && "$text" != *'`'* ]] || lit=0
-  if [ "$lit" -eq 0 ]; then LOOSE=1; LOOSE_TEXT+="$raw"$'\n'; fi
-  if [ -n "$text" ]; then tokenize "$text"; fi
-}
-
-# is_stdin_path <word>: a script path that is the shell's stdin.
-is_stdin_path() { [[ "$1" =~ ^(/dev/stdin|/dev/fd/0|/proc/self/fd/0)$ ]]; }
-
-# note_dir_change <command words...>: sets DIR_UNSURE for a command that may change the checkout later commands use:
-# cd, pushd, popd, a command word the guard cannot resolve, or an export of GIT_DIR, GIT_COMMON_DIR or GIT_CONFIG_ENV.
-# Nesting, subshells and pipelines decide whether such a change reaches a push, so every lane push on the line is refused.
-note_dir_change() {
+# note_changes <index>: for command idx, sets DIR_UNSURE when it may change the checkout or config later pushes read
+# (cd, pushd, popd, eval, source, a $ command word, a GIT_DIR assignment, an export of git config), GIT_ENV_CONFIG for
+# a git config assignment, FUNC_DEF for a function, and SUB_BAD for a substitution that does more than print.
+note_changes() {
+  local -a W
   local d
-  [[ "$1" != *'$'* ]] || DIR_UNSURE=1
-  case "${1##*/}" in
-    cd|pushd|popd) DIR_UNSURE=1 ;;
+  split_words "${CMDS[$1]}"
+  while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
+    if [[ "${W[0]}" =~ ^$GIT_CONFIG_ENV= ]]; then GIT_ENV_CONFIG=1; fi
+    if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then DIR_UNSURE=1; fi
+    drop 1
+  done
+  [ "${#W[@]}" -gt 0 ] || return 0
+  if [ -n "${CMD_SUB[$1]}" ] && { ! printer || [[ "${CMD_RAW[$1]}" == *'>'* || "${CMD_RAW[$1]}" == *'<('* ]]; }; then
+    SUB_BAD[${CMD_SUB[$1]}]=1
+  fi
+  while [[ "${W[0]}" =~ ^(builtin|command|exec|-.*)$ ]] && [ "${#W[@]}" -gt 1 ]; do drop 1; done
+  if [[ "${W[0]}" == *'$'* ]]; then DIR_UNSURE=1; fi
+  case "${W[0]##*/}" in
+    cd|pushd|popd|eval|source|.) DIR_UNSURE=1 ;;
+    function) FUNC_DEF=1 ;;
     export|declare|typeset|readonly|local)
-      for d in "${@:2}"; do [[ ! "$d" =~ ^(GIT_DIR|GIT_COMMON_DIR|$GIT_CONFIG_ENV)= ]] || DIR_UNSURE=1; done ;;
+      for d in "${W[@]:1}"; do if [[ "$d" =~ ^(GIT_DIR|GIT_COMMON_DIR|$GIT_CONFIG_ENV)= ]]; then DIR_UNSURE=1; fi; done ;;
   esac
 }
 
-# check_command <index in CMDS>: strips wrappers, follows shells and eval into CMDS, and matches the real command.
-# A git environment assignment or a wrapper's chdir anywhere on the line sets GIT_ENV_CONFIG or DIR_UNSURE for all of it.
-check_command() {
-  local idx="$1" base a k mode script
-  local -a W=()
-  VIA_XARGS=0
+# data_words <word...>: counts the words as proven data, and marks the substitutions in them as data.
+data_words() {
+  local w m
+  for w in "$@"; do
+    count_tokens data "$w"
+    while [[ "$w" == *"$SUBMARK"*"$SUBMARK"* ]]; do
+      w="${w#*"$SUBMARK"}"; m="${w%%"$SUBMARK"*}"; w="${w#*"$SUBMARK"}"
+      DATA_SUB[$m]=1
+    done
+  done
+}
+
+# classify <index>: counts command idx's words and stdin as parsed text, and the part it proves harmless as data: the
+# arguments of git commit and gh pr|issue create|comment|edit, grep's and rg's operands, an allowed push, and what a
+# printer prints where nothing reads it (on a line with no pipe, redirection or process substitution, or into a
+# substitution that is itself data).
+classify() {
+  local -a W
+  local w sub="${CMD_SUB[$1]}" stdin="${CMD_STDIN[$1]:-}" i
   split_words "${CMDS[$1]}"
-  while :; do
-    while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
-      if [[ "${W[0]}" =~ ^$GIT_CONFIG_ENV= ]]; then GIT_ENV_CONFIG=1; fi
-      if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then DIR_UNSURE=1; fi
-      drop 1
-    done
-    [ "${#W[@]}" -gt 0 ] || return 0
-    base="${W[0]##*/}"
-    if [ -n "${WRAPPERS[$base]+x}" ]; then
-      drop 1
-      while [ "${#W[@]}" -gt 0 ] && [[ "${W[0]}" == -* ]]; do
-        if [ "${W[0]}" = "--" ]; then drop 1; break; fi
-        if [ "$base" = command ] && [[ "${W[0]}" =~ ^-[a-zA-Z]*[vV] ]]; then return 0; fi
-        if [ "$base" = env ] && [[ "${W[0]}" =~ ^(-S|--split-string)$ ]]; then tokenize "${W[1]:-}"; return 0; fi
-        if [[ "$base:${W[0]}" =~ ^(env:-C|env:--chdir|sudo:-D|sudo:--chdir)$ ]]; then DIR_UNSURE=1; fi
-        if [[ "${WRAPPERS[$base]}" == *" ${W[0]} "* ]]; then drop 2; continue; fi
-        # Any other form but a lone letter or a number (a cluster, an attached value, a long option) may take the next
-        # word or carry a command or a directory (env -S'...', -iu NAME, -D/x), so the rest is matched loosely too.
-        if [[ ! "${W[0]}" =~ ^-([A-Za-z]|[0-9]+)$ ]]; then LOOSE=1; LOOSE_TEXT+="${W[*]}"$'\n'; fi
-        drop 1
-      done
-      if [ "$base" = timeout ]; then drop 1; fi
-      if [ "$base" = xargs ]; then VIA_XARGS=1; fi
-      continue
-    fi
-    case "$base" in
-      '{'|'}'|'!'|if|then|else|elif|do|while|until|coproc) drop 1 ;;
-      bash|sh|zsh|dash|ksh|ash|mksh)
-        k=1; mode=operand; script=""
-        while [ "$k" -lt "${#W[@]}" ]; do
-          a="${W[k]}"
-          case "$a" in
-            -o|-O|+o|+O) k=$((k + 2)) ;;
-            --) break ;;
-            -*|+*)
-              if [[ "$a" =~ ^-[A-Za-z]*c[A-Za-z]*$ ]]; then mode=c; script="${W[k + 1]:-}"; break; fi
-              if [[ "$a" =~ ^-[A-Za-z]*s[A-Za-z]*$ ]]; then mode=stdin; fi
-              k=$((k + 1)) ;;
-            *) break ;;
-          esac
-        done
-        if [ "$mode" = operand ] && { [ "$k" -ge "${#W[@]}" ] || is_stdin_path "${W[k]}"; }; then mode=stdin; fi
-        if [ "$mode" = stdin ]; then shell_stdin "$idx"; fi
-        if [ -n "$script" ]; then tokenize "$script"; fi
-        return 0 ;;
-      eval) drop 1; tokenize "${W[*]:-}"; return 0 ;;
-      source|.) if is_stdin_path "${W[1]:-}"; then shell_stdin "$idx"; fi; return 0 ;;
-      *) note_dir_change "${W[@]}"; match_command || true; return 0 ;;
-    esac
-  done
+  for w in "${W[@]}"; do count_tokens parsed "$w"; done
+  if [ -n "$stdin" ]; then count_tokens parsed "$stdin"; fi
+  while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do drop 1; done
+  [ "${#W[@]}" -gt 0 ] || return 0
+  case "${W[0]##*/}" in
+    git)
+      if [ "${W[1]:-}" = commit ]; then data_words "${W[@]:2}"
+      elif [[ " ${W[*]} " == *" push "* ]] && push_allowed; then data_words "${W[@]}"
+      fi ;;
+    gh) if [[ "${W[1]:-} ${W[2]:-}" =~ ^(pr|issue)\ (create|comment|edit)$ ]]; then data_words "${W[@]:3}"; fi ;;
+    grep|rg)
+      # rg --pre runs a command on each file.
+      [[ " ${W[*]} " != *" --pre"* ]] || return 0
+      for ((i = 1; i < ${#W[@]}; i++)); do
+        if [ "${W[i]}" = -- ]; then data_words "${W[@]:i+1}"; break; fi
+        if [[ "${W[i]}" != -* ]]; then data_words "${W[i]}"; fi
+      done ;;
+    *)
+      printer || return 0
+      if [ -z "$sub" ] && [ "$QUIET" -eq 1 ] || { [ -n "$sub" ] && [ -n "${DATA_SUB[$sub]+x}" ] && [ -z "${SUB_BAD[$sub]+x}" ]; }; then
+        data_words "${W[@]:1}"
+        # An unquoted heredoc body runs its substitutions, which nothing here parses.
+        # shellcheck disable=SC2016 # the patterns are literal text
+        if [[ "$stdin" != *'$('* && "$stdin" != *'`'* ]]; then count_tokens data "$stdin"; fi
+      fi ;;
+  esac
 }
 
-# loose_match <text>: true when the words of a pattern appear in order in text with any separators. This is the fallback
-# for text the tokenizer could not parse, so it errs toward matching.
-loose_match() {
-  local text="$1" pat w re
-  local -a pw
-  for pat in "${PATTERNS[@]}"; do
-    read -ra pw <<<"$pat"
-    re=""
-    for w in "${pw[@]}"; do
-      [ "$w" = "@default" ] && continue
-      w="$(printf '%s' "$w" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
-      re+="${re:+[^[:alnum:]_]+}$w"
-    done
-    if [ -n "$re" ] && [[ "$text" =~ $re ]]; then MATCHED="$pat"; return 0; fi
-  done
-  return 1
-}
-
-# load_patterns: PATTERNS from the setting, split on ";".
-load_patterns() {
-  local raw p
-  PATTERNS=()
-  raw="$(setting lead_only_commands "$DEFAULT_PATTERNS")"
-  while IFS= read -r p; do
-    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-    [ -n "$p" ] && PATTERNS+=("$p")
-  done <<<"${raw//;/$'\n'}"
-  return 0
+# exempt <command>: true when a full parse proves every mention harmless. The tokenizer must read the whole text with
+# each pattern word in a parsed word as often as in the raw text, the line must define no function (it could redefine
+# a printer), and once proven data is taken out no pattern may be left.
+exempt() {
+  local cmd="$1" idx w lead_cd='^[[:space:]]*cd[[:space:]]+(-[LP][[:space:]]+)?(/[A-Za-z0-9._/@+-]*)[[:space:]]*&&(.*)$'
+  CMDS=(); CMD_STDIN=(); CMD_RAW=(); CMD_SUB=(); LOOSE=0; TOKENIZE_CALLS=0; SUB_SERIAL=0; FUNC_DEF=0
+  DIR_UNSURE=0; GIT_ENV_CONFIG=0; RUN_DIR="$SESSION_DIR"; DATA_SUB=(); SUB_BAD=()
+  # `cd <absolute path> && rest` runs all of rest there when the cd succeeds. ".." is refused: the shell resolves it
+  # against the path as written, git -C against the symlink target.
+  if [[ "$cmd" =~ $lead_cd ]] && [[ "/${BASH_REMATCH[2]}/" != */../* ]]; then
+    RUN_DIR="${BASH_REMATCH[2]}"; cmd="${BASH_REMATCH[3]}"
+    count_tokens parsed "$RUN_DIR"; count_tokens data "$RUN_DIR"
+  fi
+  QUIET=1
+  if [[ "$cmd" == *[\|\>]* || "$cmd" == *'<('* ]]; then QUIET=0; fi
+  tokenize "$cmd"
+  [ "$LOOSE" -eq 0 ] || return 1
+  for ((idx = 0; idx < ${#CMDS[@]}; idx++)); do note_changes "$idx"; done
+  [ "$FUNC_DEF" -eq 0 ] || return 1
+  # A substitution's commands come before the command that holds it, so walking back reaches the holder first.
+  for ((idx = ${#CMDS[@]} - 1; idx >= 0; idx--)); do classify "$idx"; done
+  for w in "${!PWORDS[@]}"; do [ "${CNT[parsed:$w]:-0}" -eq "${CNT[raw:$w]:-0}" ] || return 1; done
+  ! mentions pool
 }
 
 # ---- guards ------------------------------------------------------------------------------------------------------
 
-# check_pushes: after the whole line is read, sets MATCHED for the first recorded push push_allowed refuses.
-check_pushes() {
-  local i
-  local -a W
-  for ((i = 0; i < ${#PUSHES[@]}; i++)); do
-    split_words "${PUSHES[i]}"
-    push_allowed || { MATCHED="${PUSH_PATS[i]}"; return 0; }
-  done
-}
-
 guard_lead_only() {
-  local cmd idx lead_cd='^[[:space:]]*cd[[:space:]]+(-[LP][[:space:]]+)?(/[A-Za-z0-9._/@+-]*)[[:space:]]*&&(.*)$'
-  CMDS=(); CMD_STDIN=(); CMD_PIPE=(); CMD_RAW=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
-  PUSHES=(); PUSH_PATS=(); DIR_UNSURE=0; GIT_ENV_CONFIG=0
-  RUN_DIR="$SESSION_DIR"
+  local cmd
+  MATCHED=""
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   load_patterns
   if [ "$VALID" -eq 0 ]; then
-    if loose_match "$INPUT"; then
+    count_tokens raw "$INPUT"
+    if mentions raw; then
       note "hook input is not valid JSON but names a lead-only command"
       SID=""; ROLE="none"
       refuse_not_lead lead-only "\`$MATCHED\` is lead-only" "ask the lead to run it; the lead is the session registered with role lead"
@@ -398,27 +383,17 @@ guard_lead_only() {
   [ "$(jstr tool_name)" = Bash ] || exit 0
   cmd="$(jstr tool_input.command)"
   [ -n "$cmd" ] || exit 0
-  # `cd <absolute path> && rest` runs all of rest there when the cd succeeds. ".." is refused: the shell resolves it
-  # against the path as written, git -C against the symlink target.
-  if [[ "$cmd" =~ $lead_cd ]] && [[ "/${BASH_REMATCH[2]}/" != */../* ]]; then
-    RUN_DIR="${BASH_REMATCH[2]}"; cmd="${BASH_REMATCH[3]}"
-  fi
-  tokenize "$cmd"
-  for ((idx = 0; idx < ${#CMDS[@]}; idx++)); do
-    check_command "$idx"
-    [ -z "$MATCHED" ] || break
-  done
-  if [ -z "$MATCHED" ]; then check_pushes; fi
-  if [ -z "$MATCHED" ] && [ "$LOOSE" -eq 1 ]; then loose_match "$LOOSE_TEXT" || true; fi
-  [ -n "$MATCHED" ] || exit 0
+  count_tokens raw "$cmd"
+  mentions raw || exit 0
   lookup_caller
   [ "$ROLE" != lead ] || exit 0
+  if exempt "$cmd"; then exit 0; fi
   if [[ "$MATCHED" == *@default* ]]; then
     refuse_not_lead lead-only "this \`git push\` form is lead-only: a lane pushes only one named non-default branch" \
-      "$PUSH_HINT (with -u or --force-with-lease if needed); ask the lead for any other push, or change lead_only_commands in .lanes/guards.md"
+      "$PUSH_HINT (with -u or --force-with-lease if needed), as its own command or after one leading cd; ask the lead for any other push, or change lead_only_commands in .lanes/guards.md"
   fi
-  refuse_not_lead lead-only "\`$MATCHED\` is lead-only" \
-    "ask the lead to run it, or change lead_only_commands in .lanes/guards.md"
+  refuse_not_lead lead-only "the command names \`$MATCHED\`, which is lead-only, and the guard cannot prove each mention is only text" \
+    "ask the lead to run it. Text that names it passes as a git commit message, a gh pr or issue title or body, an echo, printf or cat with nothing reading its output, or a grep or rg pattern; or change lead_only_commands in .lanes/guards.md"
 }
 
 guard_plan_message() {
@@ -514,7 +489,8 @@ no_jq() {
   find_config
   if [ "$NAME" = lead-only ]; then
     load_patterns
-    if loose_match "$INPUT"; then
+    count_tokens raw "$INPUT"
+    if mentions raw; then
       note "jq not found, and the call names \`$MATCHED\`, which is lead-only: refused because the caller cannot be identified. Install jq, or ask the lead to run it."
       exit 2
     fi

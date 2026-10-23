@@ -8,9 +8,12 @@ description: Explains why a lanes guard refused a tool call (lead-only command, 
 Three PreToolUse hooks protect a lead-and-lanes setup. Each refusal names its rule and the allowed path. Obey it; do not
 rephrase the command to get past the guard.
 
-- `lead-only`: from a lane, a Bash command matching `lead_only_commands` (default `gh workflow run`, `gh pr merge`, and
-  every `git push` but `git [-C <dir>] push [-u] [--force-with-lease[=...]] <remote> <branch>` with one non-default
-  branch, plain or as `<name>:<name>`, after at most one leading `cd <absolute path> &&`).
+- `lead-only`: from a lane, a Bash command whose text names every word of a `lead_only_commands` pattern, anywhere
+  and however quoted (default `gh workflow run`, `gh pr merge`, `git push @default`). It passes only when the guard
+  proves each mention is text (a commit message, a gh pr or issue title or body, an echo, printf or cat nobody reads,
+  a grep or rg pattern) or the one lane push: `git [-C <dir>] push [-u] [--force-with-lease[=...]] <remote> <branch>`
+  with one non-default branch, plain or as `<name>:<name>`, as its own command, after at most one leading
+  `cd <absolute path> &&`.
 - `plan-message`: from a lane, a `SendMessage` that starts with the plan marker (default `PLAN:`).
 - `main-edit`: Edit, Write or NotebookEdit on a path in the main checkout while lanes work in linked worktrees.
 
@@ -19,7 +22,7 @@ A lane in a checkout whose `origin` head is `main`:
 ```
 git push origin my-feature     # passes
 git push origin main           # refused with:
-lanes-guards rule lead-only: this `git push` form is lead-only: a lane pushes only one named non-default branch. This session is lane "lane1" (role lane), not the lead. Allowed path: push explicitly: git push <remote> <your-branch> (with -u or --force-with-lease if needed); ask the lead for any other push, or change lead_only_commands in .lanes/guards.md
+lanes-guards rule lead-only: this `git push` form is lead-only: a lane pushes only one named non-default branch. This session is lane "lane1" (role lane), not the lead. Allowed path: push explicitly: git push <remote> <your-branch> (with -u or --force-with-lease if needed), as its own command or after one leading cd; ask the lead for any other push, or change lead_only_commands in .lanes/guards.md
 ```
 
 The guard finds you by session id: `${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}/sessions/<session_id>` holds
