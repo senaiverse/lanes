@@ -1,0 +1,18 @@
+schema_version: "1.1"
+name: review-plain-question-no-reviewer
+description: A general git question does not spawn the reviewer.
+tags: [review, negative]
+plugins: ["../../../plugins/lanes-review"]
+runs: 1
+execution:
+  max_turns: 4
+  allowed_tools: [Agent, Read]
+  prompt: |
+    In one sentence, what is the difference between `git diff a..b` and `git diff a...b`?
+graders:
+  - name: no-reviewer
+    type: tool_used
+    tool: Agent
+    min: 0
+    max: 0
+    arm: both
