@@ -20,12 +20,10 @@ P="$BATS_TEST_DIRNAME/../../plugins/lanes"
   assert_output ""
 }
 
-@test "hooks.json wires the five events the core needs" {
+@test "hooks.json wires the three events the core needs, and no Stop hook (activity comes from the sessions file)" {
   run jq -r '[.hooks | to_entries[] | "\(.key)=\(.value[0].matcher // "*")=\(.value[0].hooks[0].command | split(" ")[1:] | join(" "))"] | sort | .[]' "$P/hooks/hooks.json"
   assert_output 'PreToolUse=AskUserQuestion=hook ask
 SessionStart=startup|resume|clear|compact=register
-Stop=*=hook stop
-StopFailure=*=hook stop
 UserPromptSubmit=*=hook prompt'
 }
 

@@ -21,6 +21,36 @@ setup_lane() {
   assert_output "ready|$(git -C "$WORK" rev-parse HEAD)|finish item A1 and report done"
 }
 
+@test "clear-ready records the transcript and the turns it shows begun: prompts and goal verdicts, not tool results" {
+  make_repo
+  write_resume alpha
+  t="$LANES_TEST_TMP/transcript.jsonl"
+  {
+    echo '{"type":"user","message":{"role":"user","content":"a prompt"}}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}'
+    echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"done"}]}}'
+    echo '{"type":"attachment","attachment":{"type":"goal_status","met":false,"sentinel":true,"condition":"c"}}'
+    echo '{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"c","reason":"not yet"}}'
+    echo '{"type":"attachment","attachment":{"type":"goal_status","met":true,"condition":"c","reason":"done"}}'
+    printf '{"type":"user","message":'
+  } >"$t"
+  hook_json SessionStart s1 alpha startup | jq -c --arg t "$t" '.transcript_path = $t' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  run state alpha '.handshake | [.transcript, .turns] | join("|")'
+  assert_output "$t|2"
+}
+
+@test "a RESUME check that crashes (its character count killed) is a refusal, never ready" {
+  setup_lane
+  jq_shim 'explode[] | if . > 65535' 1+
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "check failed: resume_problems"
+  run reg alpha .clear_ready
+  assert_output false
+}
+
 @test "clear-ready finds its own lane from TMUX_PANE when --lane is absent" {
   setup_lane
   TMUX_PANE=%7 run "$LANES" clear-ready
@@ -211,6 +241,6 @@ journal_worktree() {
   run "$LANES" clear alpha
   assert_failure
   assert_output --partial "the journal's work tree"
-  run grep -c '^ESC$' "$FAKE_LOG"
+  run grep -c -E '^(BURST|ESC)' "$FAKE_LOG"
   assert_output 0
 }

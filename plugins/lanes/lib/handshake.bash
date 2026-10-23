@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # jq programs are single-quoted on purpose: their $names are jq variables, not shell ones.
 # shellcheck disable=SC2016
-# lanes handshake: request, clear-ready, the screen veto, typed sends, and the clear and goal commands. bin/lanes
-# sources it after defining the registry, state, lock and RESUME helpers used here; this file only defines functions.
+# lanes handshake: request, clear-ready, the draft check, typed sends, and the clear and goal commands. bin/lanes
+# sources it after defining the registry, state, lock, RESUME and why_of helpers used here; this file only defines
+# functions.
 
 # ---- request and clear-ready -------------------------------------------------------------------------------------
 
@@ -20,11 +21,31 @@ git_problem() {
 # journal_problem <lane work tree>: a journal inside a git work tree of its own (another worktree or branch) must be
 # clean and pushed as well; a journal outside any work tree has nothing to push.
 journal_problem() {
-  local jt prob
+  local jt
   jt="$(git -C "$(journal_root "$1")" rev-parse --show-toplevel 2>/dev/null)" || return 0
   [[ "$jt" != "$1" ]] || return 0
-  prob="$(git_problem "$jt")"
-  [[ -z "$prob" ]] || echo "the journal's work tree $jt: $prob"
+  why_of git_problem "$jt"
+  [[ -z "$WHY" ]] || echo "the journal's work tree $jt: $WHY"
+}
+
+# tree_problem <work tree>: the work tree and the journal's own work tree are clean and pushed, or why not.
+tree_problem() {
+  why_of git_problem "$1"
+  [[ -n "$WHY" ]] || why_of journal_problem "$1"
+  printf '%s' "$WHY"
+}
+
+# turn_starts <transcript>: how many turns the transcript shows begun, by the entry each one starts with: a user entry
+# that is not only tool results (a prompt, a Stop hook's feedback such as a /goal verdict, a task notification), or a
+# goal_status verdict that sends the goal loop on (met false, not the sentinel; 2.1.309). A missing file has none yet.
+turn_starts() {
+  [[ -n "$1" ]] || return 1
+  [[ -e "$1" ]] || { echo 0; return 0; }
+  [[ -r "$1" ]] || return 1
+  { grep -E '"type":"(user|attachment)"' "$1" || true; } | jq -Rn '[inputs | fromjson? | select(
+      (.type == "user" and ((.message.content | type) != "array" or (.message.content | any(.type != "tool_result"))))
+      or (.type == "attachment" and .attachment.type == "goal_status" and .attachment.met == false
+          and (.attachment.sentinel | not)))] | length'
 }
 
 # self_lane [--lane x]: which lane runs this command (the Bash tool carries TMUX_PANE, not the plugin's variables).
@@ -61,19 +82,18 @@ cmd_request() {
 # cmd_clear_ready: the work tree is the one the lane runs this from (its Bash tool's directory), not the directory the
 # session started in. The goal re-sent after /clear is the RESUME Goal, its one source (RULES.md rule 6).
 cmd_clear_ready() {
-  local arg="" lane e st wt file block problems prob h goal req
+  local arg="" lane e st wt file block h goal req tp turns
   [[ "${1:-}" == "--lane" ]] && arg="${2:-}"
   lane="$(self_lane "$arg")"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "restart the session as 'claude --name $lane' inside tmux"
   wt="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" ||
     die "not clear-ready" "$PWD is not a git work tree: run 'lanes clear-ready' from the work tree you work in"
-  prob="$(git_problem "$wt")"
-  [[ -n "$prob" ]] || prob="$(journal_problem "$wt")"
-  [[ -z "$prob" ]] || die "not clear-ready" "$prob"
+  why_of tree_problem "$wt"
+  [[ -z "$WHY" ]] || die "not clear-ready" "$WHY"
   file="$(resume_path "$lane" "$wt")"
   block="$(resume_block "$file")" || die "not clear-ready" "no RESUME block in $file: run 'lanes init $lane' and fill it in"
-  problems="$(resume_problems "$block")"
-  [[ -z "$problems" ]] || die "not clear-ready" "$(tr '\n' ';' <<<"$problems")"
+  why_of resume_problems "$block"
+  [[ -z "$WHY" ]] || die "not clear-ready" "$(tr '\n' ';' <<<"$WHY")"
   h="$(hash_of "$block")"
   st="$(state_read "$lane")"
   if [[ "$(jq -r '.handshake.state // ""' <<<"$st")" == requested ]]; then
@@ -83,30 +103,33 @@ cmd_clear_ready() {
     [[ "$(jq -r '.handshake.request_resume_hash // ""' <<<"$st")" != "$h" ]] ||
       die "not clear-ready" "the RESUME block is unchanged since the lead's request: rewrite it with your current state, commit and push"
   fi
-  goal="$(section_text "$block" Goal)"
+  goal="$(trim "$(section_text "$block" Goal)")"
+  # The turns begun so far, this one included: one more later means the lane worked on after reporting ready.
+  tp="$(jq -r '.transcript // ""' <<<"$st")"
+  turns="$(turn_starts "$tp")" || turns=""
   mutex_take 5 || die "registry locked" "retry in a moment"
   # Ownership is decided under the mutex: a session that took the lane meanwhile is not marked ready for the old one.
   [[ "$(reg_read "$lane" | jq -r .session_id 2>/dev/null)" == "$(jq -r .session_id <<<"$e")" ]] ||
     die "not clear-ready" "lane $lane started a new session while clear-ready ran: run it again"
   state_update "$lane" '.handshake = {state: "ready", ready_at: $now, requested_at: .handshake.requested_at,
-      session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: (.prompts // 0), goal: $goal, attempts: 0}' \
+      session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: (.prompts // 0), goal: $goal, attempts: 0,
+      transcript: $tp, turns: $turns}' \
     --argjson now "$(now)" --arg sid "$(jq -r .session_id <<<"$e")" --arg wt "$wt" --arg head "$(git -C "$wt" rev-parse HEAD)" \
-    --arg h "$h" --arg goal "$goal"
+    --arg h "$h" --arg goal "$goal" --arg tp "$tp" --arg turns "$turns"
   reg_update "$lane" '.clear_ready = true'
   mutex_drop
   echo "clear-ready: $lane at $(git -C "$wt" rev-parse --short HEAD). Tell the lead \"clear-ready\", then stop and wait."
 }
 
-# ---- screen (a second, vetoing check; idle itself comes from the hook flag) ---------------------------------------
+# ---- screen: the one fact with no native signal, a human's draft in the input line -------------------------------
 
-# screen_read <pane>: sets COMPOSER (the typed text, all its wrapped lines; empty for the placeholder), COMPOSER_FOUND,
-# VETO and GOAL_ACTIVE. The layout is Claude Code 2.1.309's, as captured in tests/lanes/captures: spinner, notice row
-# (where `◎ /goal active` sits, right-aligned), top rule, `❯`+NBSP input lines, bottom rule, status and mode lines.
-# Transcript text can quote anything, so only those zones count; every pattern also holds under LC_ALL=C.
+# screen_read <pane>: sets COMPOSER (the typed text, all its wrapped lines; empty for the placeholder) and
+# COMPOSER_FOUND (0 when no `❯`+NBSP input line is on screen, as under a dialog or another program). The layout is
+# Claude Code 2.1.309's (tests/lanes/captures); the last input line counts, and the pattern holds under LC_ALL=C.
 screen_read() {
-  local pane="$1" raw plain i top line idx=-1 body bottom
-  COMPOSER="" COMPOSER_FOUND=0 VETO="" GOAL_ACTIVE=0
-  raw="$(tm capture-pane -p -e -t "$pane" 2>/dev/null)" || { VETO="cannot read pane $pane"; return; }
+  local pane="$1" raw plain i line idx=-1 body bottom
+  COMPOSER="" COMPOSER_FOUND=0
+  raw="$(tm capture-pane -p -e -t "$pane" 2>/dev/null)" || return 0
   # shellcheck disable=SC2001 # a regex over many lines; parameter expansion has no portable regex form
   plain="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$raw")"
   local -a lines rawlines
@@ -115,156 +138,194 @@ screen_read() {
   for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
     if [[ "${lines[i]}" == "$PROMPT_MARK"* ]]; then idx=$i; break; fi
   done
-  if ((idx < 0)); then
-    VETO="no input prompt on screen (a dialog or another program may be showing)"
-    return
-  fi
+  ((idx >= 0)) || return 0
   COMPOSER_FOUND=1
   body="${rawlines[idx]#*"$PROMPT_MARK"}"
-  if [[ "$body" != $'\e[2m'* ]]; then
-    # The input wraps onto lines indented two spaces, down to the bottom rule; they join with one space.
-    COMPOSER="$(sed $'s/\x1b\\[[0-9;]*m//g; s/[[:space:]]*$//' <<<"$body")"
-    for ((bottom = idx + 1; bottom < ${#lines[@]}; bottom++)); do
-      [[ "${lines[bottom]}" == "─"* ]] && break
-      line="${lines[bottom]#  }"
-      COMPOSER+=" ${line%"${line##*[![:space:]]}"}"
-    done
-  fi
-  top=$idx
-  for ((i = idx - 1; i >= 0 && i >= idx - 3; i--)); do
-    if [[ "${lines[i]}" == "─"* ]]; then top=$i; break; fi
+  [[ "$body" != $'\e[2m'* ]] || return 0
+  # The input wraps onto lines indented two spaces, down to the bottom rule; they join with one space.
+  COMPOSER="$(sed $'s/\x1b\\[[0-9;]*m//g; s/[[:space:]]*$//' <<<"$body")"
+  for ((bottom = idx + 1; bottom < ${#lines[@]}; bottom++)); do
+    [[ "${lines[bottom]}" == "─"* ]] && break
+    line="${lines[bottom]#  }"
+    COMPOSER+=" ${line%"${line##*[![:space:]]}"}"
   done
-  ((top > 0)) && [[ "${lines[top - 1]}" == *"◎ /goal active"* ]] && GOAL_ACTIVE=1
-  for ((i = (top >= 3 ? top - 3 : 0); i < ${#lines[@]}; i++)); do
-    line="${lines[i]}"
-    case "$line" in
-      *"queued messages"* | *"Press up to edit queued"*) VETO="queued messages on screen"; return ;;
-      *[Rr]"unning stop hook"* | *"running Stop hook"*) VETO="a Stop hook is running"; return ;;
-    esac
-    if ((i < top)); then
-      [[ "$line" =~ ^[^[:alnum:][:space:]]+\ [[:alpha:]-]+… ]] && { VETO="a working spinner is on screen"; return; }
-      continue
-    fi
-    case "$line" in *"Enter to confirm"* | *"Esc to cancel"* | *"Do you want to"*) VETO="a dialog is open"; return ;; esac
-  done
-  return 0
 }
 
-# screen_clear_to_send <pane> <allow goal 0|1>: refuse on a screen veto, on an active goal unless allowed, and on text
-# in the input line, which may be a human's draft.
-screen_clear_to_send() {
+squash() { printf '%s' "${1//[[:space:]]/}"; }
+# trim <text>: without leading and trailing whitespace; a goal is trimmed where it enters, so the text typed and the
+# text the prompt hook confirms are the same string.
+trim() { local s="${1#"${1%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+# composer_problem <pane> [input]: why the input line does not hold exactly <input> (default: nothing), or nothing.
+# An unreadable line is a refusal: lanes never types where it cannot see that no human draft is there.
+composer_problem() {
   screen_read "$1"
-  [[ -z "$VETO" ]] || die "$REFUSAL: $VETO" "wait for the lane's turn to end, then run the command again"
-  ((GOAL_ACTIVE == 0 || ${2:-0} == 1)) || die "$REFUSAL: a /goal is still active in $1" "look at the pane; nothing was typed"
-  [[ -z "$COMPOSER" ]] || die "$REFUSAL: the input line of $1 holds text ('${COMPOSER:0:40}')" "a human may be typing; it is never overwritten"
+  if ((!COMPOSER_FOUND)); then
+    echo "the input line of $1 cannot be read (no input prompt on screen: a dialog or another program may be showing)"
+  elif (($# >= 2)); then
+    [[ "$(squash "$COMPOSER")" == "$(squash "$2")" ]] ||
+      echo "the input line changed after it was checked (it now shows '${COMPOSER:0:60}')"
+  elif [[ -n "$COMPOSER" ]]; then
+    echo "the input line of $1 holds text ('${COMPOSER:0:40}'): a human may be typing, and a draft is never touched"
+  fi
 }
 
 # ---- typed sends -------------------------------------------------------------------------------------------------
 
-# send_text <pane> <text>: one line typed with send-keys -l in chunks of SEND_CHUNK characters (split by jq, so a
-# multibyte character is never cut under any locale), never a paste: Claude Code turns a burst of about 800
-# characters into "[Pasted text]", which does not dispatch a slash command (measured on 2.1.308).
-send_text() {
-  local pane="$1" chunk
-  [[ "$2" != *[[:cntrl:]]* ]] || die "refusing to type text with a newline or control character" "the goal must be one line"
-  while IFS= read -r chunk; do
-    tm send-keys -t "$pane" -l -- "$chunk"
-    sleep "$SEND_GAP"
-  done < <(printf '%s' "$2" | jq -Rrs --argjson n "$SEND_CHUNK" 'explode as $c | range(0; $c | length; $n) | $c[.:. + $n] | implode')
+# keys_check <lane> <pane> <session id>: sets WHY to why keys sent to the pane now would not reach that session of the
+# lane alone, or empty. In copy mode they go to tmux, with synchronize-panes to every pane of the window, and while
+# Claude Code is not the terminal's foreground program to whatever is; for those three HOLD_FIX names the human's
+# step, since the session is still proven and its clear-ready still holds (empty for any other objection).
+keys_check() {
+  HOLD_FIX=""
+  case "$(tm display -p -t "$2" '#{pane_in_mode} #{pane_synchronized}' 2>/dev/null)" in
+    "0 0") ;;
+    "1 "*)
+      WHY="pane $2 is in copy mode: leave it (q) first, or keys would go to tmux"
+      HOLD_FIX="leave copy mode in pane $2 (press q there)"
+      return 0
+      ;;
+    *" 1")
+      WHY="pane $2 has synchronize-panes on, so keys would reach every pane of its window: turn it off"
+      HOLD_FIX="turn synchronize-panes off for the window of pane $2"
+      return 0
+      ;;
+    *) WHY="the mode of pane $2 cannot be read"; return 0 ;;
+  esac
+  why_of identity_problem "$1" "$2" "$3"
+  [[ -z "$WHY" ]] || return 0
+  why_of foreground_problem "$1" "$2"
+  [[ -z "$WHY" ]] || check_failed ||
+    HOLD_FIX="bring Claude Code back to the foreground of pane $2 (fg in the shell it was started from)"
 }
 
-# erase_typed <pane> <text>: delete text this command typed and did not submit, in small key bursts.
-erase_typed() {
-  local n i keys=()
-  n="$(char_count "$2")"
-  for ((i = 0; i < n; i++)); do
-    keys+=(BSpace)
-    if ((${#keys[@]} == 64 || i == n - 1)); then tm send-keys -t "$1" "${keys[@]}"; keys=(); sleep "$SEND_GAP"; fi
-  done
+# foreground_problem <lane> <pane>: why the lane's Claude Code would not read keys typed into the pane now, or nothing.
+# Keys reach the terminal's foreground process group, so a stopped Claude Code (Ctrl-Z) or one a tool started in its
+# own group does not read them. pgid, tpgid and stat are ps keywords in procps and in BSD and macOS ps(1), given one
+# -o each, since BSD ps reads the text after a keyword's "=" as its header, commas included.
+foreground_problem() {
+  local pid pg="" tpg="" stat=""
+  pid="$(reg_read "$1" | jq -r '.claude_pid // "" | tostring')" || return 1
+  read -r pg tpg stat _ <<<"$(ps -o pgid= -o tpgid= -o stat= -p "$pid" 2>/dev/null)" || true
+  [[ -n "$pg" && "$pg" == "$tpg" && "$stat" != [Tt]* ]] ||
+    echo "Claude Code pid $pid of lane $1 is not the foreground program of pane $2 (stopped, or started from a shell or tool in the pane; ps says pgid '$pg', terminal group '$tpg', state '$stat')"
 }
 
-# activity_sig <lane>: what must not move between the last check and Enter.
-activity_sig() { state_read "$1" | jq -c '[.session_id, (.prompts // 0), (.stops // 0), (.busy // false), (.background // 0)]'; }
-
-# activity_moved <lane> <signature>: why the lane is no longer where the signature found it, or nothing.
-activity_moved() {
-  jq -rn --argjson a "$2" --argjson b "$(activity_sig "$1")" --arg act "$(lane_activity "$(state_read "$1")")" '
-    if $a[0] != $b[0] then "the session changed"
-    elif $a[1] != $b[1] then "the lane received a new prompt"
-    elif $a[2] != $b[2] then "a turn ended (a /goal may have started another)"
-    elif $act == "busy" or $act == "background" then "the lane is \($act)"
-    else empty end'
+# moved_problem <lane>: why the lane's session state is no longer the one proven idle (GUARD_SIG), or nothing.
+moved_problem() {
+  if ! lane_session "$1"; then
+    echo "$SS_PROBLEM"
+  elif [[ "$SS_SIG" != "$GUARD_SIG" ]]; then
+    # GUARD_SIG was taken from an idle observation, so an equal one is still that idle state.
+    echo "the lane's state moved after the idle check (now $SS_STATUS since ${SS_AGE_MS} ms)"
+  fi
 }
 
-# send_guard <lane> <pane> [input]: why nothing may be typed or submitted now, or nothing. The caller sets GUARD_SID
-# (the session the pane must still belong to), GUARD_SIG (the activity snapshot) and GUARD_READY (1: the clear-ready
-# proof must still hold); before an Enter, <input> is the text the input line must hold exactly, so a human's added
-# keys are never submitted.
+# send_guard <lane> <pane> [input]: sets WHY to why no key may be sent now, or empty; it runs before typing and before
+# every Enter, and leaves keys_check's HOLD_FIX. The caller sets GUARD_SID (the session the pane must still hold),
+# GUARD_SIG (SS_SIG at the proven idle point) and GUARD_READY (1: the clear-ready proof must still hold); <input> is
+# what the input line must hold.
 GUARD_SID="" GUARD_SIG="" GUARD_READY=0
 send_guard() {
-  local why
-  why="$(pane_owner_problem "$1" "$2" "$GUARD_SID")"
-  if [[ -z "$why" ]] && ((GUARD_READY)); then
-    why="$(changed_since_ready "$1" "$(reg_read "$1")" "$(state_read "$1")")"
-    [[ -z "$why" ]] || why="$why since clear-ready"
-  fi
-  [[ -n "$why" ]] || why="$(activity_moved "$1" "$GUARD_SIG")"
-  if [[ -z "$why" ]]; then
-    screen_read "$2"
-    why="$VETO"
-    if [[ -z "$why" && $# -ge 3 && "$(squash "$COMPOSER")" != "$(squash "$3")" ]]; then
-      why="the input line changed after it was checked (it now shows '${COMPOSER:0:60}')"
+  keys_check "$1" "$2" "$GUARD_SID"
+  if [[ -z "$WHY" ]] && ((GUARD_READY)); then why_of changed_since_ready "$1" "$(reg_read "$1")" "$(state_read "$1")"; fi
+  [[ -n "$WHY" ]] || why_of moved_problem "$1"
+  [[ -n "$WHY" ]] || why_of composer_problem "$2" "${@:3}"
+}
+
+# send_text <lane> <pane> <text>: one line typed with send-keys -l in chunks of SEND_CHUNK characters (split by jq, so
+# a multibyte character is never cut under any locale), never a paste: Claude Code turns a burst of about 800
+# characters into "[Pasted text]", which does not dispatch a slash command (measured on 2.1.308). Before each chunk
+# after the first, keys_check and moved_problem run again; an objection returns 2 with MOVED, MOVED_FIX and TYPED set.
+send_text() {
+  local chunk
+  TYPED=""
+  [[ "$3" != *[[:cntrl:]]* ]] || die "refusing to type text with a newline or control character" "the goal must be one line"
+  while IFS= read -r chunk; do
+    if [[ -n "$TYPED" ]]; then
+      keys_check "$1" "$2" "$GUARD_SID"
+      [[ -n "$WHY" ]] || why_of moved_problem "$1"
+      MOVED="$WHY" MOVED_FIX="$HOLD_FIX"
+      [[ -z "$MOVED" ]] || return 2
     fi
-  fi
-  printf '%s' "$why"
+    tm send-keys -t "$2" -l -- "$chunk"
+    TYPED+="$chunk"
+    sleep "$SEND_GAP"
+  done < <(printf '%s' "$3" | jq -Rrs --argjson n "$SEND_CHUNK" 'explode as $c | range(0; $c | length; $n) | $c[.:. + $n] | implode')
 }
 
-# erase_if_ours <pane> <text>: delete our typed text only while the input line holds exactly it; text someone added
-# is never deleted, so the line is then left as it is.
+# erase_if_ours <lane> <pane> <text>: delete our typed text only while the input line holds exactly it, in bursts of
+# Backspace, each sent only while keys_check passes. A Backspace count is exact only for a line that is all ours, so
+# text someone added is never deleted. Sets ERASED to what happened, for the message.
 erase_if_ours() {
-  screen_read "$1"
-  [[ "$(squash "$COMPOSER")" == "$(squash "$2")" ]] && erase_typed "$1" "$2"
-  return 0
+  local n i keys=()
+  screen_read "$2"
+  if [[ "$(squash "$COMPOSER")" != "$(squash "$3")" ]]; then
+    ERASED="the input line did not hold only our text, so it was left as it is (it shows '${COMPOSER:0:60}')"
+    return 0
+  fi
+  n="$(char_count "$3")"
+  for ((i = 0; i < n; i++)); do
+    keys+=(BSpace)
+    if ((${#keys[@]} == 64 || i == n - 1)); then
+      keys_check "$1" "$2" "$GUARD_SID"
+      [[ -z "$WHY" ]] || { ERASED="our typed text was left in the input line of $2, because $WHY"; return 0; }
+      tm send-keys -t "$2" "${keys[@]}"
+      keys=()
+      sleep "$SEND_GAP"
+    fi
+  done
+  ERASED="our typed text was deleted"
 }
-
-squash() { printf '%s' "${1//[[:space:]]/}"; }
 
 # submit <lane> <pane> <text> <confirm cmd...>: type the line and prove it arrived, then press Enter and confirm the
-# effect; a lost Enter (text still in the input line) gets one more press, then 1. send_guard runs before typing and
-# before every Enter; when it objects, 2 is returned with MOVED set, and our typed text is deleted if it is still alone.
+# effect; a lost Enter (text still in the input line) gets one more press, then 1. A guard objection returns 2 before
+# the first Enter and 3 after it (the text may have been taken late), with MOVED, MOVED_FIX (keys_check's HOLD_FIX)
+# and ERASED set.
 submit() {
+  local rc=0
+  # A kill (the Bash tool's timeout) deletes our text if the input line still holds it alone, and says so.
+  SUBMIT_ARGS=("$1" "$2" "$3")
+  trap 'erase_if_ours "${SUBMIT_ARGS[@]}"; echo "lanes: stopped while typing into ${SUBMIT_ARGS[1]}: $ERASED" >&2; exit 143' TERM INT
+  submit_keys "$@" || rc=$?
+  trap 'exit 143' TERM INT # bin/lanes' own handler again
+  return "$rc"
+}
+
+submit_keys() {
   local lane="$1" pane="$2" text="$3"
   shift 3
-  MOVED="$(send_guard "$lane" "$pane")"
+  ERASED="nothing was typed" MOVED_FIX=""
+  send_guard "$lane" "$pane"
+  MOVED="$WHY" MOVED_FIX="$HOLD_FIX"
   [[ -z "$MOVED" ]] || return 2
-  screen_read "$pane"
-  ((COMPOSER_FOUND)) && [[ -z "$COMPOSER" ]] ||
-    die "$REFUSAL: the input line of $pane is not empty just before typing ('${COMPOSER:0:40}')" "nothing was typed; a human may be typing, and a draft is never touched"
-  send_text "$pane" "$text"
+  if ! send_text "$lane" "$pane" "$text"; then
+    erase_if_ours "$lane" "$pane" "$TYPED"
+    return 2
+  fi
   sleep 0.3
   screen_read "$pane"
   # The composer is compared whole and without spaces, since Claude Code wraps a long line at any space.
   if [[ "$(squash "$COMPOSER")" != "$(squash "$text")" ]]; then
-    # Text that arrived ahead of ours is someone's draft: delete only the characters we typed, which end the line.
-    if [[ "$(squash "$COMPOSER")" == *"$(squash "$text")" ]]; then
-      erase_typed "$pane" "$text"
-      die "$REFUSAL: text arrived in the input line of $pane ahead of ours" "our typed text was deleted and the rest left as it is; nothing was submitted"
-    fi
+    [[ "$(squash "$COMPOSER")" != *"$(squash "$text")" ]] ||
+      die "$REFUSAL: text arrived in the input line of $pane ahead of ours" "nothing was submitted or deleted: the line holds that text with ours after it; look at the pane"
     die "typed text did not arrive intact (input line shows '${COMPOSER:0:60}')" "look at pane $pane; nothing was submitted and the input line was left as it is"
   fi
-  MOVED="$(send_guard "$lane" "$pane" "$text")"
+  send_guard "$lane" "$pane" "$text"
+  MOVED="$WHY" MOVED_FIX="$HOLD_FIX"
   if [[ -n "$MOVED" ]]; then
-    erase_if_ours "$pane" "$text"
+    erase_if_ours "$lane" "$pane" "$text"
     return 2
   fi
   tm send-keys -t "$pane" Enter
   "$@" && return 0
   screen_read "$pane"
   if [[ "$(squash "$COMPOSER")" == "$(squash "$text")" ]]; then
-    MOVED="$(send_guard "$lane" "$pane" "$text")"
+    send_guard "$lane" "$pane" "$text"
+    MOVED="$WHY"
     if [[ -n "$MOVED" ]]; then
-      erase_if_ours "$pane" "$text"
-      return 2
+      erase_if_ours "$lane" "$pane" "$text"
+      return 3
     fi
     echo "lanes: Enter was not taken for '${text:0:20}'; pressing it once more" >&2
     tm send-keys -t "$pane" Enter
@@ -275,39 +336,62 @@ submit() {
 
 # ---- waits -------------------------------------------------------------------------------------------------------
 
-# wait_idle <lane> <seconds>: lane_activity says the turn is over (idle, interrupted or busy-expired) and no background
-# task is running.
-wait_idle() {
-  local lane="$1" deadline n
-  deadline=$(($(now) + $2))
-  while :; do
-    n="$(now)"
-    case "$(lane_activity "$(state_read "$lane")")" in
-      busy) ((n < deadline)) || die "$REFUSAL: lane $lane stayed busy for $2 s" "wait for its turn to end; if it never does, look at the pane" ;;
-      background) ((n < deadline)) || die "$REFUSAL: lane $lane has background tasks running" "ask the lane to stop them; a background shell outlives /clear" ;;
-      *) return 0 ;;
-    esac
-    sleep 0.5
-  done
-}
-
-# settle <lane> <pane> <seconds> <allow goal 0|1>: idle by the hook flag, a screen with no veto, the same activity
-# after LANES_IDLE_GAP, then the final screen check. Leaves GOAL_ACTIVE from that check.
+# settle <lane> <pane> <seconds> [shell]: wait until the sessions file says idle (or shell, when passed) for
+# LANES_IDLE_GAP, keep that observation's SS_SIG in IDLE_SIG, then check that no draft is in the input line. Busy,
+# waiting or a background shell after <seconds> is refused, and an unreadable session file read twice in a row at once.
+IDLE_SIG=""
 settle() {
-  local lane="$1" pane="$2" before after
-  wait_idle "$lane" "$3"
-  screen_clear_to_send "$pane" "$4"
-  before="$(activity_sig "$lane")"
-  sleep "$IDLE_GAP"
-  after="$(activity_sig "$lane")"
-  [[ "$before" == "$after" ]] || die "$REFUSAL: lane $lane became busy during the idle re-check" "run the command again when it is idle"
-  screen_clear_to_send "$pane" "$4"
+  local lane="$1" pane="$2" deadline unknown=0
+  deadline=$(($(now) + $3))
+  while :; do
+    lane_activity "$lane"
+    case "$ACT" in
+      idle) IDLE_SIG="$SS_SIG"; break ;;
+      shell)
+        if [[ "${4:-}" == shell ]]; then
+          if ((SS_AGE_MS >= IDLE_GAP_MS)); then IDLE_SIG="$SS_SIG"; break; fi
+          ACT=settling
+        fi
+        ;;
+      unknown)
+        # One unreadable read may be a write caught midway, so the file is read once more after a pause.
+        ((!unknown)) || die "$REFUSAL: $ACT_DETAIL" "check 'lanes status'; nothing was typed"
+        unknown=1
+        sleep 0.1
+        continue
+        ;;
+    esac
+    unknown=0
+    if (($(now) >= deadline)); then
+      case "$ACT" in
+        waiting) die "$REFUSAL: lane $lane is waiting for its human ($ACT_DETAIL)" "look at the pane; a human answers it" ;;
+        shell) die "$REFUSAL: lane $lane has a background shell running" "ask the lane to stop it; a background shell outlives /clear" ;;
+        settling) die "$REFUSAL: lane $lane did not stay idle for $IDLE_GAP s within $3 s" "run the command again when the lane is quiet" ;;
+        *) die "$REFUSAL: lane $lane stayed busy for $3 s" "wait for its turn to end; if it never does, look at the pane" ;;
+      esac
+    fi
+    sleep 0.2
+  done
+  why_of composer_problem "$pane"
+  [[ -z "$WHY" ]] || die "$REFUSAL: $WHY" "nothing was typed"
 }
 
-wait_new_session() { # wait_new_session <lane> <old session id>
+# wait_new_session <lane> <old session id>: the sessions file and the registry (SessionStart(clear)) agree on a new one.
+wait_new_session() {
   local i
   for ((i = 0; i < CLEAR_TIMEOUT * 5; i++)); do
-    [[ "$(reg_read "$1" | jq -r .session_id 2>/dev/null)" != "$2" ]] && return 0
+    [[ "$(reg_read "$1" | jq -r .session_id 2>/dev/null)" != "$2" ]] && lane_session "$1" && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+# wait_composer_empty <pane>: the session /clear created has drawn its empty input line (the screen can lag the file).
+wait_composer_empty() {
+  local i
+  for ((i = 0; i < CLEAR_TIMEOUT * 5; i++)); do
+    why_of composer_problem "$1"
+    [[ -z "$WHY" ]] && return 0
     sleep 0.2
   done
   return 1
@@ -320,26 +404,6 @@ wait_goal_seen() {
   for ((i = 0; i < CLEAR_TIMEOUT * 5; i++)); do
     state_read "$1" | jq -e --arg s "$2" --arg g "/goal $3" --argjson p "$4" \
       '.session_id == $s and .last_command == $g[0:200] and (.prompts // 0) > $p' >/dev/null && return 0
-    sleep 0.2
-  done
-  return 1
-}
-
-wait_goal_footer_gone() { # wait_goal_footer_gone <pane>: the input line is back, empty, with no /goal footer
-  local i
-  for ((i = 0; i < CLEAR_TIMEOUT * 5; i++)); do
-    screen_read "$1"
-    ((COMPOSER_FOUND && !GOAL_ACTIVE)) && [[ -z "$COMPOSER" ]] && return 0
-    sleep 0.2
-  done
-  return 1
-}
-
-wait_composer_empty() { # the new session has drawn an empty input line
-  local i
-  for ((i = 0; i < CLEAR_TIMEOUT * 5; i++)); do
-    screen_read "$1"
-    ((COMPOSER_FOUND)) && [[ -z "$COMPOSER" && -z "$VETO" ]] && return 0
     sleep 0.2
   done
   return 1
@@ -376,16 +440,31 @@ refuse_clear() { # refuse_clear <lane> <reason> <what to do>: drops clear-ready 
   die "not cleared: $2" "$3"
 }
 
-# pane_owner_problem <lane> <pane> <session id>: why the pane no longer belongs to that session of the lane. A pane id
-# alone is not proof: after a tmux restart another claude can hold %0, so the tmux server pid and the pane's own pid
-# recorded at register must still match.
-pane_owner_problem() {
-  local e other
+# refuse_keys <lane> <reason> <hold fix> <what to do>: a key-path hold (keys_check's HOLD_FIX) leaves the lane
+# clear-ready, since its session and work are unchanged, and names the human's step; anything else is refuse_clear's.
+refuse_keys() {
+  [[ -n "$3" ]] || refuse_clear "$1" "$2" "$4"
+  hs_set "$1" '.state = "ready"'
+  die "not cleared: $2" "$3, then run 'lanes clear $1' again; the lane is still clear-ready"
+}
+
+# identity_problem <lane> <pane> <session id>: why the pane does not host that session of the lane, or nothing. All
+# must hold: the registry names the session and the pane, the session file is current (lane_session), the pane is on
+# the tmux server the lane registered from, Claude Code runs as the pane's process or under it, and no other lane
+# names the pane.
+identity_problem() {
+  local e f=() live=() other
   e="$(reg_read "$1")" || { echo "the registry entry for $1 is unreadable"; return; }
-  [[ "$(jq -r .session_id <<<"$e")" == "$3" ]] || { echo "the session of lane $1 changed"; return; }
-  [[ "$(jq -r '.tmux_pane // ""' <<<"$e")" == "$2" ]] || { echo "lane $1 no longer holds pane $2"; return; }
-  [[ "$(pane_identity "$2")" == "$(jq -r '"\(.tmux_pid) \(.pane_pid)"' <<<"$e")" ]] ||
-    { echo "pane $2 now runs another process than the one lane $1 registered from (tmux restarted, or the pane id was reused)"; return; }
+  jq_fields 4 '.session_id, (.tmux_pane // ""), (.tmux_pid // "" | tostring), (.claude_pid // "" | tostring)' "$e" || return 1
+  f=("${FIELDS[@]}")
+  [[ "${f[0]}" == "$3" ]] || { echo "the session of lane $1 changed"; return; }
+  [[ "${f[1]}" == "$2" ]] || { echo "lane $1 no longer holds pane $2"; return; }
+  lane_session "$1" || { echo "$SS_PROBLEM"; return; }
+  read -r -a live <<<"$(pane_identity "$2")"
+  [[ "${live[0]:-}" == "${f[2]}" ]] ||
+    { echo "pane $2 is on another tmux server than the one lane $1 registered from (tmux restarted, or the pane id was reused)"; return; }
+  pid_within "${f[3]}" "${live[1]:-}" ||
+    { echo "Claude Code pid ${f[3]} of lane $1 is not the process of pane $2 or a child of it"; return; }
   while IFS= read -r other; do
     [[ "$other" != "$1" && "$(reg_read "$other" | jq -r '.tmux_pane // ""' 2>/dev/null)" == "$2" ]] &&
       { echo "pane $2 is also registered to lane $other"; return; }
@@ -393,71 +472,71 @@ pane_owner_problem() {
   return 0
 }
 
-# target_checks <lane> <entry>: the registered pane exists, runs Claude, is not this pane or in copy mode, and belongs
-# to this lane's session alone. Sets PANE_T.
+# target_checks <lane> <entry>: the registered pane exists, is not this pane, and keys sent to it reach this lane's
+# session alone (keys_check). Sets PANE_T.
 target_checks() {
-  local lane="$1" e="$2" why
+  local lane="$1" e="$2"
   PANE_T="$(jq -r '.tmux_pane // ""' <<<"$e")"
   [[ -n "$PANE_T" ]] || die "lane $lane has no tmux pane registered" "start it inside tmux as 'claude --name $lane'"
   [[ "$PANE_T" != "${TMUX_PANE:-}" ]] || die "lane $lane is this pane" "a session never clears itself or types into its own pane; the human clears the lead"
   pane_exists "$PANE_T" || die "pane $PANE_T of lane $lane does not exist" "the lane is gone; restart it as 'claude --name $lane'"
-  [[ "$(pane_command "$PANE_T")" == "$CLAUDE_COMMAND" ]] || die "pane $PANE_T is running '$(pane_command "$PANE_T")', not $CLAUDE_COMMAND" "never type into another program; check the pane"
-  [[ "$(tm display -p -t "$PANE_T" '#{pane_in_mode}')" == 0 ]] || die "pane $PANE_T is in copy mode" "leave copy mode (q) first; keys would go to tmux"
-  why="$(pane_owner_problem "$lane" "$PANE_T" "$(jq -r .session_id <<<"$e")")"
-  [[ -z "$why" ]] || die "$REFUSAL: $why" "check 'lanes status'; a pane belongs to the lane that registered last in it"
+  keys_check "$lane" "$PANE_T" "$(jq -r .session_id <<<"$e")"
+  [[ -z "$WHY" ]] || die "$REFUSAL: $WHY" "check 'lanes status'; never type into a pane whose session is not proven"
 }
 
-# changed_since_ready <lane> <entry> <state>: what changed since clear-ready (session, head, tree, RESUME, prompts).
+# changed_since_ready <lane> <entry> <state>: what changed since clear-ready (session, head, tree, RESUME, prompts, a
+# turn begun without a prompt), each reason ending "since clear-ready", or nothing.
 changed_since_ready() {
-  local e="$2" st="$3" wt block prob
+  local e="$2" st="$3" wt block tp n
   wt="$(jq -r '.handshake.worktree // ""' <<<"$st")"
-  [[ "$(jq -r .session_id <<<"$e")" == "$(jq -r .handshake.session_id <<<"$st")" ]] || { echo "the session changed"; return; }
-  [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(jq -r .handshake.head <<<"$st")" ]] || { echo "HEAD moved"; return; }
-  prob="$(git_problem "$wt")"
-  [[ -n "$prob" ]] || prob="$(journal_problem "$wt")"
-  [[ -z "$prob" ]] || { echo "the tree stopped being clean and pushed ($prob)"; return; }
+  [[ "$(jq -r .session_id <<<"$e")" == "$(jq -r .handshake.session_id <<<"$st")" ]] || { echo "the session changed since clear-ready"; return; }
+  [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(jq -r .handshake.head <<<"$st")" ]] || { echo "HEAD moved since clear-ready"; return; }
+  why_of tree_problem "$wt"
+  [[ -z "$WHY" ]] || { echo "the tree stopped being clean and pushed ($WHY) since clear-ready"; return; }
   block="$(resume_block "$(resume_path "$1" "$wt")" || true)"
-  [[ "$(hash_of "$block")" == "$(jq -r .handshake.resume_hash <<<"$st")" ]] || { echo "the RESUME block changed"; return; }
-  [[ "$(jq -r '.prompts // 0' <<<"$st")" == "$(jq -r '.handshake.prompts // 0' <<<"$st")" ]] || echo "the lane received a new prompt"
+  [[ "$(hash_of "$block")" == "$(jq -r .handshake.resume_hash <<<"$st")" ]] || { echo "the RESUME block changed since clear-ready"; return; }
+  [[ "$(jq -r '.prompts // 0' <<<"$st")" == "$(jq -r '.handshake.prompts // 0' <<<"$st")" ]] ||
+    { echo "the lane received a new prompt since clear-ready"; return; }
+  # A turn can begin with no prompt (a /goal loop going on, a finished background shell), so the transcript is read.
+  tp="$(jq -r '.handshake.transcript // ""' <<<"$st")"
+  n=""
+  if [[ "$(jq -r '.handshake.turns // ""' <<<"$st")" =~ ^[0-9]+$ ]]; then n="$(turn_starts "$tp")" || n=""; fi
+  [[ -n "$n" ]] ||
+    { echo "the lane's transcript '$tp' could not be read, so a turn begun since clear-ready cannot be ruled out"; return; }
+  [[ "$n" == "$(jq -r .handshake.turns <<<"$st")" ]] ||
+    echo "the lane began another turn since clear-ready (its /goal went on, a background shell finished, or a message arrived)"
 }
 
-# final_verify <lane> <pane>: after every wait and the final screen check, prove again everything clear-ready proved,
-# that the pane is still this session's, and that the hook flag is idle; only then may Escape be sent.
+# final_verify <lane> <pane>: after the wait, prove again everything clear-ready proved and that the pane still hosts
+# this session; a failure drops clear-ready, except a key-path hold (refuse_keys). Activity is send_guard's, before
+# each key.
 final_verify() {
-  local lane="$1" pane="$2" e st why act
+  local lane="$1" pane="$2" e st
   e="$(reg_read "$lane")" || refuse_clear "$lane" "the registry entry became unreadable" "check 'lanes status'"
   st="$(state_read "$lane")"
-  why="$(changed_since_ready "$lane" "$e" "$st")"
-  [[ -z "$why" ]] || refuse_clear "$lane" "$why since clear-ready" "ask the lane to finish, push and report clear-ready again"
-  why="$(pane_owner_problem "$lane" "$pane" "$(jq -r .handshake.session_id <<<"$st")")"
-  [[ -z "$why" ]] || refuse_clear "$lane" "$why" "check 'lanes status'; a pane belongs to the lane that registered last in it"
-  act="$(lane_activity "$st")"
-  case "$act" in busy | background) die "not cleared: lane $lane is $act at the moment of sending" "run lanes clear again when it is idle" ;; esac
+  why_of changed_since_ready "$lane" "$e" "$st"
+  [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "ask the lane to finish, push and report clear-ready again"
+  keys_check "$lane" "$pane" "$(jq -r .handshake.session_id <<<"$st")"
+  [[ -z "$WHY" ]] || refuse_keys "$lane" "$WHY" "$HOLD_FIX" "check 'lanes status'; a pane belongs to the lane that registered last in it"
 }
 
-# clear_goal <lane> <pane>: an active /goal re-prompts the lane after each turn and the model cannot clear it, while
-# /clear removes it anyway (code.claude.com/docs/en/goal). So lanes types /goal clear at the proven idle point and
-# takes the footer going away as the confirmation, before the final checks.
-clear_goal() { # clear_goal <lane> <pane> <session id>
-  local rc=0
-  GUARD_SID="$3" GUARD_SIG="$(activity_sig "$1")" GUARD_READY=1
-  submit "$1" "$2" "/goal clear" wait_goal_footer_gone "$2" || rc=$?
-  ((rc != 2)) || die "not cleared: $MOVED before /goal clear was sent" "nothing was submitted and no typed text was left; run lanes clear again when the lane is idle"
-  ((rc == 0)) || die "not cleared: /goal clear was typed into $2 but the /goal footer stayed" "look at the pane; /clear was not sent"
-  GOAL_CLEARED=1
+# idle_point <lane> <pane> <seconds> <session id> <ready 0|1> [shell]: settle, then arm send_guard with the
+# signature of the observation that proved the lane idle, so any change after it stops the next key.
+idle_point() {
+  settle "$1" "$2" "$3" "${6:-}"
+  GUARD_SID="$4" GUARD_READY="$5" GUARD_SIG="$IDLE_SIG"
 }
 
 # send_goal <lane> <pane> <session id> <goal>: type /goal <goal> into the idle input line; the session's
-# UserPromptSubmit recording that goal confirms it. Returns submit's code (2 with MOVED set when the lane moved).
+# UserPromptSubmit recording that goal confirms it. Returns submit's code, with MOVED and ERASED set on 2 and 3.
 send_goal() {
   local base
   base="$(state_read "$1" | jq -r '.prompts // 0')"
-  GUARD_SID="$3" GUARD_SIG="$(activity_sig "$1")" GUARD_READY=0
   submit "$1" "$2" "/goal $4" wait_goal_seen "$1" "$3" "$4" "$base"
 }
 
 cmd_clear() {
-  local lane="${1:-}" wait_s=60 e st hs pane sid goal new_sid rc=0 age why
+  local lane="${1:-}" wait_s=60 e st hs pane sid goal new_sid rc=0 age
   valid_lane "$lane" || usage
   shift
   [[ "${1:-}" == "--wait" ]] && wait_s="${2:-60}"
@@ -501,27 +580,23 @@ cmd_clear() {
       die "the session the /clear created already has $(jq -r .prompts <<<"$st") prompt(s)" "the goal is not typed into a session in use; set it with 'lanes goal $lane \"<goal>\"'"
   fi
 
+  # /clear also removes an active /goal (code.claude.com/docs/en/goal; measured on 2.1.309), so none is cleared first.
+  # No Escape goes before it: an idle session with an empty input line needs none, and Escape interrupts a turn.
   if [[ "$hs" == ready ]]; then
-    why="$(changed_since_ready "$lane" "$e" "$st")"
-    [[ -z "$why" ]] || refuse_clear "$lane" "$why since clear-ready" "ask the lane to finish, push and report clear-ready again"
-    settle "$lane" "$pane" "$wait_s" 1
-    if ((GOAL_ACTIVE)); then
-      clear_goal "$lane" "$pane" "$sid"
-      settle "$lane" "$pane" "$wait_s" 0
-    fi
+    why_of changed_since_ready "$lane" "$e" "$st"
+    [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "ask the lane to finish, push and report clear-ready again"
+    idle_point "$lane" "$pane" "$wait_s" "$sid" 1
     final_verify "$lane" "$pane"
-    GUARD_SID="$sid" GUARD_SIG="$(activity_sig "$lane")" GUARD_READY=1
     hs_set "$lane" '.state = "sending" | .attempts = ((.attempts // 0) + 1) | .sent_at = $now' --argjson now "$(now)"
-    tm send-keys -t "$pane" Escape
-    sleep 0.3
+    rc=0
     submit "$lane" "$pane" "/clear" wait_new_session "$lane" "$sid" || rc=$?
-    ((rc != 2)) || refuse_clear "$lane" "$MOVED before /clear was sent" "nothing was submitted and no typed /clear was left; ask the lane to report clear-ready again"
+    ((rc != 2)) || refuse_keys "$lane" "$MOVED before /clear was sent" "${MOVED_FIX:+nothing was submitted ($ERASED); $MOVED_FIX}" "nothing was submitted ($ERASED); ask the lane to report clear-ready again"
+    # The record is left at sending: a rerun finds whether /clear landed late (a new session) or starts over.
+    ((rc != 3)) || die "/clear was sent to $pane once, then $MOVED" "it may have been taken late ($ERASED); run 'lanes status', then 'lanes clear $lane' again, which resumes from the record"
     if ((rc != 0)); then
       hs_set "$lane" '.state = "failed" | .failed = "clear not confirmed"'
-      die "/clear was sent to $pane but no new session registered" "look at the pane; the clear is not confirmed and was not retried further"
+      die "/clear was sent to $pane but no new session appeared in its sessions file and the registry" "look at the pane; the clear is not confirmed and was not retried further"
     fi
-    # shellcheck disable=SC2034 # die in bin/lanes reads it; /clear landed, so what remains is the goal
-    GOAL_CLEARED=0
   fi
 
   e="$(reg_read "$lane")" || die "registry entry for '$lane' unreadable after /clear" "check 'lanes status'"
@@ -530,10 +605,11 @@ cmd_clear() {
   goal="$(state_read "$lane" | jq -r '.handshake.goal // ""')"
   if [[ -n "$goal" ]]; then
     wait_composer_empty "$pane" || die "the cleared session in $pane shows no empty input line" "look at the pane; the goal was not sent"
-    settle "$lane" "$pane" "$wait_s" 1
+    idle_point "$lane" "$pane" "$wait_s" "$new_sid" 0
     rc=0
     send_goal "$lane" "$pane" "$new_sid" "$goal" || rc=$?
-    ((rc != 2)) || die "goal not sent: $MOVED before Enter" "the typed goal was deleted; run 'lanes clear $lane' again to send it"
+    ((rc != 2)) || die "goal not sent: $MOVED" "nothing was submitted ($ERASED); run 'lanes clear $lane' again to send it"
+    ((rc != 3)) || die "/goal was sent to $pane once, then $MOVED" "it may have been taken late ($ERASED); look at the pane and 'lanes status' before sending it again"
     if ((rc != 0)); then
       hs_set "$lane" '.state = "failed" | .failed = "goal not confirmed"'
       die "/goal was typed into $pane but the session never received it" "look at the pane and set the goal with 'lanes goal $lane'"
@@ -545,15 +621,17 @@ cmd_clear() {
 }
 
 # cmd_goal <lane> <text> [--wait s]: the lead sets or replaces a lane's /goal (a new /goal replaces an active one,
-# code.claude.com/docs/en/goal) through the same checks as lanes clear. The hook records it as the lane's goal.
+# code.claude.com/docs/en/goal) through the same checks as lanes clear; the prompt hook's last_command confirms it
+# arrived. A background shell does not stop it, since unlike /clear a new goal leaves the shell's session in place.
 cmd_goal() {
-  local lane="${1:-}" goal="${2:-}" wait_s=60 caller e prob rc=0
+  local lane="${1:-}" goal wait_s=60 caller e rc=0 sid
   if ! valid_lane "$lane" || (($# < 2)); then usage; fi
+  goal="$(trim "$2")"
   shift 2
   [[ "${1:-}" == "--wait" ]] && wait_s="${2:-60}"
   [[ "$wait_s" =~ ^[0-9]+$ ]] || die "--wait '$wait_s' is not a number of seconds" "pass a whole number" 2
-  prob="$(goal_problem "$goal")"
-  [[ -z "$prob" ]] || die "goal not sent: the goal $prob" "pass it as one line of at most $GOAL_CAP characters" 2
+  why_of goal_problem "$goal"
+  [[ -z "$WHY" ]] || die "goal not sent: the goal $WHY" "pass it as one line of at most $GOAL_CAP characters" 2
   int_in_range "$SEND_CHUNK" 1 512 ||
     die "LANES_SEND_CHUNK=$SEND_CHUNK is outside 1-512" "larger key bursts become a paste that does not dispatch /goal; unset it" 2
   caller="$(caller_lane)"
@@ -563,9 +641,11 @@ cmd_goal() {
   clear_lock "$lane"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "check 'lanes status'"
   target_checks "$lane" "$e"
-  settle "$lane" "$PANE_T" "$wait_s" 1
-  send_goal "$lane" "$PANE_T" "$(jq -r .session_id <<<"$e")" "$goal" || rc=$?
-  ((rc != 2)) || die "goal not sent: $MOVED before Enter" "the typed goal was deleted; run lanes goal again when the lane is idle"
+  sid="$(jq -r .session_id <<<"$e")"
+  idle_point "$lane" "$PANE_T" "$wait_s" "$sid" 0 shell
+  send_goal "$lane" "$PANE_T" "$sid" "$goal" || rc=$?
+  ((rc != 2)) || die "goal not sent: $MOVED" "nothing was submitted ($ERASED); run lanes goal again when the lane is idle"
+  ((rc != 3)) || die "/goal was sent to $PANE_T once, then $MOVED" "it may have been taken late ($ERASED); look at the pane before sending it again"
   ((rc == 0)) || die "/goal was typed into $PANE_T but the session never received it" "look at the pane"
   echo "goal set: $lane (pane $PANE_T)"
 }

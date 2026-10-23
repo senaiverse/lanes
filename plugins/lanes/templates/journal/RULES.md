@@ -16,15 +16,16 @@ not here. The lead and lane skills say how to follow these rules; this file says
    percentage is not "safe": ask the lane.
 6. **Clear handshake.** The lead runs `lanes request <lane>` and messages the lane. The lane finishes the change in
    hand, rewrites its RESUME block, commits and pushes, runs `lanes clear-ready` from its work tree, tells the lead
-   "clear-ready", and stops; a turn its `/goal` starts after that only waits, with no tool call. The lead then runs
-   `lanes clear <lane>`. A model cannot clear its own goal, so `lanes clear` types `/goal clear` itself, then `/clear`,
-   then the RESUME Goal, the one source of the goal after a clear: keep it equal to the goal you work toward.
+   "clear-ready", and stops; in a turn its `/goal` starts after that, it only runs `lanes clear-ready` again and
+   answers "clear-ready", since any later turn cancels the readiness. The lead then runs `lanes clear <lane>`.
+   `/clear` removes an active goal, so `lanes clear` types `/clear`, then the RESUME Goal, the one source of the goal
+   after a clear: keep it equal to the goal you work toward.
 7. **A refusal is an answer.** `lanes clear-ready` and `lanes clear` refuse unless the tree is clean, the head is
-   pushed, RESUME is valid and rewritten since the request, and the lane is idle and unchanged since clear-ready. Fix
-   the named cause; never retry blindly and never send `/clear` by hand around a refusal.
-8. **Idle comes from hooks.** Busy and idle come from the UserPromptSubmit and Stop hooks; screen text only vetoes.
-   A lane with background tasks is not idle. An active `/goal` starts turns with no UserPromptSubmit, so its
-   `◎ /goal active` footer means the flag cannot be trusted until the goal is cleared.
+   pushed, RESUME is valid and rewritten since the request, and the lane is idle, began no turn and is unchanged since
+   clear-ready. Fix the named cause; never retry blindly and never send `/clear` by hand around a refusal.
+8. **Idle comes from Claude Code.** Busy, idle, waiting and a running background shell come from the session's own
+   state file, never from screen text or a hook count; a lane is idle only once it stayed idle for a short gap. The
+   screen is read for one fact only: a human's draft in the input line, which is never typed over.
 9. **Done report.** A finished unit moves from `next-<lane>.md` to `done-<lane>.md` in the done-report form. The lead
    accepts it only after reading the full diff.
 10. **Asking the human.** Only the lead asks the human, through the ask tool: one question, its facts and costs, the

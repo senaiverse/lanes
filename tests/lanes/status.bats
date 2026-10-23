@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
-# Public seams: `lanes-statusline` (writes used_pct) and `lanes status` (reads it with the threshold, busy flag and
-# handshake). Context % has three states, never collapsed: a number, unknown and stale.
+# Public seams: `lanes-statusline` (writes used_pct), `lanes hook prompt`, and `lanes status` (context % with the
+# threshold, activity from the sessions file, goal from the transcript, handshake). Context % has three states, never
+# collapsed: a number, unknown and stale.
 
 load helper
 
@@ -143,40 +144,22 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
   assert_output --partial beta
 }
 
-@test "idle_from_hook_flag: prompt sets busy, stop clears it, and nothing is printed to the model" {
+@test "hook prompt counts the prompt, keeps a slash command's first 200 characters, and prints nothing to the model" {
   register_lane alpha s1 %7 >/dev/null
   run bash -c "jq -nc '{session_id:\"s1\",session_title:\"alpha\",prompt:\"hi\"}' | '$LANES' hook prompt"
   assert_success
   assert_output ""
-  run bash -c "'$LANES' status --json | jq -r '.[0].activity'"
-  assert_output busy
-  run bash -c "jq -nc '{session_id:\"s1\",background_tasks:[]}' | '$LANES' hook stop"
-  assert_output ""
-  run bash -c "'$LANES' status --json | jq -r '.[0].activity'"
-  assert_output idle
-}
-
-@test "busy_flag_expires_after_ttl: Stop does not fire on an interrupt, so an old busy flag ages out" {
-  register_lane alpha s1 %7 >/dev/null
-  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
-  jq '.busy_since -= 100' "$LANES_DATA_DIR/lanes/state/alpha.json" >"$LANES_TEST_TMP/s" && mv "$LANES_TEST_TMP/s" "$LANES_DATA_DIR/lanes/state/alpha.json"
-  LANES_BUSY_TTL=50 run bash -c "'$LANES' status --json | jq -r '.[0].activity'"
-  assert_output busy-expired
-}
-
-@test "a Stop with background tasks is not idle" {
-  register_lane alpha s1 %7 >/dev/null
-  jq -nc '{session_id:"s1",background_tasks:[{"id":"b1"}]}' | "$LANES" hook stop
-  run bash -c "'$LANES' status --json | jq -r '.[0].activity'"
-  assert_output background
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"/goal ship it"}' | "$LANES" hook prompt
+  run state alpha '[.prompts, .last_command, has("busy"), has("goal")] | @json'
+  assert_output '[2,"/goal ship it",false,false]'
 }
 
 @test "a hook from an unregistered session changes nothing and exits 0" {
   register_lane alpha s1 %7 >/dev/null
   run bash -c "jq -nc '{session_id:\"other\",prompt:\"hi\"}' | '$LANES' hook prompt"
   assert_success
-  run state alpha .busy
-  assert_output false
+  run state alpha .prompts
+  assert_output 0
 }
 
 @test "lead_times_out_when_lane_never_answers: an old request shows as timed out" {
@@ -196,23 +179,18 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
   { printf '{"session_id":"s1","session_title":"alpha","prompt":"/'; big; printf '"}'; } >"$LANES_TEST_TMP/in.json"
   run bash -c "'$LANES' hook prompt <'$LANES_TEST_TMP/in.json'"
   assert_success
-  run state alpha '[.busy, .prompts, (.last_command | length)] | @json'
-  assert_output '[true,1,200]'
-  { printf '{"session_id":"s1","background_tasks":[],"last_assistant_message":"'; big; printf '"}'; } >"$LANES_TEST_TMP/in.json"
-  run bash -c "'$LANES' hook stop <'$LANES_TEST_TMP/in.json'"
-  assert_success
-  run state alpha '[.busy, .stops] | @json'
-  assert_output '[false,1]'
+  run state alpha '[.prompts, (.last_command | length)] | @json'
+  assert_output '[1,200]'
 }
 
-# jq_shim <mode>: a jq on PATH that misbehaves only for the Stop update: "empty" prints nothing and exits 0, "fail"
-# prints half a document and exits 5.
-jq_shim() {
+# prompt_jq_shim <mode>: a jq on PATH that misbehaves only for the prompt update: "empty" prints nothing and exits 0,
+# "fail" prints half a document and exits 5 (helper.bash's jq_shim only fails outright).
+prompt_jq_shim() {
   mkdir -p "$LANES_TEST_TMP/jqshim"
   cat >"$LANES_TEST_TMP/jqshim/jq" <<SHIM
 #!/usr/bin/env bash
-if [[ "\$*" == *".stops = "* ]]; then
-  [[ "$1" == fail ]] && printf '{"busy":' && exit 5
+if [[ "\$*" == *".prompts = "* ]]; then
+  [[ "$1" == fail ]] && printf '{"prompts":' && exit 5
   exit 0
 fi
 exec "$(command -v jq)" "\$@"
@@ -223,19 +201,19 @@ SHIM
 @test "write_atomic refuses empty content: a jq that prints nothing leaves the state file as it was" {
   register_lane alpha s1 %7 >/dev/null
   jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
-  jq_shim empty
-  jq -nc '{session_id:"s1",background_tasks:[]}' | PATH="$LANES_TEST_TMP/jqshim:$PATH" "$LANES" hook stop || true
-  run state alpha '[.busy, .prompts] | @json'
-  assert_output '[true,1]'
+  prompt_jq_shim empty
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"/goal x"}' | PATH="$LANES_TEST_TMP/jqshim:$PATH" "$LANES" hook prompt || true
+  run state alpha '[.prompts, .last_command] | @json'
+  assert_output '[1,null]'
 }
 
 @test "a failing jq update leaves the state file as it was, never half a document" {
   register_lane alpha s1 %7 >/dev/null
   jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
-  jq_shim fail
-  jq -nc '{session_id:"s1",background_tasks:[]}' | PATH="$LANES_TEST_TMP/jqshim:$PATH" "$LANES" hook stop || true
-  run state alpha '[.busy, .prompts] | @json'
-  assert_output '[true,1]'
+  prompt_jq_shim fail
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"/goal x"}' | PATH="$LANES_TEST_TMP/jqshim:$PATH" "$LANES" hook prompt || true
+  run state alpha '[.prompts, .last_command] | @json'
+  assert_output '[1,null]'
 }
 
 @test "a missing jq is reported by name, and a hook does not exit 2 (which would block the prompt)" {
@@ -265,16 +243,16 @@ old_writer_after_new_session() {
   f="$LANES_DATA_DIR/lanes/alpha.json"
   jq '.session_id = "s2" | .used_pct = 5' "$f" >"$f.x" && mv "$f.x" "$f"
   s="$LANES_DATA_DIR/lanes/state/alpha.json"
-  jq '.session_id = "s2" | .busy = true | .prompts = 1' "$s" >"$s.x" && mv "$s.x" "$s"
+  jq '.session_id = "s2" | .prompts = 1 | .last_command = "/goal new"' "$s" >"$s.x" && mv "$s.x" "$s"
   kill "$holder"
   wait "$writer" || true
 }
 
-@test "an old session's Stop hook that waited on the mutex never overwrites the new session's busy flag" {
+@test "an old session's prompt hook that waited on the mutex never overwrites the new session's record" {
   register_lane alpha s1 %7 >/dev/null
-  old_writer_after_new_session bash -c "jq -nc '{session_id:\"s1\",background_tasks:[]}' | '$LANES' hook stop"
-  run state alpha '[.session_id, .busy] | @json'
-  assert_output '["s2",true]'
+  old_writer_after_new_session bash -c "jq -nc '{session_id:\"s1\",session_title:\"alpha\",prompt:\"/goal old\"}' | '$LANES' hook prompt"
+  run state alpha '[.session_id, .prompts, .last_command] | @json'
+  assert_output '["s2",1,"/goal new"]'
 }
 
 @test "an old session's status line that waited on the mutex never overwrites the new session's context %" {
@@ -284,38 +262,105 @@ old_writer_after_new_session() {
   assert_output 5
 }
 
-activity() { "$LANES" status --json | jq -r '.[0].activity'; }
+# ---- activity and goal, from the session's own state (the fake keeps its sessions file as 2.1.309 does) ----------
 
-@test "Esc interrupts a turn and no Stop runs: the transcript's interrupt entry ends the busy flag, the screen alone never does" {
+activity() { "$LANES" status --json | jq -r '.[0] | .activity + (if .activity_detail then " (" + .activity_detail + ")" else "" end)'; }
+
+@test "activity follows the sessions file: settling right after a change, idle once LANES_IDLE_GAP has passed" {
   make_repo
-  write_resume alpha
+  start_fake alpha
+  export LANES_IDLE_GAP=30
+  run activity
+  assert_output settling
+  export LANES_IDLE_GAP=0.1
+  sleep 0.2
+  run activity
+  assert_output idle
+}
+
+@test "LANES_IDLE_GAP outside 0.1 to 600 seconds, or not a plain number, is refused loudly, never read as no gap" {
+  register_lane alpha s1 %7 >/dev/null
+  for v in -5 0 0.05 601 nan 1e400 abc 1.2.3; do
+    LANES_IDLE_GAP="$v" run "$LANES" status
+    assert_failure 2
+    assert_output --partial "LANES_IDLE_GAP=$v is not a number of seconds from 0.1 to 600"
+  done
+  for v in 0.1 3 600; do
+    LANES_IDLE_GAP="$v" run "$LANES" status
+    assert_success
+  done
+}
+
+@test "a lane's sessions file is read from the config dir the lane registered with, not the caller's" {
+  make_repo
+  start_fake alpha
+  [ "$(reg alpha .claude_config_dir)" = "$CLAUDE_CONFIG_DIR" ]
+  CLAUDE_CONFIG_DIR="$LANES_TEST_TMP/lead-profile" run activity
+  assert_output --regexp '^(idle|settling)$'
+}
+
+@test "a prompt makes the lane busy, and Esc makes it idle at once with no hook (no Stop, as in 2.1.309)" {
+  make_repo
   start_fake alpha FAKE_TURN_MS=60000
   lanes_tmux send-keys -t "$PANE" -l -- "a long task"
   lanes_tmux send-keys -t "$PANE" Enter
-  wait_for "busy flag" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = true ]"
-  sleep 1.2
+  wait_status busy
   run activity
   assert_output busy
   lanes_tmux send-keys -t "$PANE" Escape
-  wait_for "interrupt logged" grep -q '^INTERRUPT$' "$FAKE_LOG"
-  run state alpha .busy
-  assert_output true
-  run activity
-  assert_output interrupted
+  wait_status idle
+  sleep 0.2
+  LANES_IDLE_GAP=0.1 run activity
+  assert_output idle
 }
 
-@test "an interrupt older than the current turn does not end it" {
+@test "a dialog is waiting, with what it waits for; a background shell is shell" {
   make_repo
-  write_resume alpha
-  start_fake alpha FAKE_TURN_MS=60000
-  lanes_tmux send-keys -t "$PANE" -l -- "first"
-  lanes_tmux send-keys -t "$PANE" Enter
-  wait_for "busy flag" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = true ]"
-  lanes_tmux send-keys -t "$PANE" Escape
-  wait_for "interrupt logged" grep -q '^INTERRUPT$' "$FAKE_LOG"
-  sleep 1.2
-  jq -nc --arg s "$(reg alpha .session_id)" --arg tp "$FAKE_LOG.transcript.jsonl" \
-    '{session_id:$s,session_title:"alpha",prompt:"second",transcript_path:$tp}' | "$LANES" hook prompt
+  start_fake alpha FAKE_DIALOG=1
   run activity
-  assert_output busy
+  assert_output "waiting (permission prompt)"
+  lanes_tmux kill-session -t alpha
+  start_fake alpha FAKE_SHELL_MS=60000
+  lanes_tmux send-keys -t "$PANE" -l -- "start a background shell"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_status shell
+  run activity
+  assert_output shell
+}
+
+@test "no sessions file, a stale one, or another session in it is unknown, with the reason" {
+  make_repo
+  start_fake alpha
+  edit_session '.sessionId = "someone-else"'
+  run activity
+  assert_output --partial "unknown (pid $FAKE_PID now runs session someone-else"
+  edit_session '.procStart = "1"'
+  run activity
+  assert_output --partial "unknown (the session file of pid $FAKE_PID is stale"
+  rm "$(session_file)"
+  run activity
+  assert_output --partial "unknown (no Claude Code session file"
+  run "$LANES" status
+  assert_output --partial "unknown (no Claude Code session file"
+}
+
+@test "a lane registered without a sessions file of its own (no Claude Code pid file) is unknown, never idle" {
+  register_lane alpha s1 %7 >/dev/null
+  run activity
+  assert_output --partial "unknown (no Claude Code session file $CLAUDE_CONFIG_DIR/sessions/$$.json"
+}
+
+@test "the goal column comes from the transcript's goal_status entries: active while set, none once cleared" {
+  make_repo
+  start_fake alpha FAKE_GOAL="ship A1"
+  run bash -c "'$LANES' status --json | jq -r '.[0].goal'"
+  assert_output active
+  run "$LANES" status
+  assert_output --partial "goal active"
+  wait_status idle
+  lanes_tmux send-keys -t "$PANE" -l -- "/goal clear"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_for "goal cleared" grep -q '^SUBMIT /goal clear$' "$FAKE_LOG"
+  run bash -c "'$LANES' status --json | jq -r '.[0].goal'"
+  assert_output none
 }

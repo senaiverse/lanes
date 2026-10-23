@@ -1,41 +1,42 @@
 #!/usr/bin/env bats
-# Public seam: `lanes clear <lane>` for a lane with an active /goal. The model cannot run /goal clear, the goal's Stop
-# hook re-prompts the lane (no UserPromptSubmit), and /clear removes a goal (code.claude.com/docs/en/goal). So
-# `lanes clear` types `/goal clear` itself at a proven idle point, confirms the footer is gone, then clears.
+# Public seams: `lanes clear <lane>` for a lane with an active /goal, and `lanes goal <lane> <text>`. /clear removes an
+# active goal itself (code.claude.com/docs/en/goal; measured on 2.1.309), so `lanes clear` types no `/goal clear`, and
+# a goal loop keeps the sessions file busy across its turns, so clear waits for the loop to hand control back.
 
 load helper
 
 submits() { grep -E '^SUBMIT ' "$FAKE_LOG" | cut -d' ' -f2- || true; }
 
-# goal_lane [VAR=value...]: a ready lane whose goal loop has run FAKE_GOAL_TURNS extra turns and given control back.
+# goal_lane [VAR=value...]: a ready lane whose goal loop has run FAKE_GOAL_TURNS extra turns and given control back
+# with the goal still set.
 goal_lane() {
   make_repo
   write_resume alpha
   start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=2 "$@"
-  wait_for "goal loop handed back" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -eq 2 ] && [ \"\$(jq -r .stops '$LANES_DATA_DIR/lanes/state/alpha.json')\" = 3 ]"
+  wait_for "goal loop handed back" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -eq 2 ]"
+  wait_status idle
   wait_for "goal footer" pane_has '◎ /goal active'
   run "$LANES" clear-ready --lane alpha
   assert_success
 }
 
-@test "a lane with an active goal is cleared: /goal clear, then /clear, then the RESUME Goal, never the live one" {
+@test "a lane with an active goal is cleared by /clear alone, then the RESUME Goal is set, never the live one" {
   goal_lane
   run "$LANES" clear alpha
   assert_success
   assert_output --partial "cleared: alpha"
   run submits
-  assert_output "/goal clear
-/clear
+  assert_output "/clear
 /goal finish item A1 and report done"
   run state alpha .handshake.state
   assert_output done
 }
 
-@test "a goal the human cleared never comes back: /goal clear fires no hook, and only the RESUME Goal is re-sent" {
+@test "a goal the human cleared never comes back: only the RESUME Goal is re-sent" {
   make_repo
   write_resume alpha
   start_fake alpha FAKE_GOAL="an old goal"
-  wait_for "goal turn ended" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = false ]"
+  wait_status idle
   lanes_tmux send-keys -t "$PANE" -l -- "/goal clear"
   lanes_tmux send-keys -t "$PANE" Enter
   wait_for "goal footer gone" bash -c "! tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q '◎ /goal active'"
@@ -51,46 +52,35 @@ goal_lane() {
   assert_output 1
 }
 
-@test "a /goal clear that fires UserPromptSubmit neither counts as a prompt nor sets busy" {
-  goal_lane FAKE_GOAL_CLEAR_HOOK=1
-  run "$LANES" clear alpha
-  assert_success
-  run submits
-  assert_output --partial "/clear"
-}
-
-@test "the goal footer that will not go away is a loud refusal, and /clear is never sent" {
-  goal_lane FAKE_SWALLOW_ENTERS=2
-  run "$LANES" clear alpha
-  assert_failure
-  assert_output --partial "/goal clear"
-  run grep -c '^SUBMIT /clear' "$FAKE_LOG"
-  assert_output 0
-}
-
-@test "goal-driven re-prompting during the clear stops it: the idle re-check sees the Stop count move" {
+@test "a goal loop that goes on after clear-ready (turns with no prompt) refuses /clear: nothing is typed" {
   make_repo
   write_resume alpha
-  export LANES_IDLE_GAP=1.5
-  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=1000 FAKE_TURN_MS=200
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=3 FAKE_TURN_MS=400
+  # clear-ready runs inside a goal turn, as the lane's Bash tool would run it; the loop then goes on.
+  "$LANES" clear-ready --lane alpha >/dev/null
+  n="$(grep -c '^GOAL-CONTINUE$' "$FAKE_LOG" || true)"
+  wait_for "another goal turn" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -gt $n ]"
+  run "$LANES" clear alpha --wait 5
+  assert_failure
+  assert_output --partial "began another turn since clear-ready"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output stale
+}
+
+@test "a running goal loop keeps the lane busy (one busy span), so clear waits and then refuses: nothing is typed" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=1000 FAKE_TURN_MS=60000
   "$LANES" clear-ready --lane alpha >/dev/null
   run "$LANES" clear alpha --wait 2
   assert_failure
-  assert_output --regexp "(became busy during the idle re-check|spinner)"
-  run grep -c '^SUBMIT /clear' "$FAKE_LOG"
+  assert_output --partial "stayed busy for 2 s"
+  run grep -c '^BURST' "$FAKE_LOG"
   assert_output 0
-}
-
-@test "hook prompt: /goal clear and its aliases do not start a turn, so they set no busy flag and count no prompt" {
-  register_lane alpha s1 %7 >/dev/null
-  for p in "/goal clear" "/goal stop" "/goal cancel" "/goal"; do
-    jq -nc --arg p "$p" '{session_id:"s1",session_title:"alpha",prompt:$p}' | "$LANES" hook prompt
-  done
-  run state alpha '[.busy, .prompts] | @json'
-  assert_output '[false,0]'
-  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"/goal ship it"}' | "$LANES" hook prompt
-  run state alpha '[.busy, .prompts, .last_command, has("goal")] | @json'
-  assert_output '[true,1,"/goal ship it",false]'
+  run sess .status
+  assert_output busy
 }
 
 @test "the request message does not ask the lane to clear its own goal, which only typed input can do" {
@@ -176,7 +166,7 @@ goal_setup() {
   goal_setup
   run as_lead goal alpha "ship B2 instead"
   assert_success
-  wait_for "goal turn ended" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = false ]"
+  wait_status idle
   write_resume alpha "ship B2 instead"
   run "$LANES" clear-ready --lane alpha
   assert_success
@@ -184,40 +174,13 @@ goal_setup() {
   assert_success
   run submits
   assert_output "/goal ship B2 instead
-/goal clear
 /clear
 /goal ship B2 instead"
 }
 
-# shim_on_goal_clear <action>: a tmux shim that runs <action> right after the Enter that submits `/goal clear`.
-shim_on_goal_clear() {
-  local m="$LANES_TEST_TMP/goal-clear-typed"
-  mkdir -p "$LANES_TEST_TMP/shim"
-  printf '#!/usr/bin/env bash\n%q "$@"\nrc=$?\n[[ "$*" == *"-l -- /goal clear"* ]] && : >%q\nif [[ "$*" == *" Enter" && -f %q ]]; then rm -f %q; %s; fi\nexit $rc\n' \
-    "$(command -v tmux)" "$m" "$m" "$m" "$1" >"$LANES_TEST_TMP/shim/tmux"
-  chmod +x "$LANES_TEST_TMP/shim/tmux"
-}
-
-@test "a refusal after lanes cleared the goal says so (refused path)" {
-  goal_lane
-  shim_on_goal_clear "printf 'z\\\\n' >>'$WORK/file'"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
-  assert_failure
-  assert_output --partial "uncommitted changes"
-  assert_output --partial "its /goal was cleared"
-}
-
-@test "a plain failure after lanes cleared the goal says so too (busy at the moment of sending)" {
-  goal_lane
-  shim_on_goal_clear "f='$LANES_DATA_DIR/lanes/state/alpha.json'; jq '.busy = true | .busy_since = (now | floor)' \"\$f\" >\"\$f.x\" && mv \"\$f.x\" \"\$f\""
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha --wait 1
-  assert_failure
-  assert_output --partial "its /goal was cleared"
-}
-
-@test "lanes goal checks the pane again right before typing: a session that took the pane during settle gets nothing" {
+@test "lanes goal checks the pane again right before typing: a session that took the pane during the wait gets nothing" {
   goal_setup
-  export LANES_IDLE_GAP=2
+  export LANES_IDLE_GAP=3
   as_lead goal alpha "ship B2" >"$LANES_TEST_TMP/out" 2>&1 &
   pid=$!
   sleep 1
@@ -231,14 +194,65 @@ shim_on_goal_clear() {
   assert_output 0
 }
 
-@test "a draft that lands ahead of a long goal wrapped over several lines: only our characters are erased" {
-  goal_setup FAKE_ON_ESC=draft-next
+@test "a draft that lands ahead of a long goal wrapped over several lines: nothing is deleted or submitted" {
+  goal_setup FAKE_DRAFT_AT_FIRST_KEY=1
   long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
   long="${long%; }"
   run as_lead goal alpha "$long"
   assert_failure
-  assert_output --partial "our typed text was deleted"
+  assert_output --partial "ahead of ours"
+  assert_output --partial "nothing was submitted or deleted"
   run grep -c '^SUBMIT' "$FAKE_LOG"
   assert_output 0
-  wait_for "draft left alone" bash -c "tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q $'^❯ human draft\$'"
+  run bash -c "tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -c $'^❯\xc2\xa0human draft/goal finish item B2'"
+  assert_output 1
+}
+
+@test "a goal is trimmed where it enters: lanes goal types and confirms the same string" {
+  goal_setup
+  run as_lead goal alpha "   ship B2 and its tests   "
+  assert_success
+  run grep -c '^SUBMIT /goal ship B2 and its tests$' "$FAKE_LOG"
+  assert_output 1
+}
+
+@test "a RESUME Goal with spaces around it is typed trimmed after a clear, and confirmed" {
+  make_repo
+  write_resume alpha "   ship A1 with spaces   "
+  start_fake alpha
+  "$LANES" clear-ready --lane alpha >/dev/null
+  run "$LANES" clear alpha
+  assert_success
+  run grep -c '^SUBMIT /goal ship A1 with spaces$' "$FAKE_LOG"
+  assert_output 1
+}
+
+@test "a goal check that crashes (its character count killed) is a refusal, never a pass" {
+  goal_setup
+  jq_shim 'explode[] | if . > 65535' 1+
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead goal alpha "ship B2"
+  assert_failure
+  assert_output --partial "check failed: goal_problem"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 0
+}
+
+@test "a goal of only spaces is refused before anything is typed" {
+  goal_setup
+  run as_lead goal alpha "    "
+  assert_failure 2
+  assert_output --partial "is empty"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 0
+}
+
+@test "lanes goal sets the goal of a lane with a background shell running (only /clear refuses one, which the shell would outlive)" {
+  goal_setup FAKE_SHELL_MS=60000
+  lanes_tmux send-keys -t "$PANE" -l -- "start a shell"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_status shell
+  run as_lead goal alpha "ship B2"
+  assert_success
+  run grep -c '^SUBMIT /goal ship B2$' "$FAKE_LOG"
+  assert_output 1
 }

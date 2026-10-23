@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake Claude Code pane for the lanes tests. It draws the screen of Claude Code 2.1.309 as captured in captures/ (see
-# draw), reads keys in raw mode, and fires the lanes hooks the way Claude Code does.
-# Launch it with argv[0] "claude" so tmux reports pane_current_command=claude. Behaviour knobs are FAKE_* env vars.
+# draw), reads keys in raw mode, fires the lanes hooks the way Claude Code does, and keeps its sessions file
+# ($CLAUDE_CONFIG_DIR/sessions/<pid>.json) in the shape of fixtures/2.1.309. Behaviour knobs are FAKE_* env vars.
 set -u
 
 LANE="${FAKE_LANE:?FAKE_LANE}"
@@ -13,46 +13,88 @@ SID="fake-$$-$RANDOM"
 composer="${FAKE_DRAFT:-}"
 swallow="${FAKE_SWALLOW_ENTERS:-0}"
 turn_ms="${FAKE_TURN_MS:-300}"
-# A /goal is a Stop hook that starts another turn after each one (no UserPromptSubmit), here FAKE_GOAL_TURNS times,
-# then gives control back with the goal still set; the footer shows `◎ /goal active` while one is set (goal docs).
+# A /goal keeps the session busy across its turns (no UserPromptSubmit, one busy span, measured on 2.1.309), here
+# FAKE_GOAL_TURNS extra turns, then hands control back with the goal still set; the footer shows `◎ /goal active`.
 goal=""
 goal_left=0
-on_esc="${FAKE_ON_ESC:-}"
+# FAKE_DRAFT_AT_FIRST_KEY=1: a human starts a draft just before the first typed key arrives.
+draft_at_key="${FAKE_DRAFT_AT_FIRST_KEY:-}"
 busy=0
 turn_end=0
+shell_end=0
 transcript=()
-if [[ -n "${FAKE_TRANSCRIPT:-}" ]]; then
-  while IFS= read -r line; do transcript+=("$line"); done <<<"$FAKE_TRANSCRIPT"
-fi
 
 log() { printf '%s\n' "$*" >>"$LOG"; }
 
 now_ms() { local t="${EPOCHREALTIME/./}"; printf '%s' "${t:0:13}"; }
 
-# The session transcript (hook input transcript_path): one JSON entry per line, as Claude Code writes it. An Esc
-# interrupt adds the user entry "[Request interrupted by user for tool use]" (seen in 2.1.309 transcripts).
-TRANSCRIPT_FILE="$LOG.transcript.jsonl"
-export TZ=UTC0
-tlog() { # tlog <user|assistant> <text>
-  jq -nc --arg t "$1" --arg x "$2" --arg ts "$(printf '%(%Y-%m-%dT%H:%M:%S)T' -1).000Z" \
-    '{type: $t, timestamp: $ts, message: {role: $t, content: [{type: "text", text: $x}]}}' >>"$TRANSCRIPT_FILE"
+# ---- the sessions file -------------------------------------------------------------------------------------------
+
+SESS="${CLAUDE_CONFIG_DIR:?CLAUDE_CONFIG_DIR}/sessions/$$.json"
+mkdir -p "${SESS%/*}"
+# procStart as Claude Code 2.1.309 computes it: /proc/<pid>/stat field 22 on Linux, `ps -o lstart=` elsewhere. The
+# platform comes from `uname -s`, as lanes picks it, since /proc also exists on some hosts that are not Linux.
+if [[ "$(uname -s)" == Linux ]]; then
+  read -ra stat_fields <<<"$(sed 's/.*) //' "/proc/$$/stat")"
+  PROC_START="${stat_fields[19]}"
+else
+  PROC_START="$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | sed 's/^ *//; s/ *$//')"
+fi
+STARTED="$(now_ms)"
+TMUX_NAME="$(tmux -L "$LANES_TMUX_SOCKET" display -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_id}.#{pane_id}' 2>/dev/null)"
+status=""
+status_at=0
+waiting_for=""
+
+# set_status <idle|busy|waiting|shell> [waitingFor]: statusUpdatedAt moves only when the status or waitingFor does.
+set_status() {
+  [[ "$1" == "$status" && "${2:-}" == "$waiting_for" ]] && return 0
+  status="$1" waiting_for="${2:-}" status_at="$(now_ms)"
+  write_session
 }
 
-# fire <register|prompt|stop> [extra jq args]: one hook call with Claude Code's input shape.
+# write_session: the 2.1.309 key set; waitingFor only while waiting, tmux only inside tmux (as observed).
+write_session() {
+  jq -nc --argjson pid $$ --arg sid "$SID" --arg cwd "$CWD" --argjson started "$STARTED" --arg ps "$PROC_START" \
+    --arg tmux "$TMUX_NAME" --arg name "$LANE" --argjson at "$status_at" --arg st "$status" --arg wf "$waiting_for" '
+    {pid: $pid, sessionId: $sid, cwd: $cwd, startedAt: $started, procStart: $ps, version: "2.1.309", peerProtocol: 1,
+     peerFeatures: ["notify_idle"], kind: "interactive", entrypoint: "cli", pidDomain: "linux:fake:pid:[0]"}
+    + (if $tmux == "" then {} else {tmux: $tmux} end)
+    + {messagingSocketPath: "/run/fake/\($pid).sock", name: $name, nameSource: "user", nameSince: $started,
+       updatedAt: $at, status: $st, statusUpdatedAt: $at}
+    + (if $wf == "" then {} else {waitingFor: $wf} end)' >"$SESS.tmp" && mv -f "$SESS.tmp" "$SESS"
+}
+
+# Claude Code deletes the file on exit; a SIGKILL leaves it behind (measured on 2.1.309).
+trap 'rm -f "$SESS" "$SESS.tmp"' EXIT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+# The session transcript (hook input transcript_path): one JSON entry per line, as Claude Code writes it, including
+# the goal_status attachments of fixtures/2.1.309/goal-transcript.jsonl.
+export TZ=UTC0
+transcript_file() { printf '%s.%s.jsonl' "$LOG" "$SID"; }
+tlog() { # tlog <user|assistant> <text>
+  jq -nc --arg t "$1" --arg x "$2" --arg ts "$(printf '%(%Y-%m-%dT%H:%M:%S)T' -1).000Z" \
+    '{type: $t, timestamp: $ts, message: {role: $t, content: [{type: "text", text: $x}]}}' >>"$(transcript_file)"
+}
+goal_entry() { # goal_entry <met true|false> <sentinel true|false> <condition>
+  jq -nc --argjson m "$1" --argjson s "$2" --arg c "$3" \
+    '{type: "attachment", attachment: ({type: "goal_status", met: $m} + (if $s then {sentinel: true} else {} end)
+      + {condition: $c} + (if $s then {} else {reason: "not yet"} end))}' >>"$(transcript_file)"
+}
+
+# fire <start|prompt> <source|prompt>: one hook call with Claude Code's input shape and hook environment.
 fire() {
-  local kind="$1" json
-  case "$kind" in
-    start) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg src "$2" \
-      '{hook_event_name:"SessionStart",source:$src,session_id:$s,session_title:$t,cwd:$c}')"
-      printf '%s' "$json" | "$LANES" register >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
-    prompt) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg p "$2" --arg tp "$TRANSCRIPT_FILE" \
+  local json
+  case "$1" in
+    start) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg src "$2" --arg tp "$(transcript_file)" \
+      '{hook_event_name:"SessionStart",source:$src,session_id:$s,session_title:$t,cwd:$c,transcript_path:$tp}')"
+      printf '%s' "$json" | CLAUDE_PID=$$ CLAUDE_CODE_SESSION_ID="$SID" "$LANES" register >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
+    prompt) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg p "$2" --arg tp "$(transcript_file)" \
       '{hook_event_name:"UserPromptSubmit",session_id:$s,session_title:$t,cwd:$c,prompt:$p,transcript_path:$tp}')"
-      printf '%s' "$json" | "$LANES" hook prompt >>"$LOG.hookout" 2>>"$LOG.hookerr"
+      printf '%s' "$json" | CLAUDE_PID=$$ CLAUDE_CODE_SESSION_ID="$SID" "$LANES" hook prompt >>"$LOG.hookout" 2>>"$LOG.hookerr"
       tlog user "$2" ;;
-    stop) tlog assistant "done"
-      json="$(jq -nc --arg s "$SID" --arg c "$CWD" --arg tp "$TRANSCRIPT_FILE" \
-      '{hook_event_name:"Stop",session_id:$s,cwd:$c,stop_hook_active:false,background_tasks:[],transcript_path:$tp}')"
-      printf '%s' "$json" | "$LANES" hook stop >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
   esac
 }
 
@@ -62,11 +104,11 @@ fire() {
 # permission dialog replaces everything below the transcript and has no `❯`+NBSP line.
 WIDTH=116
 draw() {
-  local start=0 n="${#transcript[@]}" i spin="${FAKE_SPINNER:-}" rest
+  local start=0 n="${#transcript[@]}" i spin="" rest
   ((n > 24)) && start=$((n - 24))
   printf '\033[H\033[2J'
   for ((i = start; i < n; i++)); do printf '%s\r\n' "${transcript[i]}"; done
-  if [[ -n "${FAKE_DIALOG:-}" ]]; then
+  if [[ "$status" == waiting ]]; then
     printf ' Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n'
     return
   fi
@@ -87,6 +129,29 @@ draw() {
 start_turn() {
   busy=1
   turn_end=$(($(now_ms) + turn_ms))
+  set_status busy
+}
+
+# end_turn: the turn is over; a goal with turns left starts the next one at once (the status stays busy), and a turn
+# that left a background shell (FAKE_SHELL_MS) is `shell` until the shell exits, which starts a turn of its own.
+end_turn() {
+  busy=0
+  turn_end=0
+  transcript+=("● done")
+  tlog assistant "done"
+  if [[ -n "$goal" ]] && ((goal_left > 0)); then
+    goal_left=$((goal_left - 1))
+    goal_entry false false "$goal"
+    log "GOAL-CONTINUE"
+    busy=1
+    turn_end=$(($(now_ms) + turn_ms))
+  elif [[ -n "${FAKE_SHELL_MS:-}" ]]; then
+    shell_end=$(($(now_ms) + FAKE_SHELL_MS))
+    FAKE_SHELL_MS=""
+    set_status shell
+  else
+    set_status idle
+  fi
 }
 
 enter() {
@@ -99,19 +164,21 @@ enter() {
   composer=""
   log "SUBMIT $text"
   if [[ "$text" == "/clear" ]]; then
+    # Same process and file, a new session id; SessionStart(clear) fires and UserPromptSubmit does not; the goal goes.
     SID="fake-$$-$RANDOM"
     transcript=()
     busy=0
     goal=""
+    write_session
     fire start clear
   elif [[ "$text" =~ ^/goal\ (clear|stop|off|reset|none|cancel)$ ]]; then
-    [[ -n "${FAKE_GOAL_CLEAR_HOOK:-}" ]] && fire prompt "$text"
-    if [[ -n "$goal" ]]; then transcript+=("❯ $text" "  ⎿  Goal cleared: $goal"); else transcript+=("❯ $text" "  ⎿  No goal set"); fi
+    if [[ -n "$goal" ]]; then transcript+=("❯ $text" "  ⎿  Goal cleared: $goal"); goal_entry true true "$goal"; else transcript+=("❯ $text" "  ⎿  No goal set"); fi
     goal=""
   elif [[ "$text" == "/goal "* ]]; then
     [[ -z "${FAKE_GOAL_NO_HOOK:-}" ]] && fire prompt "$text"
     transcript+=("❯ $text" "  ⎿  Goal set: ${text#/goal }")
     goal="${text#/goal }"
+    goal_entry false true "$goal"
     goal_left="${FAKE_GOAL_TURNS:-0}"
     start_turn
   elif [[ -n "$text" ]]; then
@@ -122,26 +189,33 @@ enter() {
   pasted=""
 }
 
-# nap <seconds>: a sleep without a child process, so tmux keeps reporting pane_current_command=claude. It reads a FIFO
-# held open read-write by this process, which never has data and never reaches EOF. `<> <(:)` is not portable: macOS
-# refuses a read-write open of a pipe's /dev/fd entry, and bash then carries on with napfd unset.
+# nap <seconds>: a sleep without forking a process on every poll. It reads a FIFO held open read-write by this
+# process, which never has data and never reaches EOF (macOS refuses a read-write open of `<(:)`).
 nap_fifo="$LOG.nap.$$"
 rm -f "$nap_fifo"
-mkfifo "$nap_fifo" && exec {napfd}<>"$nap_fifo" || { echo "fake-claude: cannot open the nap FIFO $nap_fifo" >&2; exit 1; }
+if ! { mkfifo "$nap_fifo" && exec {napfd}<>"$nap_fifo"; }; then
+  echo "fake-claude: cannot open the nap FIFO $nap_fifo" >&2
+  exit 1
+fi
 nap() { read -rt "$1" -u "$napfd" _ || true; }
 
 stty raw -echo 2>/dev/null
+# After Ctrl-Z and fg the shell has reset the terminal, so the fake takes raw mode back and redraws, as a terminal UI
+# resuming from a stop does, then logs CONT so a test knows it may type again.
+trap 'stty raw -echo 2>/dev/null; draw; log CONT' CONT
 pasted=""
+if [[ -n "${FAKE_DIALOG:-}" ]]; then set_status waiting "permission prompt"; else set_status idle; fi
 [[ -z "${FAKE_NO_REGISTER:-}" ]] && fire start startup
 if [[ -n "${FAKE_GOAL:-}" ]]; then
   goal="$FAKE_GOAL"
   goal_left="${FAKE_GOAL_TURNS:-0}"
   fire prompt "/goal $goal"
+  goal_entry false true "$goal"
   start_turn
 fi
 if [[ -n "${FAKE_BUSY_FOREVER:-}" ]]; then
   fire prompt "long task"
-  busy=1
+  start_turn
   turn_end=0
 fi
 draw
@@ -166,29 +240,19 @@ while :; do
           $'\r' | $'\n') enter ;;
           $'\e')
             log "ESC"
-            if ((busy)); then
-              # Esc interrupts the turn: Claude Code writes the interrupt to the transcript and runs no Stop hook.
+            if ((busy)) || [[ "$status" == waiting ]]; then
+              # Esc ends the turn or dialog: the status is idle at once, no hook runs, and a goal stays set.
               busy=0
               turn_end=0
               log "INTERRUPT"
               transcript+=("  ⎿  Interrupted · What should Claude do instead?")
               tlog user "[Request interrupted by user for tool use]"
+              set_status idle
             fi
-            if [[ "$on_esc" == prompt ]]; then
-              # A human submits a message right after the lead's Escape: a new turn starts.
-              on_esc=""
-              log "HUMAN-PROMPT"
-              fire prompt "a human's message"
-              transcript+=("❯ a human's message")
-              start_turn
-            fi
-            # A human starts a draft at the Escape (draft), or just before the next key arrives (draft-late).
-            [[ "$on_esc" == draft ]] && { composer="human draft"; on_esc=""; }
-            [[ "$on_esc" == draft-late ]] && on_esc=draft-next
             ;;
           $'\177') composer="${composer%?}" ;;
           *)
-            [[ "$on_esc" == draft-next ]] && { composer="human draft"; on_esc=""; }
+            [[ -n "$draft_at_key" ]] && { composer="human draft"; draft_at_key=""; }
             composer+="$k"
             ;;
         esac
@@ -200,14 +264,14 @@ while :; do
     nap 0.03
   fi
   if ((busy && turn_end > 0 && $(now_ms) >= turn_end)); then
-    busy=0
-    transcript+=("● done")
-    fire stop
-    if [[ -n "$goal" ]] && ((goal_left > 0)); then
-      goal_left=$((goal_left - 1))
-      log "GOAL-CONTINUE"
-      start_turn
-    fi
+    end_turn
+    draw
+  fi
+  if ((shell_end > 0 && $(now_ms) >= shell_end)); then
+    # The background shell exited: Claude Code wakes itself for one turn (busy, then idle).
+    shell_end=0
+    log "SHELL-DONE"
+    start_turn
     draw
   fi
 done

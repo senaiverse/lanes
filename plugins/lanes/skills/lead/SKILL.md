@@ -33,16 +33,18 @@ Done when every lane has one item in flight and a tracker row that names it.
 At the start of each session, start every watcher the SessionStart context lists as down: CI, review score, lane
 context and journal drift, one endless Monitor each. Their commands are in [MONITORS.md](MONITORS.md).
 
-Run `lanes status` at each check. A row reads lane, role, pane, context, activity, readiness and handshake:
+Run `lanes status` at each check. A row reads lane, role, pane, context, activity, goal, readiness and handshake:
 
 ```text
-alpha	lane	%3	ctx 72% AT-THRESHOLD	idle	clear-ready	handshake ready
+alpha	lane	%3	ctx 72% AT-THRESHOLD	idle	goal active	clear-ready	handshake ready
 ```
 
 - **ctx**: a number, `unknown` or `stale`. Treat `unknown` and `stale` as "ask the lane", never as safe.
 - **AT-THRESHOLD**: start the handshake (step 4).
-- **activity**: `idle`, `busy`, `interrupted` (Esc ended the turn), `busy-expired` (no Stop for a long time),
-  `background` or `unknown`.
+- **activity**, from Claude Code's own session state: `idle`, `settling` (idle for under a few seconds), `busy`,
+  `waiting (<what for>)` (a question, dialog or permission prompt a human must answer), `shell` (a background shell
+  runs) or `unknown (<why>)`. Treat `unknown` as "look at the pane".
+- **goal**: `active`, `none` or `unknown`, from the lane's transcript.
 - **handshake**: `none`, `requested`, `request-timed-out`, `ready`, `sending`, `cleared`, `stale`, `failed`, `done`.
 
 `sending` and `cleared` are a clear in flight: run `lanes clear <lane>` again to finish it. `stale` and `failed` need a
@@ -57,9 +59,10 @@ The handshake is RULES.md rule 6; these are its commands.
 1. Run `lanes request <lane>`. It records the request and prints the message to send.
 2. Send that message to the lane.
 3. Wait for the lane's "clear-ready". Use `lanes status`: the row shows `clear-ready`.
-4. Run `lanes clear <lane>`. It re-checks everything at the moment of sending. When a `/goal` is active it types
-   `/goal clear` first, since the lane cannot. Then it sends one Esc and `/clear`, then the RESUME Goal recorded at
-   clear-ready, and confirms each by its effect.
+4. Run `lanes clear <lane>` with the Bash tool's `timeout` set to 300000 (5 minutes): it waits up to `--wait` seconds
+   (default 60) for idle twice and up to 20 s for each confirmation, about 4 minutes at worst, while the tool's
+   default is 2 minutes. It re-checks everything before every key it sends. It types `/clear`, which also ends an
+   active `/goal`, then the RESUME Goal recorded at clear-ready, and confirms each by its effect.
 5. Read its last line. `cleared: <lane> ...` means the lane has a new session, its RESUME block, and its goal.
 
 Done when `lanes status` shows the lane with handshake `done` and the lane has answered its first message.
@@ -72,9 +75,10 @@ When `lanes clear` refuses, its message names the cause and the fix; act on that
 
 Run `lanes goal <lane> "<one line>"` when a lane should work toward a new end state without losing its context: a new
 item, a narrower target, or a goal that ended early. It refuses unless you are the lead, the goal is one line of at
-most 4,000 characters, and the lane is idle. It types the goal through the same checks as `lanes clear` and confirms
-it by the lane's own prompt hook. It sets the live goal only: ask the lane to copy it into its RESUME Goal, the goal a
-later `lanes clear` sets again. To give a lane a plain instruction, message it instead.
+most 4,000 characters, and the lane is idle (a background shell may run). It types the goal through the same checks as
+`lanes clear` and confirms it by the lane's own prompt hook; give it a Bash `timeout` of 180000 (it can wait `--wait`
+seconds and then up to 40 s for the confirmation). It sets the live goal only: ask the lane to copy it into its RESUME
+Goal, the goal a later `lanes clear` sets again. To give a lane a plain instruction, message it instead.
 
 ## 5. Accept a done report
 

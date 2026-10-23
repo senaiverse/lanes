@@ -54,11 +54,12 @@ When the lead asks (or your own context reaches the threshold and you tell the l
 2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request is refused.
 3. Commit and push your branch and the journal.
 4. Stop anything running in the background, or name it under Running if it must outlive the clear.
-5. Leave an active `/goal` alone. You cannot clear it; `lanes clear` clears it and sets your RESUME Goal after the clear.
+5. Leave an active `/goal` alone. You cannot clear it; the `/clear` that `lanes clear` types removes it, and
+   `lanes clear` then sets your RESUME Goal.
 6. Run `lanes clear-ready` from the work tree you work in. If it refuses, fix the cause it names and run it again.
-7. Send the lead "clear-ready", then stop and wait. A new prompt, a commit or an edit after this cancels the
-   readiness. When your goal starts another turn, answer only "waiting for clear" and call no tool: after a few such
-   turns the goal hands control back, and the lead can clear you.
+7. Send the lead "clear-ready", then stop and wait. A new prompt, a commit, an edit or another turn after this cancels
+   the readiness. When your goal starts another turn, run `lanes clear-ready` again, answer only "clear-ready" and call
+   no other tool: after a few such turns the goal hands control back, and the lead can clear you.
 
 Done when `lanes clear-ready` printed `clear-ready: <lane>` and the lead has your message.
 
