@@ -288,3 +288,50 @@ EOF
   run reg alpha .pane_pid
   assert_output "$(lanes_tmux display -p -t "$PANE" '#{pane_pid}')"
 }
+
+# shim_on_keys <match> <action>: a tmux shim that runs <action> once, right after a tmux call whose arguments contain
+# <match> (for example " Escape" or " Enter").
+shim_on_keys() {
+  local m="$LANES_TEST_TMP/shim-fired"
+  mkdir -p "$LANES_TEST_TMP/shim"
+  printf '#!/usr/bin/env bash\n%q "$@"\nrc=$?\nif [[ " $* " == *%q* && ! -f %q ]]; then : >%q; %s; fi\nexit $rc\n' \
+    "$(command -v tmux)" "$1" "$m" "$m" "$2" >"$LANES_TEST_TMP/shim/tmux"
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+@test "a tree edit at the Escape stops /clear before anything is typed" {
+  ready_lane alpha
+  shim_on_keys " Escape" "printf 'z\\\\n' >>'$WORK/file'"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "uncommitted changes"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 1
+  run submitted /clear
+  assert_output 0
+}
+
+@test "a tree edit while /clear is typed stops it before Enter, and the typed /clear is deleted" {
+  ready_lane alpha
+  shim_on_keys "-l -- /clear" "printf 'z\\\\n' >>'$WORK/file'"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "uncommitted changes"
+  run submitted /clear
+  assert_output 0
+  wait_for "typed /clear deleted" bash -c "! tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q $'^❯ /clear'"
+  run state alpha .handshake.state
+  assert_output stale
+}
+
+@test "the Enter retry checks again too: a tree edit after a lost Enter means no second Enter" {
+  ready_lane alpha FAKE_SWALLOW_ENTERS=1
+  shim_on_keys " Enter" "printf 'z\\\\n' >>'$WORK/file'"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "uncommitted changes"
+  run grep -c ENTER-SWALLOWED "$FAKE_LOG"
+  assert_output 1
+  run submitted /clear
+  assert_output 0
+}

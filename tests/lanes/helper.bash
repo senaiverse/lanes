@@ -10,6 +10,8 @@ FAKE="$BATS_TEST_DIRNAME/fake-claude"
 
 setup() {
   lanes_test_setup
+  # The physical path, as git and getcwd report it: on macOS /tmp is a link to /private/tmp.
+  LANES_TEST_TMP="$(cd "$LANES_TEST_TMP" && pwd -P)"
   # bin/ must work with no Claude Code variables at all.
   unset CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA CLAUDE_PROJECT_DIR CLAUDE_ENV_FILE \
     CLAUDE_PLUGIN_OPTION_THRESHOLD CLAUDE_PLUGIN_OPTION_JOURNAL_DIR LANES_THRESHOLD LANES_JOURNAL_DIR LANES_ROLE
@@ -94,8 +96,8 @@ start_fake() {
     env LANES_DATA_DIR="$LANES_DATA_DIR" LANES_TMUX_SOCKET="$LANES_TMUX_SOCKET" LANES_BIN="$LANES" \
     FAKE_LANE="$lane" FAKE_LOG="$FAKE_LOG" "$@" bash -c 'exec -a claude bash "$0"' "$FAKE"
   PANE="$(lanes_tmux display -p -t "$lane" '#{pane_id}')"
-  wait_for "registered $lane" test -f "$LANES_DATA_DIR/lanes/$lane.json"
-  wait_for "prompt drawn" pane_has '❯'
+  wait_for "registered $lane" test -f "$LANES_DATA_DIR/lanes/$lane.json" || { cat "$FAKE_LOG.err" >&2; return 1; }
+  wait_for "prompt drawn" pane_has '❯' || { cat "$FAKE_LOG.err" >&2; return 1; }
 }
 
 # wait_for <what> <cmd...>: poll up to 5 s.

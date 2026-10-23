@@ -37,13 +37,19 @@ cmd_monitor_diff() {
   write_atomic "$MON/$name.state" "$cur"
 }
 
-# monitors_down: the watchers that ran here before (a state file exists) and have no live holder now.
+# The four watchers of skills/lead/MONITORS.md, so a fresh install reports them all as down.
+MONITOR_NAMES=(ci reviews context drift)
+
+# monitors_down: the four watchers, plus any other that ran here before (a state file exists), with no live holder.
 monitors_down() {
-  local f name down=()
+  local f name names=("${MONITOR_NAMES[@]}") down=()
   for f in "$MON"/*.state; do
     [[ -e "$f" ]] || continue
     name="${f##*/}"
     name="${name%.state}"
+    [[ " ${names[*]} " == *" $name "* ]] || names+=("$name")
+  done
+  for name in "${names[@]}"; do
     kill -0 "$(lock_holder "$MON/$name.lnk")" 2>/dev/null || down+=("$name")
   done
   echo "${down[*]}"

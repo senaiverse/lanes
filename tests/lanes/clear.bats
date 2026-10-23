@@ -354,12 +354,19 @@ SUBMIT /clear"
   [ $((prompts + timeouts)) -eq 150 ] || { echo "prompts=$prompts timeouts=$timeouts" >&2; false; }
 }
 
-# bounded_hook: one `hook prompt` under the no-flock mutex, killed at 20 s; sets RC, OUT and ELAPSED.
+# bounded_hook: one `hook prompt` under the no-flock mutex, killed at 20 s (RC 124) by a bash watchdog, since macOS
+# has no `timeout`; sets RC, OUT and ELAPSED.
 bounded_hook() {
+  local pid i
   SECONDS=0
   RC=0
-  OUT="$(jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' |
-    PATH="$LANES_TEST_TMP/shim:$PATH" LANES_NO_FLOCK=1 timeout 20 "$LANES" hook prompt 2>&1)" || RC=$?
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' |
+    PATH="$LANES_TEST_TMP/shim:$PATH" LANES_NO_FLOCK=1 "$LANES" hook prompt >"$LANES_TEST_TMP/hook.out" 2>&1 &
+  pid=$!
+  for ((i = 0; i < 200; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then kill "$pid"; RC=124; fi
+  wait "$pid" 2>/dev/null || ((RC)) || RC=$?
+  OUT="$(cat "$LANES_TEST_TMP/hook.out")"
   ELAPSED=$SECONDS
 }
 

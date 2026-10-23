@@ -193,3 +193,19 @@ shim_on_goal_clear() {
   assert_failure
   assert_output --partial "its /goal was cleared"
 }
+
+@test "lanes goal checks the pane again right before typing: a session that took the pane during settle gets nothing" {
+  goal_setup
+  export LANES_IDLE_GAP=2
+  as_lead goal alpha "ship B2" >"$LANES_TEST_TMP/out" 2>&1 &
+  pid=$!
+  sleep 1
+  register_lane beta sb "$PANE" >/dev/null 2>&1
+  rc=0
+  wait "$pid" || rc=$?
+  assert [ "$rc" -ne 0 ]
+  run cat "$LANES_TEST_TMP/out"
+  assert_output --partial "no longer holds pane"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 0
+}

@@ -15,8 +15,8 @@ job.
   the first is alive and reclaims the name from a dead one.
 - **Back off, never die:** when `gh` fails, skip the diff for that pass (a partial set would report items as gone),
   print one line, double the wait up to 10 minutes, and keep looping.
-- **Start:** at the start of each lead session. The SessionStart context lists the watchers that ran here before and
-  are down; start those. Starting one that is already running is harmless: it prints a refusal and exits.
+- **Start:** at the start of each lead session. The SessionStart context lists every watcher that is down (all four on
+  a fresh install); start those. Starting one that is already running is harmless: it prints a refusal and exits.
 - **Stop:** stop the Monitor when the human ends the session. Nothing else stops a watcher.
 
 Bash and Git Bash run the loops as written (Git Bash needs `jq` and `gh` on its PATH). PowerShell: `lanes` is a Bash

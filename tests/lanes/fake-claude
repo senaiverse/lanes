@@ -7,6 +7,7 @@ set -u
 LANE="${FAKE_LANE:?FAKE_LANE}"
 LANES="${LANES_BIN:?LANES_BIN}"
 LOG="${FAKE_LOG:?FAKE_LOG}"
+exec 2>>"$LOG.err" # the pane is the screen; errors go where start_fake can show them
 CWD="$PWD"
 SID="fake-$$-$RANDOM"
 composer="${FAKE_DRAFT:-}"
@@ -104,8 +105,12 @@ enter() {
   pasted=""
 }
 
-# nap <seconds>: a sleep without a child process, so tmux keeps reporting pane_current_command=claude.
-exec {napfd}<> <(:)
+# nap <seconds>: a sleep without a child process, so tmux keeps reporting pane_current_command=claude. It reads a FIFO
+# held open read-write by this process, which never has data and never reaches EOF. `<> <(:)` is not portable: macOS
+# refuses a read-write open of a pipe's /dev/fd entry, and bash then carries on with napfd unset.
+nap_fifo="$LOG.nap.$$"
+rm -f "$nap_fifo"
+mkfifo "$nap_fifo" && exec {napfd}<>"$nap_fifo" || { echo "fake-claude: cannot open the nap FIFO $nap_fifo" >&2; exit 1; }
 nap() { read -rt "$1" -u "$napfd" _ || true; }
 
 stty raw -echo 2>/dev/null

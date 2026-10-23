@@ -175,3 +175,42 @@ start_elsewhere() {
   assert_failure
   assert_output --partial "$LANES_TEST_TMP/start/.lanes/next-alpha.md"
 }
+
+# journal_worktree: the journal lives in a second work tree of the same repo, on its own pushed branch. Sets J.
+journal_worktree() {
+  make_repo
+  J="$LANES_TEST_TMP/jwt"
+  git -C "$WORK" worktree add -q -b journal "$J"
+  git -C "$J" push -q -u origin journal
+  (WORK="$J" && write_resume alpha)
+  export LANES_JOURNAL_DIR="$J/.lanes"
+}
+
+@test "a journal in its own work tree must be committed and pushed too, at clear-ready" {
+  journal_worktree
+  register_lane alpha s1 %7 >/dev/null
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  printf 'draft\n' >>"$J/.lanes/note.md"
+  run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "the journal's work tree"
+  assert_output --partial "uncommitted changes"
+  git -C "$J" add .lanes && git -C "$J" commit -q -m note
+  run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "unpushed"
+}
+
+@test "a journal work tree left dirty after clear-ready stops lanes clear before anything is typed" {
+  journal_worktree
+  start_fake alpha
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  printf 'draft\n' >>"$J/.lanes/note.md"
+  run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "the journal's work tree"
+  run grep -c '^ESC$' "$FAKE_LOG"
+  assert_output 0
+}

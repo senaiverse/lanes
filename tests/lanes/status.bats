@@ -250,3 +250,36 @@ SHIM
   run bash -c "PATH='$LANES_TEST_TMP/nojq' '$LANES' statusline </dev/null 2>/dev/null"
   assert_output "lanes: jq is not installed"
 }
+
+# old_writer_after_new_session <command...>: a hook of session s1 passes its session lookup, then waits for the mutex
+# (held by a live process); meanwhile s2 takes the lane. Once the mutex is free, the old hook must write nothing.
+old_writer_after_new_session() {
+  local holder writer f s
+  export LANES_NO_FLOCK=1
+  sleep 30 &
+  holder=$!
+  ln -s "$holder.1" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  "$@" &
+  writer=$!
+  sleep 0.5
+  f="$LANES_DATA_DIR/lanes/alpha.json"
+  jq '.session_id = "s2" | .used_pct = 5' "$f" >"$f.x" && mv "$f.x" "$f"
+  s="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq '.session_id = "s2" | .busy = true | .prompts = 1' "$s" >"$s.x" && mv "$s.x" "$s"
+  kill "$holder"
+  wait "$writer" || true
+}
+
+@test "an old session's Stop hook that waited on the mutex never overwrites the new session's busy flag" {
+  register_lane alpha s1 %7 >/dev/null
+  old_writer_after_new_session bash -c "jq -nc '{session_id:\"s1\",background_tasks:[]}' | '$LANES' hook stop"
+  run state alpha '[.session_id, .busy] | @json'
+  assert_output '["s2",true]'
+}
+
+@test "an old session's status line that waited on the mutex never overwrites the new session's context %" {
+  register_lane alpha s1 %7 >/dev/null
+  old_writer_after_new_session bash -c "jq -nc '{session_id:\"s1\",session_name:\"alpha\",context_window:{used_percentage:91}}' | '$LANES' statusline >/dev/null"
+  run reg alpha .used_pct
+  assert_output 5
+}

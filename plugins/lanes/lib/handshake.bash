@@ -17,6 +17,16 @@ git_problem() {
   [[ "$ahead" == 0 ]] || echo "the branch in $dir has $ahead unpushed commit(s): push them"
 }
 
+# journal_problem <lane work tree>: a journal inside a git work tree of its own (another worktree or branch) must be
+# clean and pushed as well; a journal outside any work tree has nothing to push.
+journal_problem() {
+  local jt prob
+  jt="$(git -C "$(journal_root "$1")" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [[ "$jt" != "$1" ]] || return 0
+  prob="$(git_problem "$jt")"
+  [[ -z "$prob" ]] || echo "the journal's work tree $jt: $prob"
+}
+
 # self_lane [--lane x]: which lane runs this command (the Bash tool carries TMUX_PANE, not the plugin's variables).
 self_lane() {
   if [[ -n "${1:-}" ]]; then
@@ -58,6 +68,7 @@ cmd_clear_ready() {
   wt="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" ||
     die "not clear-ready" "$PWD is not a git work tree: run 'lanes clear-ready' from the work tree you work in"
   prob="$(git_problem "$wt")"
+  [[ -n "$prob" ]] || prob="$(journal_problem "$wt")"
   [[ -z "$prob" ]] || die "not clear-ready" "$prob"
   file="$(resume_path "$lane" "$wt")"
   block="$(resume_block "$file")" || die "not clear-ready" "no RESUME block in $file: run 'lanes init $lane' and fill it in"
@@ -75,6 +86,9 @@ cmd_clear_ready() {
   goal="$(jq -r '.goal // ""' <<<"$st")"
   [[ -n "$goal" ]] || goal="$(section_text "$block" Goal)"
   mutex_take 5 || die "registry locked" "retry in a moment"
+  # Ownership is decided under the mutex: a session that took the lane meanwhile is not marked ready for the old one.
+  [[ "$(reg_read "$lane" | jq -r .session_id 2>/dev/null)" == "$(jq -r .session_id <<<"$e")" ]] ||
+    die "not clear-ready" "lane $lane started a new session while clear-ready ran: run it again"
   state_update "$lane" '.handshake = {state: "ready", ready_at: $now, requested_at: .handshake.requested_at,
       session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: (.prompts // 0), goal: $goal, attempts: 0}' \
     --argjson now "$(now)" --arg sid "$(jq -r .session_id <<<"$e")" --arg wt "$wt" --arg head "$(git -C "$wt" rev-parse HEAD)" \
@@ -175,13 +189,30 @@ activity_moved() {
     else empty end'
 }
 
-# submit <lane> <pane> <text> <signature> <confirm cmd...>: type the line and prove it arrived; just before Enter,
-# re-read the hook flag, the counters and the screen, and on any move delete the typed text and return 2 with MOVED
-# set. After Enter the effect confirms it; a lost Enter (text still in the input line) gets one more press, then 1.
+# send_guard <lane> <pane>: why nothing may be typed or submitted now, or nothing. The caller sets GUARD_SID (the
+# session the pane must still belong to), GUARD_SIG (the activity snapshot) and GUARD_READY (1: the clear-ready proof
+# must still hold). It runs before typing, before Enter and before a retried Enter.
+GUARD_SID="" GUARD_SIG="" GUARD_READY=0
+send_guard() {
+  local why
+  why="$(pane_owner_problem "$1" "$2" "$GUARD_SID")"
+  if [[ -z "$why" ]] && ((GUARD_READY)); then
+    why="$(changed_since_ready "$1" "$(reg_read "$1")" "$(state_read "$1")")"
+    [[ -z "$why" ]] || why="$why since clear-ready"
+  fi
+  [[ -n "$why" ]] || why="$(activity_moved "$1" "$GUARD_SIG")"
+  [[ -n "$why" ]] || { screen_read "$2"; why="$VETO"; }
+  printf '%s' "$why"
+}
+
+# submit <lane> <pane> <text> <confirm cmd...>: type the line and prove it arrived, then press Enter and confirm the
+# effect; a lost Enter (text still in the input line) gets one more press, then 1. send_guard runs before typing and
+# before every Enter; when it objects, the typed text is deleted and 2 is returned with MOVED set.
 submit() {
-  local lane="$1" pane="$2" text="$3" sig="$4"
-  shift 4
-  MOVED=""
+  local lane="$1" pane="$2" text="$3"
+  shift 3
+  MOVED="$(send_guard "$lane" "$pane")"
+  [[ -z "$MOVED" ]] || return 2
   screen_read "$pane"
   ((COMPOSER_FOUND)) && [[ -z "$COMPOSER" ]] ||
     die "$REFUSAL: the input line of $pane is not empty just before typing ('${COMPOSER:0:40}')" "nothing was typed; a human may be typing, and a draft is never touched"
@@ -196,8 +227,7 @@ submit() {
     fi
     die "typed text did not arrive intact (input line shows '${COMPOSER:0:60}')" "look at pane $pane; nothing was submitted and the input line was left as it is"
   fi
-  MOVED="$(activity_moved "$lane" "$sig")"
-  [[ -n "$MOVED" ]] || MOVED="$VETO"
+  MOVED="$(send_guard "$lane" "$pane")"
   if [[ -n "$MOVED" ]]; then
     erase_typed "$pane" "$text"
     return 2
@@ -206,6 +236,11 @@ submit() {
   "$@" && return 0
   screen_read "$pane"
   if [[ "$COMPOSER" == "${text:0:20}"* ]]; then
+    MOVED="$(send_guard "$lane" "$pane")"
+    if [[ -n "$MOVED" ]]; then
+      erase_typed "$pane" "$text"
+      return 2
+    fi
     echo "lanes: Enter was not taken for '${text:0:20}'; pressing it once more" >&2
     tm send-keys -t "$pane" Enter
     "$@" && return 0
@@ -352,6 +387,7 @@ changed_since_ready() {
   [[ "$(jq -r .session_id <<<"$e")" == "$(jq -r .handshake.session_id <<<"$st")" ]] || { echo "the session changed"; return; }
   [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(jq -r .handshake.head <<<"$st")" ]] || { echo "HEAD moved"; return; }
   prob="$(git_problem "$wt")"
+  [[ -n "$prob" ]] || prob="$(journal_problem "$wt")"
   [[ -z "$prob" ]] || { echo "the tree stopped being clean and pushed ($prob)"; return; }
   block="$(resume_block "$(resume_path "$1" "$wt")" || true)"
   [[ "$(hash_of "$block")" == "$(jq -r .handshake.resume_hash <<<"$st")" ]] || { echo "the RESUME block changed"; return; }
@@ -375,10 +411,11 @@ final_verify() {
 # clear_goal <lane> <pane>: an active /goal re-prompts the lane after each turn and the model cannot clear it, while
 # /clear removes it anyway (code.claude.com/docs/en/goal). So lanes types /goal clear at the proven idle point and
 # takes the footer going away as the confirmation, before the final checks.
-clear_goal() {
+clear_goal() { # clear_goal <lane> <pane> <session id>
   local rc=0
-  submit "$1" "$2" "/goal clear" "$(activity_sig "$1")" wait_goal_footer_gone "$2" || rc=$?
-  ((rc != 2)) || die "not cleared: $MOVED before /goal clear was sent" "the typed text was deleted; run lanes clear again when the lane is idle"
+  GUARD_SID="$3" GUARD_SIG="$(activity_sig "$1")" GUARD_READY=1
+  submit "$1" "$2" "/goal clear" wait_goal_footer_gone "$2" || rc=$?
+  ((rc != 2)) || die "not cleared: $MOVED before /goal clear was sent" "nothing was submitted and no typed text was left; run lanes clear again when the lane is idle"
   ((rc == 0)) || die "not cleared: /goal clear was typed into $2 but the /goal footer stayed" "look at the pane; /clear was not sent"
   GOAL_CLEARED=1
 }
@@ -388,11 +425,12 @@ clear_goal() {
 send_goal() {
   local base
   base="$(state_read "$1" | jq -r '.prompts // 0')"
-  submit "$1" "$2" "/goal $4" "$(activity_sig "$1")" wait_goal_seen "$1" "$3" "$4" "$base"
+  GUARD_SID="$3" GUARD_SIG="$(activity_sig "$1")" GUARD_READY=0
+  submit "$1" "$2" "/goal $4" wait_goal_seen "$1" "$3" "$4" "$base"
 }
 
 cmd_clear() {
-  local lane="${1:-}" wait_s=60 e st hs pane sid goal new_sid sig rc=0 age why
+  local lane="${1:-}" wait_s=60 e st hs pane sid goal new_sid rc=0 age why
   valid_lane "$lane" || usage
   shift
   [[ "${1:-}" == "--wait" ]] && wait_s="${2:-60}"
@@ -441,16 +479,16 @@ cmd_clear() {
     [[ -z "$why" ]] || refuse_clear "$lane" "$why since clear-ready" "ask the lane to finish, push and report clear-ready again"
     settle "$lane" "$pane" "$wait_s" 1
     if ((GOAL_ACTIVE)); then
-      clear_goal "$lane" "$pane"
+      clear_goal "$lane" "$pane" "$sid"
       settle "$lane" "$pane" "$wait_s" 0
     fi
     final_verify "$lane" "$pane"
-    sig="$(activity_sig "$lane")"
+    GUARD_SID="$sid" GUARD_SIG="$(activity_sig "$lane")" GUARD_READY=1
     hs_set "$lane" '.state = "sending" | .attempts = ((.attempts // 0) + 1) | .sent_at = $now' --argjson now "$(now)"
     tm send-keys -t "$pane" Escape
     sleep 0.3
-    submit "$lane" "$pane" "/clear" "$sig" wait_new_session "$lane" "$sid" || rc=$?
-    ((rc != 2)) || refuse_clear "$lane" "$MOVED before /clear was sent" "the typed /clear was deleted; ask the lane to report clear-ready again"
+    submit "$lane" "$pane" "/clear" wait_new_session "$lane" "$sid" || rc=$?
+    ((rc != 2)) || refuse_clear "$lane" "$MOVED before /clear was sent" "nothing was submitted and no typed /clear was left; ask the lane to report clear-ready again"
     if ((rc != 0)); then
       hs_set "$lane" '.state = "failed" | .failed = "clear not confirmed"'
       die "/clear was sent to $pane but no new session registered" "look at the pane; the clear is not confirmed and was not retried further"

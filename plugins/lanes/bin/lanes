@@ -509,7 +509,7 @@ cmd_register() {
   else
     ctx="lanes: $(who "$lane" "$role"); follow the ${role} skill."
   fi
-  # The lead re-arms the watchers that ran here before and are down; the model reads this, not the systemMessage.
+  # The lead re-arms every watcher that is down; the model reads this, not the systemMessage.
   if [[ "$role" == lead ]]; then
     down="$(monitors_down)"
     [[ -z "$down" ]] || ctx+="${ctx:+$'\n\n'}lanes: watchers not running: $down. Start each from skills/lead/MONITORS.md (a running one refuses a second start)."
@@ -544,6 +544,9 @@ cmd_hook() {
   fi
   lane="$(lane_for_session "${f[0]}" "${f[1]}")" || return 0
   mutex_take 3 || { echo "lanes: registry locked: busy flag for '$lane' not updated" >&2; return 0; }
+  # Ownership is decided again under the mutex: a hook of an old session that waited here must not write over the
+  # session that took the lane meanwhile.
+  [[ "$(lane_for_session "${f[0]}" "${f[1]}")" == "$lane" ]] || { mutex_drop; return 0; }
   if [[ "$kind" == prompt ]]; then
     # `/goal` alone and `/goal clear` (with its aliases) start no turn, so no Stop would ever end a busy flag set here.
     state_update "$lane" '.session_id = $sid | .last_command = $p.cmd | .activity_at = $now
@@ -573,9 +576,9 @@ cmd_statusline() {
     (
       trap on_exit EXIT # a subshell resets traps, and a cancelled status line must not leave a temp file
       trap 'exit 143' TERM INT
-      e="$(reg_read "$lane")" || exit 0
-      [[ "$(jq -r .session_id <<<"$e")" == "$sid" ]] || exit 0
       mutex_take 1 || exit 0
+      # Under the mutex: only the session that owns the lane now records its context %.
+      [[ "$(reg_read "$lane" | jq -r .session_id 2>/dev/null)" == "$sid" ]] || exit 0
       reg_update "$lane" '.used_pct = $pct' --argjson pct "$pct"
       state_update "$lane" '.pct_at = $now' --argjson now "$(now)"
       mutex_drop

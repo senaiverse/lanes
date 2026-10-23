@@ -96,11 +96,17 @@ clear_context() { clear_output | jq -r .hookSpecificOutput.additionalContext; }
 }
 
 @test "a wrapper that would push the context over 10,000 characters falls back to the read-the-file notice" {
+  # A journal path of 980 characters: the file path stays under macOS's PATH_MAX of 1024, and the path, which the
+  # wrapper names twice, still pushes a block at the cap over the hook cap.
+  local dir="$LANES_TEST_TMP" seg
   seg="$(printf 'd%.0s' $(seq 1 200))"
-  export LANES_JOURNAL_DIR="$LANES_TEST_TMP/$seg/$seg/$seg/$seg/$seg/$seg/$seg"
+  while ((${#dir} + 201 < 980)); do dir+="/$seg"; done
+  dir+="/${seg:0:$((980 - ${#dir} - 1))}"
+  [ "${#dir}" -eq 980 ]
+  export LANES_JOURNAL_DIR="$dir"
   make_repo
   mkdir -p "$LANES_JOURNAL_DIR"
-  write_resume alpha "ship A1" "$(printf 'y%.0s' $(seq 1 7700))"
+  write_resume alpha "ship A1" "$(printf 'y%.0s' $(seq 1 7790))"
   cp "$WORK/.lanes/next-alpha.md" "$LANES_JOURNAL_DIR/"
   register_lane alpha s1 %7 >/dev/null
   ctx="$(clear_context)"

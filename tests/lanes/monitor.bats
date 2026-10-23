@@ -59,10 +59,15 @@ MD="$BATS_TEST_DIRNAME/../../plugins/lanes/skills/lead"
   "$LANES" monitor-lock drift "$live" >/dev/null
   run bash -c "jq -nc '{session_id:\"sl\",session_title:\"lead\",cwd:\"/\",source:\"startup\"}' | LANES_ROLE=lead TMUX_PANE=%9 '$LANES' register 2>/dev/null | jq -r .hookSpecificOutput.additionalContext"
   kill "$live"
-  assert_output --partial "watchers not running: ci."
+  assert_output --partial "watchers not running: ci reviews context."
   refute_output --partial drift
   run bash -c "jq -nc '{session_id:\"s1\",session_title:\"alpha\",cwd:\"/\",source:\"startup\"}' | TMUX_PANE=%7 '$LANES' register 2>/dev/null"
   refute_output --partial watchers
+}
+
+@test "on a fresh install the lead is told all four watchers are down" {
+  run bash -c "jq -nc '{session_id:\"sl\",session_title:\"lead\",cwd:\"/\",source:\"startup\"}' | LANES_ROLE=lead TMUX_PANE=%9 '$LANES' register 2>/dev/null | jq -r .hookSpecificOutput.additionalContext"
+  assert_output --partial "watchers not running: ci reviews context drift."
 }
 
 @test "MONITORS.md: under 120 lines, cited by the lead skill, one watcher per signal" {
