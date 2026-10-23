@@ -24,8 +24,12 @@
 - Session registry: `$DATA/lanes/<lane>.json` holds
   `{"lane":"<name>","session_id":"<current>","role":"lead|lane","tmux_pane":"%N","cwd":"<abs>","used_pct":<int|null>,"clear_ready":<bool>,"updated_at":"<ISO-8601 UTC>"}`.
   It is keyed by lane name because `/clear` rotates `session_id`. Every session is launched as `claude --name <lane>`,
-  and the lane name is the hook input's `session_title` (`docs/M0-FINDINGS.md` Q2, Q4). The core plugin owns this
-  file. Other pieces only read it.
+  and `lanes register` takes the lane name from the SessionStart input's `session_title` (`docs/M0-FINDINGS.md` Q2,
+  Q4). PreToolUse input has no `session_title`; a probe on 2.1.308 confirmed it. The core plugin owns this file.
+  Other pieces only read it.
+- Session index: `$DATA/sessions/<session_id>` holds one line, the lane name. `lanes register` writes it on every
+  SessionStart and removes the lane's previous one. Hooks other than SessionStart and UserPromptSubmit receive no
+  `session_title` (hooks docs), so they find the caller by `session_id` through this index. The core plugin owns it.
 - The registry also records `tmux_pid` and `pane_pid` at register, so `lanes clear` can prove the pane still holds
   that session after a tmux or host restart reuses the pane id.
 - Core working state: `$DATA/lanes/state/` holds `<lane>.json` (activity, handshake record), `config.json` (plugin
@@ -50,7 +54,9 @@
   private deny-list. It reads the list from
   `docs/PORT-SOURCES.local.md` when that file is present, or from `LANES_DENY_LIST` otherwise. It runs as the local
   pre-push hook, not in CI (DECISIONS 23). The hook also checks the author, committer and message of every commit being
-  pushed (`deny-gate.sh --commits`).
+  pushed (`deny-gate.sh --commits`), and refuses a push whose tip commit has unresolved conflict markers
+  (`scripts/marker-gate.sh`). Both scripts run every git call they parse through `git_plain`, which pins the git config
+  keys that reshape output, so user config cannot change what they read.
 
 ## Process
 

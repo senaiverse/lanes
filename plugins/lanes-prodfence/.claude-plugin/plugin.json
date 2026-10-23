@@ -1,0 +1,23 @@
+{
+  "name": "lanes-prodfence",
+  "version": "0.1.0",
+  "description": "Production fence: refuses any session's tool call that mentions a configured production marker, so only the human acts on production.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["production", "guard", "safety", "hooks"],
+  "userConfig": {
+    "markers": {
+      "type": "string",
+      "title": "Production markers",
+      "description": "Text that names production (hosts, project IDs, contexts), separated by ';'. Added to the markers in .lanes/prodfence.md.",
+      "sensitive": true
+    },
+    "protected_paths": {
+      "type": "string",
+      "title": "Protected paths",
+      "description": "Globs of files no session may edit, separated by ';'. Added to protected_paths in .lanes/prodfence.md."
+    }
+  }
+}

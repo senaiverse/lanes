@@ -1,0 +1,20 @@
+schema_version: "1.1"
+name: plancheck-send-plan-runs-check
+description: Sending a plan to a lane runs lanes-plancheck on the plan file first.
+tags: [plancheck, trigger]
+plugins: ["../../../plugins/lanes-plancheck"]
+runs: 1
+execution:
+  max_turns: 8
+  allowed_tools: [Skill, Read, Glob]
+  prompt: |
+    Write a short plan to ./plan.md for adding a --verbose flag to our CLI, then send this plan to lane s3.
+graders:
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: '"skill"\s*:\s*"(?:[\w-]+:)?plancheck"'
+  - name: ran-plancheck
+    type: tool_used
+    tool: Bash
+    input_match: '"command"\s*:\s*"(?:[^"]*?(?:&&|;)\s*)?(?:\S*/)?lanes-plancheck\s+(\./)?plan\.md'

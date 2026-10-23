@@ -1,0 +1,16 @@
+schema_version: "1.1"
+name: review-review-branch-delegates
+description: A request to review a branch hands the work to the reviewer agent.
+tags: [review, trigger]
+plugins: ["../../../plugins/lanes-review"]
+runs: 1
+execution:
+  max_turns: 6
+  allowed_tools: [Agent, Read]
+  prompt: |
+    Review this branch: main...feat/retry-queue, head is ready. I want an independent read, not your own summary.
+graders:
+  - name: delegated-to-reviewer
+    type: tool_used
+    tool: Agent
+    input_match: '"subagent_type"\s*:\s*"lanes-review:reviewer"'

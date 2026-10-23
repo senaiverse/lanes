@@ -24,6 +24,11 @@
       "name": "lanes-review",
       "source": "./plugins/lanes-review",
       "description": "Adversarial reviewer agent, instructed not to edit; not sandboxed."
+    },
+    {
+      "name": "lanes-prodfence",
+      "source": "./plugins/lanes-prodfence",
+      "description": "Production fence: refuses any tool call that mentions a configured production marker (lanes-prodfence)."
     }
   ]
 }

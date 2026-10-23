@@ -13,7 +13,7 @@ setup() {
   git -C "$REPO" config user.email t@example.invalid
   git -C "$REPO" config user.name t
   mkdir -p "$REPO/scripts" "$REPO/.githooks"
-  cp "$ROOT/scripts/deny-gate.sh" "$ROOT/scripts/install-hooks.sh" "$REPO/scripts/"
+  cp "$ROOT"/scripts/*.sh "$REPO/scripts/"
   cp "$ROOT/.githooks/pre-push" "$REPO/.githooks/"
   git -C "$REPO" remote add origin "$REMOTE"
   unset LANES_DENY_LIST
@@ -149,6 +149,119 @@ commit_file() { # $1 file, $2 message
   assert_output --partial "author"
   run git -C "$REMOTE" rev-parse --verify feature
   assert_failure
+}
+
+# Conflict markers: the hook refuses a push whose tip tree holds an unresolved merge conflict.
+conflict_text() { printf 'keep\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/main\n'; }
+
+@test "a pushed commit with conflict markers is refused and names each file:line" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/.gitignore"
+  printf 'Title\n=======\n' > "$REPO/notes.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial ".gitignore:2"
+  assert_output --partial ".gitignore:4"
+  assert_output --partial ".gitignore:6"
+  refute_output --partial "notes.md"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "the pushed commit is checked, not the work tree" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  echo resolved > "$REPO/a.txt"
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial "a.txt:2"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "a clean push passes the conflict-marker check" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  printf 'text\n  <<<<<<< indented\n<<<<<<<\n========\n' > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  conflict_text > "$REPO/b.txt"   # untracked in the work tree: not pushed, so not checked
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_success
+}
+
+@test "a markdown setext underline of seven = with no other marker passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  printf 'Title\n=======\n\nLonger heading\n==============\n' > "$REPO/README.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+}
+
+@test "only the tip tree is checked: a marker fixed by a later pushed commit passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm broken
+  echo resolved > "$REPO/a.txt"
+  git -C "$REPO" commit -qam fixed
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+}
+
+# User git config that reshapes git grep and git log output must not change what the gates parse.
+reshape_git_output() { # $1 repo
+  local kv
+  for kv in grep.column=true color.grep=always color.ui=always grep.lineNumber=true grep.fullName=true \
+    core.quotePath=true submodule.recurse=true log.showSignature=true i18n.logOutputEncoding=ISO-8859-1; do
+    git -C "$1" config "${kv%%=*}" "${kv#*=}"
+  done
+}
+
+@test "with output-reshaping git config a push with markers is refused and names each file:line" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  reshape_git_output "$REPO"
+  conflict_text > "$REPO/notes-é.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial "  notes-é.txt:2"
+  assert_output --partial "  notes-é.txt:4"
+  assert_output --partial "  notes-é.txt:6"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "with output-reshaping git config a clean push passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  reshape_git_output "$REPO"
+  printf 'Title\n=======\n' > "$REPO/README-é.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_success
+}
+
+@test "a marker inside a submodule is not the pushed tree's, even with submodule.recurse set" {
+  SUB="$LANES_TEST_TMP/sub"
+  git init -q -b main "$SUB"
+  conflict_text > "$SUB/m.txt"
+  git -C "$SUB" add .
+  git -C "$SUB" -c user.email=t@example.invalid -c user.name=t commit -qm sub
+  git -C "$REPO" -c protocol.file.allow=always submodule add -q "$SUB" sub
+  git -C "$REPO" commit -qm "add sub"
+  reshape_git_output "$REPO"
+  run "$REPO/scripts/marker-gate.sh" "$REPO" HEAD
+  assert_success
 }
 
 @test "deleting a branch passes" {
