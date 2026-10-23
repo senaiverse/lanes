@@ -74,6 +74,30 @@ Suggested skills"
   [ "$(wc -l <"$f")" -lt 80 ]
 }
 
+@test "every bin/ script refuses Bash 4.0 to 4.3 (an empty array is unbound under set -u before 4.4) at once, and runs on 4.4" {
+  local f n=0
+  for f in "$P"/bin/*; do
+    n=$((n + 1))
+    # BASH_VERSINFO is read-only, so a copy reads a stand-in array instead; the guard must be among its first lines.
+    for v in "3 2" "4 0" "4 3" "4 4" "5 0" "5 3"; do
+      { echo "FAKE_VER=($v)"; sed 's/BASH_VERSINFO/FAKE_VER/g' "$f"; } >"$LANES_TEST_TMP/v"
+      run bash "$LANES_TEST_TMP/v" journal-dir </dev/null
+      case "$v" in
+        3* | "4 0" | "4 3")
+          assert_failure 2
+          assert_output --partial "requires Bash 4.4 or newer"
+          assert_output --partial "brew install bash"
+          ;;
+        *) refute_output --partial "requires Bash" ;;
+      esac
+    done
+    run grep -n 'BASH_VERSINFO' "$f"
+    assert_output --regexp '^[0-9]+:\[ "\$\(\(BASH_VERSINFO\[0\] \* 100 \+ BASH_VERSINFO\[1\]\)\)" -ge 404 \]'
+    [ "${lines[0]%%:*}" -le 6 ] || { echo "the guard of $f is on line ${lines[0]%%:*}" >&2; false; }
+  done
+  [ "$n" -ge 2 ]
+}
+
 @test "no lanes test starts a process group with a tool macOS lacks, so none skips there for want of it" {
   # The name is split so this line does not match itself.
   run grep -rnE '^[^#]*(^|[^[:alnum:]_])set''sid([^[:alnum:]_]|$)' "$BATS_TEST_DIRNAME"

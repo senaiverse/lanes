@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Every plugin bin/ script needs Bash 4+ (docs/CONVENTIONS.md) and must say so at once on an older Bash.
+# Every plugin bin/ script needs Bash 4+ (docs/CONVENTIONS.md; bin/lanes 4.4+) and must say so at once on an older Bash.
 # BASH_VERSINFO is read-only, so the test raises the script's minimum instead of faking the running version.
 
 load ../helpers/common
@@ -14,11 +14,11 @@ teardown() { lanes_test_teardown; }
   for f in "$ROOT"/plugins/*/bin/*; do
     [ -f "$f" ] || continue
     copy="$LANES_TEST_TMP/$(basename "$f")"
-    sed 's/-ge 4 \]/-ge 99 ]/' "$f" > "$copy"
-    cmp -s "$f" "$copy" && { echo "no 'BASH_VERSINFO[0] -ge 4' guard in $f" >&2; false; }
+    sed -e 's/-ge 4 \]/-ge 99 ]/' -e 's/-ge 404 \]/-ge 9999 ]/' "$f" > "$copy"
+    cmp -s "$f" "$copy" && { echo "no 'BASH_VERSINFO' guard ('-ge 4' or '-ge 404') in $f" >&2; false; }
     run bash "$copy"
     [ "$status" -eq 2 ] || { echo "$f exited $status, want 2" >&2; false; }
-    [[ "$output" == *"requires Bash 4 or newer"* && "$output" == *"brew install bash"* ]] || { echo "$f said: $output" >&2; false; }
+    [[ "$output" == *"requires Bash 4"*" or newer"* && "$output" == *"brew install bash"* ]] || { echo "$f said: $output" >&2; false; }
   done
 }
 
@@ -30,6 +30,6 @@ teardown() { lanes_test_teardown; }
     [ -f "$f" ] || continue
     run /bin/bash "$f"
     [ "$status" -eq 2 ] || { echo "$f exited $status under /bin/bash" >&2; false; }
-    [[ "$output" == *"requires Bash 4 or newer"* ]] || { echo "$f said: $output" >&2; false; }
+    [[ "$output" == *"requires Bash 4"*" or newer"* ]] || { echo "$f said: $output" >&2; false; }
   done
 }

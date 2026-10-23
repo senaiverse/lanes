@@ -33,7 +33,7 @@ Done when every lane has one item in flight and a tracker row that names it.
 At the start of each session, start every watcher the SessionStart context lists as down: CI, review score, lane
 context and journal drift, one endless Monitor each. Their commands are in [MONITORS.md](MONITORS.md).
 
-Run `lanes status` at each check. A row reads lane, role, pane, context, activity, goal, readiness and handshake:
+Run `lanes status` at each check; it lists your own project's lead and lanes only. A row reads lane, role, pane, context, activity, goal, readiness and handshake:
 
 ```text
 alpha	lane	%3	ctx 72% AT-THRESHOLD	idle	goal active	clear-ready	handshake ready
@@ -102,7 +102,8 @@ Done when the answer is recorded where the work reads it (plan, tracker or the j
 
 Away mode is RULES.md rule 11; only the human's own message lifts it.
 
-- When the human says they are going away, run `lanes away on` from your own pane. `lanes away status` shows who set
+- When the human says they are going away, run `lanes away on` from your own pane. It holds for your project only:
+  the ask tool is refused to you and your lanes, never to another project's sessions. `lanes away status` shows who set
   it and when.
 - While away, write each question into `morning.md` in its entry form, take the recommended option where the work can
   proceed safely and reversibly, and mark that choice in the entry. Keep work that needs the human blocked.

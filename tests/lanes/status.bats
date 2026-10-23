@@ -149,13 +149,47 @@ in_new_group() {
   assert_output "lanes alpha ctx 60% at threshold"
   run sl beta b1 60
   assert_output "lanes beta ctx 60%"
-  run bash -c "'$LANES' status --json | jq -c 'map([.lane, .threshold, .at_threshold])'"
-  assert_output '[["alpha",50,true],["beta",90,false]]'
-  run bash -c "'$LANES' status | grep '^alpha'"
+  run bash -c "cd '$LANES_TEST_TMP/A' && '$LANES' status --json | jq -c 'map([.lane, .threshold, .at_threshold])'"
+  assert_output '[["alpha",50,true]]'
+  run bash -c "cd '$LANES_TEST_TMP/B' && '$LANES' status --json | jq -c 'map([.lane, .threshold, .at_threshold])'"
+  assert_output '[["beta",90,false]]'
+  run bash -c "cd '$LANES_TEST_TMP/A' && '$LANES' status | grep '^alpha'"
   assert_output --partial "ctx 60% AT-THRESHOLD"
-  run bash -c "'$LANES' status | grep '^beta'"
+  run bash -c "cd '$LANES_TEST_TMP/B' && '$LANES' status | grep '^beta'"
   assert_output --partial "ctx 60%"
   refute_output --partial AT-THRESHOLD
+}
+
+# lead_and_lane <project dir> <lead> <lead pane> <lane>: a lead and a lane registered from that project.
+lead_and_lane() {
+  jq -nc --arg c "$1" --arg t "$2" '{session_id:("s-" + $t),session_title:$t,cwd:$c,source:"startup"}' |
+    TMUX_PANE="$3" LANES_ROLE=lead "$LANES" register >/dev/null 2>&1
+  jq -nc --arg c "$1" --arg t "$4" '{session_id:("s-" + $t),session_title:$t,cwd:$c,source:"startup"}' |
+    TMUX_PANE="%9${3#%}" "$LANES" register >/dev/null 2>&1
+}
+
+@test "status lists the caller's project only: each lead sees its own lead and lanes, whatever directory it runs in" {
+  for p in A B; do
+    git init -q -b main "$LANES_TEST_TMP/$p"
+    git -C "$LANES_TEST_TMP/$p" commit -q --allow-empty -m init
+  done
+  git -C "$LANES_TEST_TMP/A" worktree add -q -b wt "$LANES_TEST_TMP/A-wt"
+  lead_and_lane "$LANES_TEST_TMP/A" leadA %1 alphaA
+  lead_and_lane "$LANES_TEST_TMP/B" leadB %2 betaB
+  # The lead's project is its registered one, even from the other project's directory.
+  run bash -c "cd '$LANES_TEST_TMP/B' && TMUX_PANE=%1 '$LANES' status --json | jq -c 'map(.lane) | sort'"
+  assert_output '["alphaA","leadA"]'
+  run bash -c "cd '$LANES_TEST_TMP/A' && TMUX_PANE=%2 '$LANES' status --json | jq -c 'map(.lane) | sort'"
+  assert_output '["betaB","leadB"]'
+  run bash -c "cd '$LANES_TEST_TMP/A' && TMUX_PANE=%2 '$LANES' status"
+  refute_output --partial alphaA
+  refute_output --partial leadA
+  # Outside a registered pane the project is the directory's; a worktree is its repository's project.
+  run bash -c "cd '$LANES_TEST_TMP/A-wt' && '$LANES' status --json | jq -c 'map(.lane) | sort'"
+  assert_output '["alphaA","leadA"]'
+  mkdir -p "$LANES_TEST_TMP/C"
+  run bash -c "cd '$LANES_TEST_TMP/C' && '$LANES' status"
+  assert_output --partial "no lanes registered for $LANES_TEST_TMP/C"
 }
 
 @test "each timing and chunk variable, not a plain number in its range, is refused before the command reads it" {
@@ -192,10 +226,31 @@ in_new_group() {
   [ "$(cat "$LANES_DATA_DIR/lanes/state/alpha.json")" = "$before" ]
 }
 
+# tmux_v <tmux -V output>: tmux_check against that version line; prints ok or the refusal.
+tmux_v() { bash -c 'source "$1"; V="$2"; tm() { echo "$V"; }; tmux_check && echo ok' _ "$LANES" "$1" 2>&1; }
+
+@test "tmux openbsd-X.Y is an OpenBSD release: 6.6 (its tmux has 3.0's features) or newer passes, older is refused" {
+  for v in "tmux openbsd-6.6" "tmux openbsd-6.10" "tmux openbsd-7.6" "tmux openbsd-10.0"; do
+    run tmux_v "$v"
+    assert_output ok
+  done
+  for v in "tmux openbsd-6.5" "tmux openbsd-5.9" "tmux openbsd-6.0"; do
+    run tmux_v "$v"
+    assert_failure 2
+    assert_output --partial "$v is the tmux of OpenBSD"
+    assert_output --partial "older than the tmux 3.0 of OpenBSD 6.6"
+  done
+  for v in "tmux openbsd-x.y" "tmux openbsd-6" "tmux foo-3.4"; do
+    run tmux_v "$v"
+    assert_failure 2
+    assert_output --partial "not a tmux version"
+  done
+}
+
 @test "empty journal and empty registry: status says how to start a lane" {
   run "$LANES" status
   assert_success
-  assert_output --partial "no lanes registered"
+  assert_output --partial "no lanes registered for $WORK"
   run bash -c "'$LANES' status --json"
   assert_output "[]"
 }
@@ -225,6 +280,24 @@ in_new_group() {
   assert_success
   run state alpha .prompts
   assert_output 0
+}
+
+@test "after /rename, to a free name or to another lane's, the session's prompts and context % still record under its lane" {
+  register_lane alpha s1 %7 >/dev/null
+  register_lane beta s2 %8 >/dev/null
+  for title in renamed beta; do
+    jq -nc --arg t "$title" '{session_id:"s1",session_title:$t,prompt:"hi"}' | "$LANES" hook prompt
+  done
+  run state alpha .prompts
+  assert_output 2
+  run state beta .prompts
+  assert_output 0
+  run sl renamed s1 44
+  assert_output "lanes alpha ctx 44%"
+  run reg alpha .used_pct
+  assert_output 44
+  run reg beta .used_pct
+  assert_output null
 }
 
 @test "lead_times_out_when_lane_never_answers: an old request shows as timed out" {

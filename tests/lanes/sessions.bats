@@ -121,15 +121,19 @@ start_odd() {
 
 @test "proc_start elsewhere is 'LC_ALL=C TZ=UTC ps -o lstart=' trimmed, and a gone process gives nothing" {
   start_odd
-  want="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$ODD" | sed 's/^ *//; s/ *$//')"
-  run bash -c 'source "$1"; OS_NAME=Darwin; proc_start "$2"' _ "$LANES" "$ODD"
+  # The value comes from darwin_ps (a stable lstart on Linux); the real ps output only shows the format it copies.
+  want="$(LC_ALL=C TZ=UTC darwin_ps -o stat= -o lstart= -p "$ODD" | sed 's/^[^ ]* *//; s/ *$//')"
+  real="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$ODD" | sed 's/^ *//; s/ *$//')"
+  run bash -c 'source "$1"; eval "$3"; proc_start "$2"' _ "$LANES" "$ODD" "$DARWIN"
   kill "$ODD"
   wait "$ODD" 2>/dev/null || true
   assert_output "$want"
-  [[ "$want" =~ ^[A-Z][a-z]{2}\ [A-Z][a-z]{2}\ +[0-9]+\ [0-9:]{8}\ [0-9]{4}$ ]]
+  for v in "$want" "$real"; do
+    [[ "$v" =~ ^[A-Z][a-z]{2}\ [A-Z][a-z]{2}\ +[0-9]+\ [0-9:]{8}\ [0-9]{4}$ ]]
+  done
   run bash -c 'source "$1"; proc_start "$2" || echo gone' _ "$LANES" "$ODD"
   assert_output gone
-  run bash -c 'source "$1"; OS_NAME=Darwin; proc_start "$2" || echo gone' _ "$LANES" "$ODD"
+  run bash -c 'source "$1"; eval "$3"; proc_start "$2" || echo gone' _ "$LANES" "$ODD" "$DARWIN"
   assert_output gone
 }
 
@@ -137,7 +141,7 @@ start_odd() {
   zombie_child
   run bash -c 'source "$1"; proc_start "$2" || echo gone' _ "$LANES" "$ZPID"
   linux="$output"
-  run bash -c 'source "$1"; OS_NAME=Darwin; proc_start "$2" || echo gone' _ "$LANES" "$ZPID"
+  run bash -c 'source "$1"; eval "$3"; proc_start "$2" || echo gone' _ "$LANES" "$ZPID" "$DARWIN"
   kill "$ZPARENT"
   wait "$ZPARENT" 2>/dev/null || true
   assert_equal "$linux" gone
@@ -212,4 +216,58 @@ unknown"
   jq -nc '{type: "user", message: {content: "the \"goal_status\" entry, met:true"}}' >>"$LANES_TEST_TMP/t.jsonl"
   run bash -c 'source "$1"; goal_state "$2"' _ "$LANES" "$LANES_TEST_TMP/t.jsonl"
   assert_output active
+}
+
+# locks <script>: run the script with bin/lanes sourced and the start time read in its non-Linux form through darwin_ps
+# (helper.bash), where a test makes ps slow or failing by defining its own ps function. $S in the script is the data
+# dir's state folder.
+locks() { bash -c 'source "$1"; eval "$4"; S="$2"; mkdir -p "$S"; eval "$3"' _ "$LANES" "$LANES_DATA_DIR/lanes/state" "$1" "$DARWIN"; }
+# state_of <target> [script]: holder_state's exit status for the target, after the script.
+state_of() { locks "${2:-:}; rc=0; holder_state '$1' || rc=\$?; echo \$rc"; }
+
+@test "lock_tag fails and prints nothing when the start time or its checksum cannot be read, never '<pid>.'" {
+  run locks 'cksum() { return 1; }; lock_tag $$ || echo failed'
+  assert_output failed
+  run locks 'ps() { return 1; }; lock_tag $$ || echo failed'
+  assert_output failed
+  run locks 'lock_tag $$'
+  assert_output --regexp '^[0-9]+\.[0-9]+$'
+}
+
+@test "a lock holder is dead only on proof: a failed ps or cksum for a live pid is unknown, and the lock is not broken" {
+  sleep 30 &
+  live=$!
+  tag="$(locks "lock_tag $live")"
+  run state_of "$tag"
+  assert_output 0
+  run state_of "$tag" "ps() { return 1; }"
+  assert_output 2
+  run state_of "$tag" "cksum() { return 1; }"
+  assert_output 2
+  # Under a failing ps the held lock is waited for and left as it is.
+  run locks "ln -s '$tag' \"\$S/x.lnk\"; ps() { return 1; }; lock_take \"\$S/x.lnk\" 0 \$\$ || echo refused; readlink \"\$S/x.lnk\""
+  assert_output "refused
+$tag"
+  # Proof of death still breaks it: a start time that differs, and a pid that no longer runs.
+  run state_of "$live.1"
+  assert_output 1
+  kill "$live"
+  wait "$live" 2>/dev/null || true
+  run state_of "$tag"
+  assert_output 1
+  run locks "ln -sf '$tag' \"\$S/x.lnk\"; lock_take \"\$S/x.lnk\" 0 \$\$ && echo taken"
+  assert_output taken
+}
+
+@test "the acquire is bounded by elapsed time, not attempts: a slow ps (macOS) with a live holder and marker ends within the wait" {
+  sleep 30 &
+  live=$!
+  run locks "
+    ps() { sleep 0.4; darwin_ps \"\$@\"; }
+    tag=\"\$(lock_tag $live)\"
+    ln -s \"\$tag\" \"\$S/m.lnk\"; ln -s \"\$tag\" \"\$S/m.lnk.break\"
+    SECONDS=0
+    lock_take \"\$S/m.lnk\" 2 \$\$ || echo \"locked after \$SECONDS s\""
+  kill "$live"
+  assert_output --regexp '^locked after [0-3] s$'
 }

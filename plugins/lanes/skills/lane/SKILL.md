@@ -33,7 +33,7 @@ Done when the RESUME block would let a fresh session continue without asking any
 The block sits between the `lanes:resume` markers and has six sections: **Goal** (one line), **Now**, **Next step**,
 **Links**, **Running**, **Suggested skills**. The block rules are RULES.md rule 3; `lanes clear-ready` enforces them.
 The sample is `${CLAUDE_PLUGIN_ROOT}/templates/journal/next-lane.md`. Under Running, name every job still going outside
-this session and where its result lands (a background shell of the session itself stops before clear-ready, §5).
+this session and where its result lands (the session's own background work ends before clear-ready, §5).
 
 Done when `lanes clear-ready` would accept it (run it to check; it changes nothing when it refuses).
 
@@ -51,12 +51,14 @@ Done when the entry is pushed and the lead has your message.
 When the lead asks (or your own context reaches the threshold and you tell the lead):
 
 1. Finish or commit the change in hand.
-2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request, or last committed
-   before it, is refused, in whichever work tree you now work.
+2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request, or the same as in
+   the file's last commit before the request, is refused, in whichever work tree you now work; a change elsewhere in
+   the file (Open items) does not count.
 3. Commit and push your branch and your own journal files (`next-<lane>.md`, `done-<lane>.md`).
-4. Stop or finish every background shell of this session first: `lanes clear` refuses a lane with one running, since
-   it would outlive the clear unseen. Jobs that run outside the session (CI, a tmux job) go under Running, with where
-   their results land.
+4. Stop or finish every background shell and Monitor of this session, and let every background subagent finish:
+   `lanes clear` refuses while one runs (a shell or Monitor shows as `shell` and outlives `/clear`; a running subagent
+   keeps the session `busy`, and `/clear` does not stop it). Jobs that run outside the session (CI, a tmux job) go
+   under Running, with where their results land.
 5. Leave an active `/goal` alone. You cannot clear it; the `/clear` that `lanes clear` types removes it, and
    `lanes clear` then sets your RESUME Goal.
 6. Run `lanes clear-ready` from the work tree you work in. If it refuses, fix the cause it names and run it again.

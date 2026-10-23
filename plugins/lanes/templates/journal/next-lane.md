@@ -23,7 +23,7 @@ skill, MIT: https://github.com/mattpocock/skills
 
 ### Running
 <!-- Jobs outside this session still going (CI runs, tmux jobs), with where their results land. "Nothing" if none.
-     Stop or finish this session's own background shells before clear-ready: lanes clear refuses while one runs. -->
+     This session's own background shells, Monitors and subagents end before clear-ready (lane skill §5). -->
 
 ### Suggested skills
 <!-- The skills to load first after the clear, for example: lane -->

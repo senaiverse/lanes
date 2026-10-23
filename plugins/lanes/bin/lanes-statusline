@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
+# Bash 4.4 or newer, the floor of bin/lanes, which this script runs.
+[ "$((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))" -ge 404 ] || { echo "${0##*/}: requires Bash 4.4 or newer, not ${BASH_VERSION}: on macOS run 'brew install bash'" >&2; exit 2; }
 # lanes-statusline: the command a user's statusLine setting runs, through the stable link that the SessionStart hook
 # keeps under the lanes data dir. It follows the link to the installed plugin and runs `lanes statusline`.
 # A status line must always print, so a broken link prints a short line instead of failing.

@@ -27,6 +27,10 @@ setup() {
   REMOTE="$LANES_TEST_TMP/remote.git"
   FAKE_LOG="$LANES_TEST_TMP/fake.log"
   : >"$FAKE_LOG"
+  # Every test starts in the project its lanes register from (hook_json's cwd), since lanes acts on the caller's
+  # project only; make_repo turns this folder into the repository.
+  mkdir -p "$WORK"
+  cd "$WORK" || return 1
 }
 
 teardown() {
@@ -165,6 +169,27 @@ wait_for() {
   echo "timed out waiting for $what" >&2
   return 1
 }
+
+# darwin_ps <ps args...>: the ps behind bin/lanes' non-Linux start time read, for a test that runs that form. On a
+# Linux host it answers `-o stat= -o lstart= -p <pid>` from /proc/<pid>/stat (state; start ticks over a fixed boot
+# time), since procps prints /proc/stat btime plus ticks and btime moves when the clock is stepped, while macOS ps prints
+# the kernel's p_starttime. Any other call, or a non-Linux host, runs the real ps.
+darwin_ps() {
+  local s hz
+  local -a f
+  if [[ "$(uname -s)" != Linux || "$*" != "-o stat= -o lstart= -p "* ]]; then
+    command ps "$@"
+    return
+  fi
+  { IFS= read -r s <"/proc/${!#}/stat"; } 2>/dev/null || return 1
+  read -ra f <<<"${s##*) }"
+  hz="$(getconf CLK_TCK)"
+  printf '%s %s\n' "${f[0]}" "$(LC_ALL=C date -u -d "@$((1700000000 + f[19] / hz))" '+%a %b %e %H:%M:%S %Y')"
+}
+
+# DARWIN: the lines that put a sourced bin/lanes into its non-Linux form, with darwin_ps as its ps.
+# shellcheck disable=SC2034 # used by the suites that load this helper
+DARWIN="$(declare -f darwin_ps); ps() { darwin_ps \"\$@\"; }; OS_NAME=Darwin"
 
 # lock_tag_of <pid>: the lock target that names <pid> as a live holder, built by the lanes function itself.
 lock_tag_of() { bash -c 'source "$1"; lock_tag "$2"' _ "$LANES" "$1"; }

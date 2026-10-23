@@ -351,7 +351,8 @@ SUBMIT /clear"
   ready_lane alpha
   lanes_tmux send-keys -t "$PANE" -l -- "/clear"
   lanes_tmux send-keys -t "$PANE" Enter
-  wait_for "new session recorded" bash -c "[ \"\$(jq -r .session_id '$LANES_DATA_DIR/lanes/state/alpha.json')\" != \"\$(jq -r .handshake.session_id '$LANES_DATA_DIR/lanes/state/alpha.json')\" ]"
+  # start_source is register's last state write, so mark_sending cannot race it.
+  wait_for "new session recorded" bash -c "[ \"\$(jq -r .start_source '$LANES_DATA_DIR/lanes/state/alpha.json')\" = clear ]"
   mark_sending
   run as_lead clear alpha
   assert_success
@@ -371,11 +372,70 @@ SUBMIT /clear"
   assert_output 1
 }
 
-@test "the lead never clears its own pane" {
+@test "the lead never clears itself: it is a lead, and a lead never acts on a lead" {
   ready_lane alpha
   run as_lead clear lead
   assert_failure
-  assert_output --partial "never clears itself"
+  assert_output --partial "lane lead is a lead"
+}
+
+# project_b_lane <lane>: a live, clear-ready lane in a second project (its own repository and remote). WORK and the
+# current directory are project A's again afterwards.
+project_b_lane() {
+  local a="$WORK" r="$REMOTE"
+  WORK="$LANES_TEST_TMP/workB" REMOTE="$LANES_TEST_TMP/remoteB.git"
+  make_repo
+  write_resume "$1"
+  start_fake "$1"
+  "$LANES" clear-ready --lane "$1" >/dev/null
+  WORK="$a" REMOTE="$r"
+  cd "$WORK" || return 1
+}
+
+# refused_untouched_at <lane> <message part>: request, clear and goal at <lane> from the lead are each refused with the
+# message, and the lane's state file and registry entry are as before.
+refused_untouched_at() {
+  local before_s before_r
+  before_s="$(cat "$LANES_DATA_DIR/lanes/state/$1.json" 2>/dev/null || true)"
+  before_r="$(cat "$LANES_DATA_DIR/lanes/$1.json")"
+  run as_lead request "$1"
+  assert_failure
+  assert_output --partial "$2"
+  run as_lead clear "$1"
+  assert_failure
+  assert_output --partial "$2"
+  run as_lead goal "$1" "take over this lane"
+  assert_failure
+  assert_output --partial "$2"
+  assert [ "$(cat "$LANES_DATA_DIR/lanes/state/$1.json" 2>/dev/null || true)" = "$before_s" ]
+  assert [ "$(cat "$LANES_DATA_DIR/lanes/$1.json")" = "$before_r" ]
+  assert [ ! -e "$LANES_DATA_DIR/lanes/state/$1.clear.lnk" ]
+}
+
+@test "a lead acts only on lanes of its own project: request, clear and goal at another project's lane write and type nothing" {
+  make_repo
+  project_b_lane betab
+  register_lead
+  refused_untouched_at betab "not the project of this lead"
+  run reg betab .clear_ready
+  assert_output true
+  run keys_sent
+  assert_output 0
+}
+
+@test "a lead never acts on another lead, of its own project or another: request, clear and goal write and type nothing" {
+  make_repo
+  start_fake lead2 LANES_ROLE=lead
+  mkdir -p "$LANES_TEST_TMP/workB"
+  jq -nc --arg c "$LANES_TEST_TMP/workB" '{session_id:"sB",session_title:"leadb",cwd:$c,source:"startup"}' |
+    LANES_ROLE=lead TMUX_PANE=%97 "$LANES" register >/dev/null 2>&1
+  register_lead
+  run reg lead2 .role
+  assert_output lead
+  refused_untouched_at lead2 "lane lead2 is a lead"
+  refused_untouched_at leadb "lane leadb is a lead"
+  run keys_sent
+  assert_output 0
 }
 
 @test "lanes clear from a caller that is not the lead is refused and types nothing" {
@@ -736,5 +796,109 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
   assert_output --partial "stopped while typing into $PANE: our typed text was deleted"
   wait_for "typed /clear deleted" bash -c "! tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q $'^❯ /clear'"
   run submitted /clear
+  assert_output 0
+}
+
+# The transcript entry 2.1.309 writes for a message another Claude session sends: meta, origin peer, string content.
+PEER_ENTRY='{"type":"user","isMeta":true,"origin":{"kind":"peer"},"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from=\"lead\">start on B2</cross-session-message>"}}'
+
+# use_after_clear <n> <prompt|message>: a tmux shim that, at the n-th screen read once the registry names a session
+# other than the one in $LANES_TEST_TMP/old-sid (the waits after /clear, then the check before typing), uses that new
+# session: a human prompt through its UserPromptSubmit, or a cross-session message written to its transcript alone.
+use_after_clear() {
+  mkdir -p "$LANES_TEST_TMP/shim"
+  echo "$1" >"$LANES_TEST_TMP/use-count"
+  printf '%s\n' "$PEER_ENTRY" >"$LANES_TEST_TMP/peer.json"
+  cat >"$LANES_TEST_TMP/shim/tmux" <<EOS
+#!/usr/bin/env bash
+"$(command -v tmux)" "\$@"
+rc=\$?
+sid="\$(jq -r .session_id "$LANES_DATA_DIR/lanes/alpha.json")"
+if [[ " \$* " == *" capture-pane "* && -f "$LANES_TEST_TMP/use-count" && "\$sid" != "\$(cat "$LANES_TEST_TMP/old-sid")" ]]; then
+  n=\$((\$(cat "$LANES_TEST_TMP/use-count") - 1))
+  if ((n > 0)); then echo "\$n" >"$LANES_TEST_TMP/use-count"; else
+    rm -f "$LANES_TEST_TMP/use-count"
+    if [[ "$2" == prompt ]]; then
+      jq -nc --arg s "\$sid" '{session_id:\$s,session_title:"alpha",prompt:"a human prompt"}' | "$LANES" hook prompt
+    else
+      cat "$LANES_TEST_TMP/peer.json" >>"\$(jq -r .transcript "$LANES_DATA_DIR/lanes/state/alpha.json")"
+    fi
+    : >"$LANES_TEST_TMP/used"
+  fi
+fi
+exit \$rc
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+# goal_refused_after_use <n> <prompt|message> <message part>: lanes clear on a ready lane, with the new session used at
+# the n-th screen read after /clear; the goal is never typed and the record stays cleared.
+goal_refused_after_use() {
+  ready_lane alpha
+  reg alpha .session_id >"$LANES_TEST_TMP/old-sid"
+  use_after_clear "$1" "$2"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "$3"
+  assert_output --partial "lanes goal alpha"
+  assert [ -f "$LANES_TEST_TMP/used" ]
+  run submitted /clear
+  assert_output 1
+  run submitted "/goal"
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output cleared
+}
+
+@test "the goal goes only into an unused session: a human prompt while clear waits for the new input line gets no goal" {
+  goal_refused_after_use 1 prompt "already took 1 prompt"
+}
+
+@test "the goal goes only into an unused session: a cross-session message at the end of the wait for idle gets no goal" {
+  goal_refused_after_use 2 message "already began 1 turn"
+}
+
+@test "the goal goes only into an unused session: a prompt at the last screen read before typing gets no goal" {
+  goal_refused_after_use 3 prompt "already took 1 prompt"
+}
+
+@test "/clear's own transcript entries (its caveat and the command) are not use: the goal is typed" {
+  ready_lane alpha
+  run as_lead clear alpha
+  assert_success
+  run grep -c 'command-name>/clear' "$(state alpha .transcript)"
+  assert_output 1
+  run submitted "/goal finish item A1"
+  assert_output 1
+}
+
+# resume_cleared: /clear typed by hand and the lead killed after it recorded sending, so a rerun resumes at cleared.
+resume_cleared() {
+  ready_lane alpha
+  reg alpha .session_id >"$LANES_TEST_TMP/old-sid"
+  lanes_tmux send-keys -t "$PANE" -l -- "/clear"
+  lanes_tmux send-keys -t "$PANE" Enter
+  # start_source is register's last state write, so mark_sending cannot race it.
+  wait_for "new session recorded" bash -c "[ \"\$(jq -r .start_source '$LANES_DATA_DIR/lanes/state/alpha.json')\" = clear ]"
+  mark_sending
+}
+
+@test "a resumed clear checks again after its waits: a human prompt during the wait for the input line gets no goal" {
+  resume_cleared
+  use_after_clear 1 prompt
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "already took 1 prompt"
+  run submitted "/goal"
+  assert_output 0
+}
+
+@test "a resumed clear checks again after its waits: a cross-session message during the wait for idle gets no goal" {
+  resume_cleared
+  use_after_clear 2 message
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "already began 1 turn"
+  run submitted "/goal"
   assert_output 0
 }

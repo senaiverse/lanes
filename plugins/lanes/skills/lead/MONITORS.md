@@ -13,10 +13,13 @@ job.
   items whose state changed and keeps the last set under the lanes data dir
   (`monitors/<project checksum>/<name>.state`).
 - **One instance per name and project:** the loop starts with `lanes monitor-lock <name> $$`, which refuses a second
-  start while the first is alive and reclaims the name from a dead one. The project is the repository the loop runs
-  in (all its worktrees are one), so start each watcher from inside the repository; two projects each run their own.
-- **Back off, never die:** when `gh` fails, skip the diff for that pass (a partial set would report items as gone),
-  print one line, double the wait up to 10 minutes, and keep looping.
+  start while the first is alive and reclaims the name from a dead one. The project is the lead's own, the repository
+  it registered from (all its worktrees are one), whatever directory the loop runs in; outside a registered pane it is
+  the repository the loop runs in. Two projects each run their own.
+- **Back off, never die:** when any command a pass reads fails (`gh`, `lanes`), the pass fails and the loop skips the
+  diff for it (a partial or empty set would report items as gone), prints one line, doubles the wait up to 10 minutes,
+  and keeps looping. So a pass keeps each command's output and checks its exit status before it reads it; a pipe
+  would hide the failure.
 - **Start:** at the start of each lead session. The SessionStart context lists every watcher that is down (all four on
   a fresh install); start those. Starting one that is already running is harmless: it prints a refusal and exits.
 - **Stop:** stop the Monitor when the human ends the session. Nothing else stops a watcher.
@@ -38,7 +41,7 @@ while :; do
     printf '%s\n' "$out" | lanes monitor-diff "$name"
     wait_s=$every failing=0
   else
-    ((failing)) || echo "$name: gh failed; retrying with back-off"
+    ((failing)) || echo "$name: pass failed; retrying with back-off"
     failing=1 wait_s=$((wait_s * 2 > 600 ? 600 : wait_s * 2))
   fi
   sleep "$wait_s"
@@ -77,9 +80,13 @@ score; read the bot's comment on the PR, then route its findings.
 ## 3. Lane context levels (name `context`, every 30 s)
 
 ```bash
-pass() { lanes status --json | jq -r '.[] | select(.error == null) | "\(.lane)\t\(
-  if .at_threshold then "at threshold" elif .ctx != "fresh" then "context \(.ctx)" else "below threshold" end)"'; }
+pass() { local s
+  s="$(lanes status --json)" || return 1
+  jq -r '.[] | select(.error == null) | "\(.lane)\t\(
+    if .at_threshold then "at threshold" elif .ctx != "fresh" then "context \(.ctx)" else "below threshold" end)"' <<<"$s"; }
 ```
+
+`lanes status` lists the lanes of your own project only, so the watcher sees no other project's lanes.
 
 On `alpha: below threshold -> at threshold`, run `lanes request alpha` and send the message it prints (lead skill,
 step 4). On `context unknown` or `context stale`, ask the lane; never treat it as safe.
@@ -90,9 +97,10 @@ Each in-flight row in `tracker.md` and `next-<lane>.md` names its PR as `#<n>`. 
 name, in the journal folder `lanes journal-dir` prints (it follows the `journal_dir` option):
 
 ```bash
-pass() { local n j
-  j="$(lanes journal-dir)"
-  for n in $(cat "$j/tracker.md" "$j"/next-*.md | grep -oE '#[0-9]+' | tr -d '#' | sort -un); do
+pass() { local n j f text
+  j="$(lanes journal-dir)" && text="$(cat "$j/tracker.md")" || return 1
+  for f in "$j"/next-*.md; do [[ -e "$f" ]] || continue; text+=$'\n'"$(cat "$f")" || return 1; done
+  for n in $(grep -oE '#[0-9]+' <<<"$text" | tr -d '#' | sort -un); do
     gh pr view "$n" --json state,headRefOid,statusCheckRollup --jq '"#'"$n"'\t\(.state) \(.headRefOid[0:7]) \(
       [.statusCheckRollup[] | (.conclusion // .state // "") | ascii_downcase | select(. != "")] | unique | join(","))"' ||
       printf '#%s\tunreadable\n' "$n"

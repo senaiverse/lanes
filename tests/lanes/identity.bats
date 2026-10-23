@@ -24,6 +24,49 @@ refused_untouched() { # refused_untouched <message part>
   assert_success
 }
 
+# stopped_in_foreground <signal>: Claude Code stopped by <signal> while its process group is still the terminal's
+# foreground group, so only its process state (T) shows that it reads no keys; lanes clear must refuse it.
+stopped_in_foreground() {
+  kill "-$1" "$FAKE_PID"
+  wait_for "stopped" bash -c "ps -o stat= -p $FAKE_PID | grep -q '^ *T'"
+  read -r pg tpg <<<"$(ps -o pgid= -o tpgid= -p "$FAKE_PID")"
+  [ "$pg" = "$tpg" ]
+  run as_lead clear alpha --wait 2
+  kill -CONT "$FAKE_PID"
+  assert_failure
+  assert_output --partial "Claude Code pid $FAKE_PID of lane alpha is not the foreground program of pane $PANE"
+  assert_output --partial "state 'T"
+  run reg alpha .clear_ready
+  assert_output true
+  sleep 0.5
+  refute pane_has '/clear'
+  run keys_typed
+  assert_output 0
+}
+
+# start_wrapped_fake: the pane runs a bash that waits on the fake as its child, in the same process group, as node
+# cli-wrapper.cjs does with the native binary. Sets PANE and FAKE_PID (the child).
+start_wrapped_fake() {
+  lanes_tmux new-session -d -s alpha -x 160 -y 40 -c "$WORK" \
+    env LANES_DATA_DIR="$LANES_DATA_DIR" LANES_TMUX_SOCKET="$LANES_TMUX_SOCKET" LANES_BIN="$LANES" \
+    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" FAKE_LANE=alpha FAKE_LOG="$FAKE_LOG" \
+    bash -c 'bash "$0"; exit $?' "$FAKE"
+  PANE="$(lanes_tmux display -p -t alpha '#{pane_id}')"
+  wait_for "registered alpha" test -f "$LANES_DATA_DIR/lanes/alpha.json"
+  wait_for "prompt drawn" pane_has '❯'
+  FAKE_PID="$(reg alpha .claude_pid)"
+}
+
+# A pane's own process cannot stay stopped: tmux sends it SIGCONT after a SIGSTOP (server.c, server_child_stopped),
+# and the kernel discards SIGTSTP, SIGTTIN and SIGTTOU in its orphaned process group. A wrapped child can.
+@test "Claude Code under the npm wrapper, stopped by SIGSTOP (its group still the terminal's), is not proven: nothing is typed" {
+  make_repo
+  write_resume alpha
+  start_wrapped_fake
+  "$LANES" clear-ready --lane alpha >/dev/null
+  stopped_in_foreground STOP
+}
+
 @test "no sessions file at the registered pid: refused" {
   ready_lane alpha
   rm "$(session_file)"
@@ -74,15 +117,7 @@ refused_untouched() { # refused_untouched <message part>
 @test "Claude Code as a child of the pane's process (the npm node wrapper) is proven, and its clear lands" {
   make_repo
   write_resume alpha
-  # The pane runs a bash that waits on the fake as its child, as node cli-wrapper.cjs does with the native binary.
-  lanes_tmux new-session -d -s alpha -x 160 -y 40 -c "$WORK" \
-    env LANES_DATA_DIR="$LANES_DATA_DIR" LANES_TMUX_SOCKET="$LANES_TMUX_SOCKET" LANES_BIN="$LANES" \
-    CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" FAKE_LANE=alpha FAKE_LOG="$FAKE_LOG" \
-    bash -c 'bash "$0"; exit $?' "$FAKE"
-  PANE="$(lanes_tmux display -p -t alpha '#{pane_id}')"
-  wait_for "registered alpha" test -f "$LANES_DATA_DIR/lanes/alpha.json"
-  wait_for "prompt drawn" pane_has '❯'
-  FAKE_PID="$(reg alpha .claude_pid)"
+  start_wrapped_fake
   [ "$FAKE_PID" != "$(lanes_tmux display -p -t alpha '#{pane_pid}')" ]
   run "$LANES" clear-ready --lane alpha
   assert_success

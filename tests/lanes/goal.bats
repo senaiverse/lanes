@@ -361,3 +361,20 @@ composer_squashed() {
   run grep -c '^SUBMIT' "$FAKE_LOG"
   assert_output 0
 }
+
+@test "a line that keeps showing more of our text than is left (a human retyping our next characters) stops the deletion" {
+  goal_setup
+  long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
+  long="${long%; }"
+  typed="/goal $long"
+  # After the first burst of 64 Backspaces the human types back five of the characters it deleted.
+  shim_hold_after_chunk "${typed:192:5}"
+  kill_goal_after_first_chunk "$long"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"kept showing more of it than was left"* ]]
+  run composer_squashed
+  kept="${typed:0:197}"
+  assert_output "${kept// /}"
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
+}

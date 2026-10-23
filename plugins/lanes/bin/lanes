@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # jq programs are single-quoted on purpose: their $names are jq variables, not shell ones.
 # shellcheck disable=SC2016
-[ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
+# Bash 4.4 or newer: before 4.4, "${a[*]}" of an empty array fails under set -u.
+[ "$((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))" -ge 404 ] || { echo "${0##*/}: requires Bash 4.4 or newer, not ${BASH_VERSION}: on macOS run 'brew install bash'" >&2; exit 2; }
 # lanes: the session registry, the journal and the clear handshake for one lead session and its lane sessions in tmux.
 #   lanes init [--claude-md yes|no] [lane...]   write the journal template into the journal dir (never overwrites)
 #   lanes status [--json]                        every lane: pane, context %, activity, goal, clear-ready, handshake
@@ -9,7 +10,7 @@
 #   lanes clear-ready [--lane <lane>]            lane, from its work tree: refuse unless clean, pushed, RESUME valid
 #   lanes clear <lane> [--wait <seconds>]        lead: refuse unless ready, idle and unchanged; send /clear and /goal
 #   lanes goal <lane> <text> [--wait <seconds>]  lead: set or replace a lane's /goal through the same checks
-#   lanes away on|off|status                     away mode: the ask tool is refused, questions go to morning.md
+#   lanes away on|off|status                     away mode for this project: its sessions' ask tool is refused
 #   lanes journal-dir                            the journal folder for this work tree (absolute path)
 #   lanes monitor-lock <name> <pid>            a watcher loop claims its name (skills/lead/MONITORS.md)
 #   lanes monitor-diff <name>                    print the items of stdin whose state changed since the last pass
@@ -108,13 +109,19 @@ tm() {
 }
 
 # tmux_check: the commands that type need tmux 3.0 or newer, since send_literal sends `;` with send-keys -H, which 3.0
-# added (tmux CHANGES "FROM 2.9 TO 3.0"). -V prints "tmux <version>", "tmux next-<version>" or "tmux master" (a build
-# from git); anything else is refused, never guessed.
+# added (tmux CHANGES "FROM 2.9 TO 3.0"). -V prints "tmux <version>", "tmux next-<version>", "tmux master" (a build
+# from git) or, in OpenBSD base, "tmux openbsd-<OpenBSD release>": 6.6 is the first with 3.0's features (its
+# ANNOUNCEMENT lists display-menu, which CHANGES puts in 3.0). Anything else is refused, never guessed.
 tmux_check() {
   local v
   v="$(tm -V 2>/dev/null || true)"
   [[ "$v" == "tmux master" ]] && return 0
-  [[ "$v" =~ ^tmux\ ([a-z]+-)?([0-9]+)\.([0-9]+) ]] ||
+  if [[ "$v" =~ ^tmux\ openbsd-([0-9]+)\.([0-9]+)$ ]]; then
+    ((BASH_REMATCH[1] * 100 + BASH_REMATCH[2] >= 606)) ||
+      die "$v is the tmux of OpenBSD ${BASH_REMATCH[1]}.${BASH_REMATCH[2]}, older than the tmux 3.0 of OpenBSD 6.6, which lanes clear and lanes goal need (send-keys -H)" "upgrade OpenBSD or install tmux 3.0 or newer; nothing was typed" 2
+    return 0
+  fi
+  [[ "$v" =~ ^tmux\ (next-)?([0-9]+)\.([0-9]+) ]] ||
     die "tmux -V printed '$v', not a tmux version" "lanes clear and lanes goal need tmux 3.0 or newer on PATH" 2
   ((BASH_REMATCH[2] >= 3)) ||
     die "$v is older than 3.0, which lanes clear and lanes goal need (send-keys -H)" "install tmux 3.0 or newer; nothing was typed" 2
@@ -132,30 +139,48 @@ plugin_root() {
 
 # ---- locks: a symlink whose target "<pid>.<start tag>" names its holder ------------------------------------------
 
-# lock_tag <pid>: the one name of a lock holder, "<pid>.<checksum of its start time (proc_start)>"; fails for a pid
-# that does not run or is a zombie. A reused pid gets another tag.
+# lock_tag <pid>: the one name of a lock holder, "<pid>.<checksum of its start time (proc_start)>"; fails, printing
+# nothing, for a pid that does not run, a zombie, or a start time or checksum that cannot be read. A reused pid gets
+# another tag.
 lock_tag() {
-  local s
-  s="$(proc_start "$1")" || return 1
-  printf '%s.%s' "$1" "$(hash_of "$s")"
+  local h
+  proc_start_get "$1" || return 1
+  h="$(hash_of "$PS_VALUE")" && [[ "$h" =~ ^[0-9]+$ ]] || return 1
+  printf '%s.%s' "$1" "$h"
 }
 
-# holder_live <target>: the one liveness rule for every lock: the holder a target names runs, as the same process.
-holder_live() { [[ "${1%%.*}" =~ ^[0-9]+$ && "$1" == "$(lock_tag "${1%%.*}" || true)" ]]; }
+# holder_state <target>: the one liveness rule for every lock. Exits 0 when the holder the target names runs as the same
+# process, 1 only on proof it does not (a malformed target, no such pid, a zombie, a start time that differs), and 2
+# when a check failed for a running pid; only 1 lets a lock be broken, since a failed ps or cksum proves nothing.
+holder_state() {
+  local pid="${1%%.*}" rc=0 h
+  [[ "$pid" =~ ^[0-9]+$ && "$1" == "$pid".?* ]] || return 1
+  proc_start_get "$pid" || rc=$?
+  ((rc == 0)) || return "$rc"
+  h="$(hash_of "$PS_VALUE")" && [[ "$h" =~ ^[0-9]+$ ]] || return 2
+  [[ "$1" == "$pid.$h" ]] || return 1
+}
+
+holder_dead() {
+  local rc=0
+  holder_state "$1" || rc=$?
+  ((rc == 1))
+}
 
 # lock_take <path> <wait seconds> [holder pid]: ln -s creates the lock atomically with its holder in it, so it is never
-# seen half-written, and sets LOCK_MINE, the target to release with; a lock whose holder is not live (holder_live) is
-# broken (lock_break). Every attempt counts, a break included, so the acquire ends after at most <wait> * 10 + 1 attempts.
+# seen half-written, and sets LOCK_MINE, the target to release with; a lock whose holder is proven dead (holder_state)
+# is broken (lock_break). The acquire gives up once <wait> whole seconds have passed by SECONDS, a builtin clock (bash
+# 4.4 has no EPOCHREALTIME, and date forks), so a slow liveness check never stretches it; the first try always runs.
 LOCK_MINE=""
 lock_take() {
   # The holder is read here: inside the $(...) below, BASHPID would be that subshell's.
-  local path="$1" tries=0 limit=$(($2 * 10 + 1)) seen holder="${3:-$BASHPID}"
+  local path="$1" end=$((SECONDS + $2)) first=1 seen holder="${3:-$BASHPID}"
   LOCK_MINE="$(lock_tag "$holder")" || { LOCK_MINE=""; return 1; }
   until ln -s "$LOCK_MINE" "$path" 2>/dev/null; do
-    tries=$((tries + 1))
-    ((tries > limit)) && { LOCK_MINE=""; return 1; }
+    ((first || SECONDS < end)) || { LOCK_MINE=""; return 1; }
+    first=0
     seen="$(readlink "$path" 2>/dev/null || true)"
-    if [[ -n "$seen" ]] && ! holder_live "$seen" && lock_break "$path" "$seen"; then continue; fi
+    if [[ -n "$seen" ]] && holder_dead "$seen" && lock_break "$path" "$seen"; then continue; fi
     sleep 0.1
   done
 }
@@ -172,7 +197,7 @@ lock_break() {
   mine="$(lock_tag "$me")" || return 1
   if ! ln -s "$mine" "$marker" 2>/dev/null; then
     cur="$(readlink "$marker" 2>/dev/null || true)"
-    [[ -n "$cur" ]] && ! holder_live "$cur" && lock_drop "$marker" "$cur"
+    [[ -n "$cur" ]] && holder_dead "$cur" && lock_drop "$marker" "$cur"
     return 1
   fi
   lock_drop "$1" "$2"
@@ -306,23 +331,41 @@ session_read() {
   valid_sid "$SS_SID" || { SS_PROBLEM="the session file $f has an unknown schema: sessionId \"$SS_SID\" is not a session id"; return 1; }
 }
 
-# proc_start <pid>: the start time of a live process, computed as Claude Code computes procStart (2.1.309 binary): field
-# 22 of /proc/<pid>/stat, counted after the last ")", on Linux; `LC_ALL=C TZ=UTC ps -o lstart=` trimmed elsewhere. A
-# zombie (state Z, or X on Linux) has exited but keeps its pid and start time until its parent reaps it, so it fails.
-proc_start() {
-  local s st
+# proc_start_get <pid>: sets PS_VALUE to the start time of a live process, computed as Claude Code computes procStart
+# (2.1.309 binary): field 22 of /proc/<pid>/stat, counted after the last ")", on Linux; `LC_ALL=C TZ=UTC ps -o lstart=`
+# trimmed elsewhere. Exits 1 only on proof the process is gone (no such pid, or a zombie: state Z, or X on Linux) and 2
+# when the read failed for a running pid; it runs in the caller's shell, so a failed fork never reads as gone.
+PS_VALUE=""
+proc_start_get() {
+  local s st out
   local -a f
+  PS_VALUE=""
   if [[ "$OS_NAME" == Linux ]]; then
-    { IFS= read -r s <"/proc/$1/stat"; } 2>/dev/null || return 1
+    if ! { IFS= read -r s <"/proc/$1/stat"; } 2>/dev/null; then
+      [[ -e "/proc/$1" ]] && return 2
+      return 1
+    fi
     read -ra f <<<"${s##*) }"
     [[ "${f[0]:-}" != [ZX] ]] || return 1
-    printf '%s' "${f[19]:-}"
+    s="${f[19]:-}"
   else
     # One -o per keyword: BSD ps(1) reads the text after a keyword's "=" as its header, commas included.
-    read -r st s <<<"$(LC_ALL=C TZ=UTC ps -o stat= -o lstart= -p "$1" 2>/dev/null)"
-    [[ -n "$st" && "$st" != Z* ]] || return 1
-    printf '%s' "$s"
+    out="$(LC_ALL=C TZ=UTC ps -o stat= -o lstart= -p "$1" 2>/dev/null)" || out=""
+    read -r st s <<<"$out"
+    if [[ -z "$st" ]]; then
+      kill -0 "$1" 2>/dev/null && return 2
+      return 1
+    fi
+    [[ "$st" != Z* ]] || return 1
   fi
+  [[ -n "$s" ]] || return 2
+  PS_VALUE="$s"
+}
+
+# proc_start <pid>: prints the start time (proc_start_get), with its exit status.
+proc_start() {
+  proc_start_get "$1" || return
+  printf '%s' "$PS_VALUE"
 }
 
 # pid_within <pid> <root>: the pid is the root or a descendant of it. The npm install runs claude as a child of a
@@ -337,22 +380,43 @@ pid_within() {
   return 1
 }
 
+# process_gone <pid> <start time recorded at registration>: the registered Claude Code process is proven gone: the pid
+# is gone or a zombie, or it now runs a process that started at another time (a reused pid). An empty recorded time
+# (an entry from before it was recorded) or a start time that cannot be read proves nothing.
+process_gone() {
+  local rc=0
+  proc_start_get "$1" || rc=$?
+  ((rc == 1)) || [[ "$rc" == 0 && -n "$2" && "$PS_VALUE" != "$2" ]]
+}
+
 # lane_session <lane>: the lane's session file, proven current: it names the registered pid, that process started
 # when the file says (a SIGKILL leaves a stale file, and a pid can be reused), and it holds the registered session.
-# Sets the SS_ values of session_read and SS_SIG, or SS_PROBLEM and returns 1.
+# Sets the SS_ values of session_read and SS_SIG, or SS_PROBLEM and exits 1 on proof the registered session no longer
+# runs (its pid is gone or a zombie, a stale file, another session in it, a start time other than the one recorded at
+# registration), or 2 when that cannot be decided.
 lane_session() {
-  local e f=() live
-  e="$(reg_read "$1")" || { SS_PROBLEM="the registry entry for $1 is unreadable"; return 1; }
-  jq_fields 3 '(.claude_pid // "" | tostring), .session_id, (.claude_config_dir // "")' "$e" ||
-    { SS_PROBLEM="the registry entry for $1 could not be read"; return 1; }
+  local e f=() rc=0
+  e="$(reg_read "$1")" || { SS_PROBLEM="the registry entry for $1 is unreadable"; return 2; }
+  jq_fields 4 '(.claude_pid // "" | tostring), .session_id, (.claude_config_dir // ""), (.claude_start // "")' "$e" ||
+    { SS_PROBLEM="the registry entry for $1 could not be read"; return 2; }
   f=("${FIELDS[@]}")
   [[ "${f[0]}" =~ ^[0-9]+$ ]] ||
-    { SS_PROBLEM="lane $1 has no Claude Code pid registered: restart it so SessionStart records CLAUDE_PID"; return 1; }
-  session_read "${f[0]}" "${f[2]}" || return 1
-  [[ "$SS_PID" == "${f[0]}" ]] || { SS_PROBLEM="the session file of pid ${f[0]} names pid $SS_PID"; return 1; }
-  live="$(proc_start "${f[0]}" || true)"
-  [[ -n "$live" && "$live" == "$SS_PROCSTART" ]] ||
-    { SS_PROBLEM="the session file of pid ${f[0]} is stale: it says the process started at '$SS_PROCSTART', the live one at '${live:-none}' (killed, or the pid was reused)"; return 1; }
+    { SS_PROBLEM="lane $1 has no Claude Code pid registered: restart it so SessionStart records CLAUDE_PID"; return 2; }
+  # A missing, unreadable or foreign file proves the session gone only once its process is (process_gone).
+  if ! session_read "${f[0]}" "${f[2]}"; then
+    process_gone "${f[0]}" "${f[3]}" && return 1
+    return 2
+  fi
+  if [[ "$SS_PID" != "${f[0]}" ]]; then
+    SS_PROBLEM="the session file of pid ${f[0]} names pid $SS_PID"
+    process_gone "${f[0]}" "${f[3]}" && return 1
+    return 2
+  fi
+  proc_start_get "${f[0]}" || rc=$?
+  ((rc != 2)) ||
+    { SS_PROBLEM="the start time of pid ${f[0]} could not be read, so its session file is not proven current"; return 2; }
+  [[ "$rc" == 0 && "$PS_VALUE" == "$SS_PROCSTART" ]] ||
+    { SS_PROBLEM="the session file of pid ${f[0]} is stale: it says the process started at '$SS_PROCSTART', the live one at '${PS_VALUE:-none}' (killed, or the pid was reused)"; return 1; }
   [[ "$SS_SID" == "${f[1]}" ]] ||
     { SS_PROBLEM="pid ${f[0]} now runs session $SS_SID, not the registered ${f[1]}"; return 1; }
   # SS_SIG moves on any state change, a self-started turn included (a /goal check-in, a finished background shell).
@@ -517,18 +581,16 @@ each_lane() {
 # session_title. A session id becomes a file name, so only a plain one is indexed.
 valid_sid() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
 
-# lane_for_session <session_id> [title]: the lane whose registry entry holds this session id. The registry decides,
-# so an index file left by a cleared session never resolves.
+# lane_for_session <session_id> [title]: the lane whose registry entry holds this session id, tried by the title, then
+# by the index (a /rename changes the title, not the registered lane). The registry decides, so an index file left by
+# a cleared session never resolves.
 lane_for_session() {
-  local sid="$1" title="${2:-}" lane="" e
+  local sid="$1" lane e
   valid_sid "$sid" || return 1
-  if [[ -n "$title" ]] && valid_lane "$title"; then
-    lane="$title"
-  else
-    lane="$(head -n 1 "$DATA/sessions/$sid" 2>/dev/null || true)"
-  fi
-  valid_lane "$lane" && e="$(reg_read "$lane")" && [[ "$(jq -r .session_id <<<"$e")" == "$sid" ]] || return 1
-  echo "$lane"
+  for lane in "${2:-}" "$(head -n 1 "$DATA/sessions/$sid" 2>/dev/null || true)"; do
+    valid_lane "$lane" && e="$(reg_read "$lane")" && [[ "$(jq -r .session_id <<<"$e")" == "$sid" ]] && { echo "$lane"; return 0; }
+  done
+  return 1
 }
 
 lane_for_pane() {
@@ -543,6 +605,22 @@ lane_for_pane() {
 
 # caller_lane: the registered lane of the pane this command runs in, or nothing.
 caller_lane() { lane_for_pane "${TMUX_PANE:-}" || true; }
+
+# caller_project: the one rule for the caller's project (project_of): the registered cwd of the caller's lane when its
+# pane is registered, else $PWD, so a lead acts from its own project whatever directory its Bash tool is in.
+caller_project() {
+  local lane cwd=""
+  lane="$(caller_lane)"
+  [[ -n "$lane" ]] && cwd="$(lane_cwd "$lane")"
+  project_of "${cwd:-$PWD}"
+}
+
+# lane_project <lane>: the project of the lane's registered cwd, or nothing when the lane or its cwd is unknown.
+lane_project() {
+  local cwd
+  cwd="$(lane_cwd "$1")"
+  [[ -z "$cwd" ]] || project_of "$cwd"
+}
 
 pane_exists() { [[ -n "$1" ]] && [[ "$(tm display -p -t "$1" '#{pane_id}' 2>/dev/null)" == "$1" ]]; }
 # pane_identity <pane>: "<tmux server pid> <pane pid>", or nothing when the pane cannot be read.
@@ -642,30 +720,26 @@ release_pane() {
   done < <(each_lane)
 }
 
-# name_holder <lane> <entry> <old pane> <old session>: why a new session must not take the lane name from the live pane
-# that holds it, or nothing when the old session is gone. An entry with no claude_pid is held while its pane still runs
-# the process it registered from, since only a restart records that pid. Exits 1 printing the check that failed.
+# name_holder <lane> <entry> <incoming Claude Code pid>: why the incoming session must not take the lane name, or
+# nothing (exit 1 prints the check that could not decide). The registered process decides, never the pane or the
+# session id: the same pid, or the old session proven gone (lane_session), frees it, since one process runs one session
+# (/clear, /resume, /branch, while its sessions file may still name the old one); proven live, on any pane or tmux
+# server, holds it, and a check that cannot decide never frees it. An entry with no claude_pid (a lanes version before
+# it) proves nothing live, so its name is free.
 name_holder() {
-  local f=() live=()
-  jq_fields 3 '(.claude_pid // "" | tostring), (.tmux_pid // "" | tostring), (.pane_pid // "" | tostring)' "$2" ||
+  local f=() rc=0
+  jq_fields 3 '(.claude_pid // "" | tostring), .session_id, (.tmux_pane // "no pane")' "$2" ||
     { echo "reading the registry entry"; return 1; }
   f=("${FIELDS[@]}")
-  if [[ -z "${f[0]}" ]]; then
-    read -r -a live <<<"$(pane_identity "$3")"
-    ((${#live[@]} == 2)) || { echo pane_identity; return 1; }
-    [[ -n "${f[1]}" && -n "${f[2]}" && ("${live[0]}" != "${f[1]}" || "${live[1]}" != "${f[2]}") ]] && return 0
-    echo "lane name '$1' is held by pane $3, registered by a lanes version that recorded no Claude Code pid: this session was not registered. If pane $3 still runs lane '$1', restart it there as 'claude --name $1' and start this session with another --name; if it does not, close pane $3 or delete $(reg_file "$1"), then restart this session"
-    return 0
-  fi
-  # A failed identity check proves nothing, so only a reason it found frees the name.
-  why_of identity_problem "$1" "$3" "$4"
-  if check_failed; then echo identity_problem; return 1; fi
-  [[ -n "$WHY" ]] || echo "lane name '$1' is already in use by pane $3 (a lane name is unique on this machine, across projects): this session was not registered; restart it with another --name"
-  return 0
+  [[ -z "${f[0]}" || "${f[0]}" == "$3" ]] && return 0
+  lane_session "$1" || rc=$?
+  ((rc == 1)) && return 0
+  ((rc == 0)) || { echo "lane_session: $SS_PROBLEM"; return 1; }
+  echo "lane name '$1' is already in use by session ${f[1]} (Claude Code pid ${f[0]}, pane ${f[2]}), which still runs: a lane name is unique on this machine, across projects and tmux servers. This session was not registered; restart it with another --name"
 }
 
 cmd_register() {
-  local input lane sid cwd src tp pane role existing old_pane old_sid held ctx="" fresh wt down ids cpid="${CLAUDE_PID:-}" f=()
+  local input lane sid cwd src tp pane role existing old_sid held ctx="" fresh wt down ids cpid="${CLAUDE_PID:-}" f=()
   input="$(cat || true)"
   mapfile -t f < <(jq -r 'if type == "object" then (.session_title // ""), (.session_id // ""), (.cwd // ""), (.source // ""),
     (.transcript_path // "" | tostring) else empty end' 2>/dev/null <<<"$input")
@@ -704,34 +778,33 @@ cmd_register() {
     notice "registry entry for '$lane' was corrupt and has been replaced"
     existing=""
   fi
-  role="lane" old_pane="" old_sid=""
+  role="lane" old_sid=""
   if [[ -n "$existing" ]]; then
-    mapfile -t f < <(jq -r '(.tmux_pane // ""), (.session_id // ""), (.role // "lane")' <<<"$existing")
-    old_pane="${f[0]}" old_sid="${f[1]}" role="${f[2]}"
-    # A fork can start while its source still runs in the same pane (the /fork background copy), so its own pane does
-    # not free the name either.
-    if [[ "$old_sid" != "$sid" && -n "$old_pane" && ("$old_pane" != "$pane" || "$src" == fork) ]] && pane_exists "$old_pane"; then
-      held="$(name_holder "$lane" "$existing" "$old_pane" "$old_sid")" ||
-        held="lane name '$lane' could not be checked against pane $old_pane (check failed: ${held:-name_holder}): this session was not registered; run 'lanes status', then restart this session"
-      if [[ -n "$held" ]]; then
-        notice "$held"
-        hook_emit
-        return 0
-      fi
+    mapfile -t f < <(jq -r '(.session_id // ""), (.role // "lane")' <<<"$existing")
+    old_sid="${f[0]}" role="${f[1]}"
+    # Also for the same session id: a second process resuming the session (no --fork-session) is another process.
+    held="$(name_holder "$lane" "$existing" "$cpid")" ||
+      held="lane name '$lane' could not be checked against its registered session (check failed: ${held:-name_holder}): this session was not registered; run 'lanes status', then restart this session"
+    if [[ -n "$held" ]]; then
+      notice "$held"
+      hook_emit
+      return 0
     fi
   fi
   case "${LANES_ROLE:-}" in lead | lane) role="$LANES_ROLE" ;; esac
   fresh=1
   [[ -n "$existing" && "$old_sid" == "$sid" ]] && fresh=0
-  # Beside the pane id: the tmux server pid and the pane's pid (identity_problem, name_holder), Claude Code's own pid,
-  # and its config dir, where its sessions file is (null: the default ~/.claude).
+  # Beside the pane id: the tmux server pid and the pane's pid (identity_problem), Claude Code's own pid and start time
+  # (lane_session, which proves a reused pid by it), and its config dir, where its sessions file is (null: ~/.claude).
   ids="$( [[ -n "$pane" ]] && pane_identity "$pane" || true)"
+  proc_start_get "$cpid" || true
   write_atomic "$(reg_file "$lane")" "$(jq -nc --argjson old "${existing:-null}" --arg lane "$lane" --arg sid "$sid" \
     --arg role "$role" --arg pane "$pane" --arg cwd "$cwd" --arg now "$(iso_now)" --argjson fresh "$fresh" --arg ids "$ids" \
-    --argjson cpid "$cpid" --arg ccd "${CLAUDE_CONFIG_DIR:-}" '
+    --argjson cpid "$cpid" --arg cst "$PS_VALUE" --arg ccd "${CLAUDE_CONFIG_DIR:-}" '
     ($ids | split(" ") | map(tonumber? // null)) as $id
     | {lane: $lane, session_id: $sid, role: $role, tmux_pane: (if $pane == "" then null else $pane end),
-     tmux_pid: $id[0], pane_pid: $id[1], claude_pid: $cpid, claude_config_dir: (if $ccd == "" then null else $ccd end),
+     tmux_pid: $id[0], pane_pid: $id[1], claude_pid: $cpid, claude_start: (if $cst == "" then null else $cst end),
+     claude_config_dir: (if $ccd == "" then null else $ccd end),
      cwd: $cwd,
      used_pct: (if $fresh == 1 then null else $old.used_pct end),
      clear_ready: (if $fresh == 1 then false else ($old.clear_ready // false) end), updated_at: $now}')"
@@ -757,18 +830,18 @@ cmd_register() {
   fi
   # The lead re-arms every watcher that is down; the model reads this, not the systemMessage.
   if [[ "$role" == lead ]]; then
-    down="$(monitors_down "$cwd")"
+    down="$(monitors_down "$(lane_project "$lane")")"
     [[ -z "$down" ]] || ctx+="${ctx:+$'\n\n'}lanes: watchers not running: $down. Start each from skills/lead/MONITORS.md (a running one refuses a second start)."
   fi
   hook_emit "$ctx"
 }
 
 # cmd_hook prompt|ask: UserPromptSubmit counts the session's prompts and keeps its last slash command, the proof that a
-# typed /goal arrived and of new work since clear-ready; PreToolUse(AskUserQuestion) refuses while away mode is on.
+# typed /goal arrived and of new work since clear-ready; PreToolUse(AskUserQuestion) refuses in away mode.
 # Activity is never recorded here, since it comes from the sessions file. Nothing is printed (a prompt's stdout
 # reaches the model), and jq reads stdin once, since a prompt can be far larger than an argument may be.
 cmd_hook() {
-  local kind="${1:-}" lane f=()
+  local kind="${1:-}" lane proj f=()
   case "$kind" in ask | prompt) ;; *) usage ;; esac
   mapfile -t f < <(jq -r '
     if type == "object" then (.session_id // ""), (.session_title // ""), (.cwd // ""),
@@ -777,8 +850,11 @@ cmd_hook() {
     else empty end' 2>/dev/null)
   ((${#f[@]} == 5)) || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
   if [[ "$kind" == ask ]]; then
-    [[ -f "$STATE/away.json" ]] || return 0
-    jq -nc --arg m "$(journal_root "${f[2]:-$PWD}")/morning.md" '{hookSpecificOutput: {hookEventName: "PreToolUse",
+    # Only a session registered in a project in away mode, its lead or a lane, is refused; any other session asks.
+    lane="$(lane_for_session "${f[0]}" "${f[1]}")" || return 0
+    proj="$(lane_project "$lane")"
+    [[ -n "$proj" ]] && away_on "$proj" || return 0
+    jq -nc --arg m "$(journal_root "${f[2]:-$(lane_cwd "$lane")}")/morning.md" '{hookSpecificOutput: {hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason: ("lanes away mode is on: the human is away, so ask nothing now. Add the question to " + $m
         + " (one question, its facts and costs, your recommended option marked) and continue with other work. Only the human'"'"'s own message lifts away mode (lanes away off).")}}'
@@ -805,6 +881,8 @@ cmd_statusline() {
   input="$(cat 2>/dev/null || true)"
   lane="$(jq -r '.session_name // ""' <<<"$input" 2>/dev/null || true)"
   sid="$(jq -r '.session_id // ""' <<<"$input" 2>/dev/null || true)"
+  # After a /rename the session name is not the lane name: the session's own lane, when it has one, is used.
+  lane="$(lane_for_session "$sid" "$lane" 2>/dev/null || echo "$lane")"
   pct="$(jq -r '.context_window.used_percentage // "null" | if type == "number" then floor else "null" end' <<<"$input" 2>/dev/null || echo null)"
   [[ "$pct" =~ ^[0-9]+$ ]] || pct=null
   if [[ -n "$lane" ]] && valid_lane "$lane"; then
@@ -855,16 +933,22 @@ lane_view() {
                    else ($h.state // "none") end)}'
 }
 
+# cmd_status: the lanes of the caller's project only (caller_project), so a lead never reads another project's lanes
+# as its own. An entry that cannot be read names no project, so it shows as an error row in every project.
 cmd_status() {
-  local json=0 lane rows=()
+  local json=0 lane rows=() proj
   [[ "${1:-}" == "--json" ]] && json=1
-  while IFS= read -r lane; do rows+=("$(lane_view "$lane")"); done < <(each_lane)
+  proj="$(caller_project)"
+  while IFS= read -r lane; do
+    reg_read "$lane" >/dev/null 2>&1 && [[ "$(lane_project "$lane")" != "$proj" ]] && continue
+    rows+=("$(lane_view "$lane")")
+  done < <(each_lane)
   if ((json)); then
     printf '%s\n' "${rows[@]+"${rows[@]}"}" | jq -s .
     return 0
   fi
   if ((${#rows[@]} == 0)); then
-    echo "lanes: no lanes registered in $REG (start each session as 'claude --name <lane>' inside tmux)"
+    echo "lanes: no lanes registered for $proj (start each session as 'claude --name <lane>' inside tmux, from this project)"
     return 0
   fi
   # Each lane's threshold is its own project's option, so it is not one header line: AT-THRESHOLD marks the row, and
@@ -880,21 +964,30 @@ cmd_status() {
 
 # ---- away mode, init ---------------------------------------------------------------------------------------------
 
-# cmd_away: the record names who set it (the caller's lane, from its pane) and when; only the human lifts it.
+# away_file <project>: the away record of one project, named by a checksum of its path, which can hold any character.
+away_file() { printf '%s/away/%s.json' "$STATE" "$(hash_of "$1")"; }
+
+# away_on <project>: away mode holds for that project; the record names its project, so a checksum collision is off.
+away_on() { [[ "$(jq -r '.project // ""' "$(away_file "$1")" 2>/dev/null)" == "$1" ]]; }
+
+# cmd_away: away mode is per project (caller_project), and the record names who set it (the caller's lane, from its
+# pane) and when; only the human lifts it.
 cmd_away() {
-  local by
+  local by proj
+  proj="$(caller_project)"
   case "${1:-status}" in
     on)
       by="$(caller_lane)"
-      write_atomic "$STATE/away.json" "$(jq -nc --arg t "$(iso_now)" --arg by "${by:-outside a lane pane}" '{away: true, since: $t, set_by: $by}')"
-      echo "away mode on: the ask tool is refused; questions go to the morning list"
+      write_atomic "$(away_file "$proj")" "$(jq -nc --arg p "$proj" --arg t "$(iso_now)" --arg by "${by:-outside a lane pane}" \
+        '{away: true, project: $p, since: $t, set_by: $by}')"
+      echo "away mode on for $proj: its lead and lanes are refused the ask tool; questions go to the morning list"
       ;;
-    off) rm -f "$STATE/away.json" && echo "away mode off" ;;
+    off) rm -f "$(away_file "$proj")" && echo "away mode off for $proj" ;;
     status)
-      if [[ -f "$STATE/away.json" ]]; then
-        jq -r '"away mode on since \(.since), set by \(.set_by // "an unknown caller")"' "$STATE/away.json"
+      if away_on "$proj"; then
+        jq -r '"away mode on since \(.since), set by \(.set_by // "an unknown caller"), for \(.project)"' "$(away_file "$proj")"
       else
-        echo "away mode off"
+        echo "away mode off for $proj"
       fi
       ;;
     *) usage ;;

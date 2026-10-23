@@ -449,6 +449,106 @@ SHIM
   chmod +x "$LANES_TEST_TMP/shim/tmux"
 }
 
+# composer_line: the input line as the fake draws it (its first line, without the input mark and its NBSP).
+composer_line() { lanes_tmux capture-pane -p -t "$PANE" | sed -n $'s/^❯\xc2\xa0//p' | tail -n 1; }
+
+# replace_typed <keys>: once /clear is typed, a human deletes it and types <keys> before the arrival check reads.
+replace_typed() {
+  shim_on_keys "-l -- /clear" "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' send-keys -t '$PANE' BSpace BSpace BSpace BSpace BSpace BSpace; '$(command -v tmux)' -L '$LANES_TMUX_SOCKET' send-keys -t '$PANE' -l -- '$1'"
+}
+
+@test "a human draft shorter than our text and not a leading part of it is never deleted after a failed arrival" {
+  ready_lane alpha
+  replace_typed abc
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "did not arrive intact"
+  assert_output --partial "did not hold only our text, so it was left"
+  run composer_line
+  assert_output abc
+  run submitted /clear
+  assert_output 0
+}
+
+@test "a human draft as long as our text and not our text is never deleted after a failed arrival" {
+  ready_lane alpha
+  replace_typed abcdef
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "did not hold only our text, so it was left"
+  run composer_line
+  assert_output abcdef
+}
+
+@test "a slow redraw is read again until our text shows: the clear lands" {
+  ready_lane alpha FAKE_DRAW_LAG_MS=700
+  run as_lead clear alpha
+  assert_success
+  run submitted /clear
+  assert_output 1
+}
+
+@test "a line that keeps only a leading part of our typed text has that part deleted, and the message says so" {
+  ready_lane alpha
+  # Two of our keys are lost: the line keeps "/cle".
+  shim_on_keys "-l -- /clear" "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' send-keys -t '$PANE' BSpace BSpace"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "did not arrive intact"
+  assert_output --partial "our typed text was deleted"
+  wait_for "leading part deleted" pane_has 'Try "refactor'
+  run submitted /clear
+  assert_output 0
+}
+
+# request_after_nth_fg_check <n>: a ps shim that, right after the n-th foreground check (ps -o pgid=), runs
+# `lanes request alpha` from the lead's pane.
+request_after_nth_fg_check() {
+  mkdir -p "$LANES_TEST_TMP/shim"
+  echo "$1" >"$LANES_TEST_TMP/fg-count"
+  register_lead
+  cat >"$LANES_TEST_TMP/shim/ps" <<EOS
+#!/usr/bin/env bash
+"$(command -v ps)" "\$@"
+rc=\$?
+if [[ " \$* " == *" pgid= "* && -f "$LANES_TEST_TMP/fg-count" ]]; then
+  n=\$((\$(cat "$LANES_TEST_TMP/fg-count") - 1))
+  if ((n > 0)); then echo "\$n" >"$LANES_TEST_TMP/fg-count"; else
+    rm -f "$LANES_TEST_TMP/fg-count"
+    TMUX_PANE=%99 "$LANES" request alpha >"$LANES_TEST_TMP/request.out" 2>&1
+  fi
+fi
+exit \$rc
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/ps"
+}
+
+@test "a request landing between the last check and the sending record stops the clear with the true reason, and stands" {
+  ready_lane alpha
+  # The first foreground check is the target check; the second is final_verify's, the last before the record.
+  request_after_nth_fg_check 2
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "a new 'lanes request alpha' arrived while the clear ran"
+  run cat "$LANES_TEST_TMP/request.out"
+  assert_output --partial "requested:"
+  run state alpha .handshake.state
+  assert_output requested
+  run keys_sent
+  assert_output 0
+}
+
+@test "a request landing while clear waits for idle stops the clear with the true reason, and stands" {
+  ready_lane alpha
+  clear_during_wait as_lead request alpha
+  assert [ "$RC" -ne 0 ]
+  [[ "$OUT" == *"a new 'lanes request alpha' arrived while the clear ran"* ]]
+  run state alpha .handshake.state
+  assert_output requested
+  run keys_sent
+  assert_output 0
+}
+
 @test "a human key added after the arrival check stops Enter, and the human's text is never erased" {
   ready_lane alpha
   shim_key_after_verify "x"

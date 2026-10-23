@@ -181,12 +181,17 @@ second line"
   assert_output --partial "not a git work tree"
 }
 
-# start_elsewhere: the session started outside the work tree, so its registry cwd has a different journal.
+# register_in_start [commit]: the session started in another work tree of the same project (at <commit>, default
+# HEAD), so its registry cwd has a different journal.
+register_in_start() {
+  git -C "$WORK" worktree add -q --detach "$LANES_TEST_TMP/start" "${1:-HEAD}"
+  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null
+}
+
 start_elsewhere() {
   make_repo
   write_resume alpha
-  mkdir -p "$LANES_TEST_TMP/start"
-  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  register_in_start
 }
 
 @test "request reads RESUME where the last clear-ready proved it, so 'unchanged since the request' still holds" {
@@ -199,19 +204,64 @@ start_elsewhere() {
   assert_output --partial "unchanged since the lead's request"
 }
 
-@test "a RESUME at another place than the one the request read is ready only once committed after the request" {
+@test "a RESUME block at another place than the one the request read is ready only once the block itself changed after it" {
   make_repo
+  register_in_start
   # The RESUME was committed an hour before the request, at a place the request did not read.
   GIT_COMMITTER_DATE="$(($(date +%s) - 3600)) +0000" write_resume alpha
-  mkdir -p "$LANES_TEST_TMP/start"
-  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null
   as_lead request alpha >/dev/null
   run "$LANES" clear-ready --lane alpha
   assert_failure
-  assert_output --partial "was last committed before the lead's request"
+  assert_output --partial "the same as in its last commit before the lead's request"
+  # A commit after the request that changes only the file outside the block proves nothing.
+  printf '\n## Open items\n- B2 waits on CI\n' >>"$WORK/.lanes/next-alpha.md"
+  git -C "$WORK" commit -q -am "open items" && git -C "$WORK" push -q
+  run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "the same as in its last commit before the lead's request"
   write_resume alpha "finish item A1, now with tests"
+  printf '\n## Open items\n- B2 waits on CI\n' >>"$WORK/.lanes/next-alpha.md"
+  git -C "$WORK" commit -q -am "open items" && git -C "$WORK" push -q
   run "$LANES" clear-ready --lane alpha
   assert_success
+}
+
+@test "a RESUME file new in the work tree the lane moved to, written after the request, is ready" {
+  make_repo
+  write_resume alpha
+  register_lane alpha s1 %7 >/dev/null
+  "$LANES" clear-ready --lane alpha >/dev/null
+  as_lead request alpha >/dev/null
+  # The new work tree starts at the first commit, before the RESUME file existed.
+  git -C "$WORK" worktree add -q -b wt2 "$LANES_TEST_TMP/wt2" HEAD~1
+  git -C "$LANES_TEST_TMP/wt2" push -q -u origin wt2
+  (WORK="$LANES_TEST_TMP/wt2" && write_resume alpha "finish item A1 in the new tree")
+  run bash -c "cd '$LANES_TEST_TMP/wt2' && '$LANES' clear-ready --lane alpha"
+  assert_success
+}
+
+@test "the session that holds the lane is decided under the mutex: a session that took the lane during clear-ready is not marked ready" {
+  setup_lane
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # Right after clear-ready read the entry, while it checks the tree, a new session of alpha registers.
+  cat >"$LANES_TEST_TMP/shim/git" <<EOS
+#!/usr/bin/env bash
+if [[ " \$* " == *" status --porcelain"* && ! -f "$LANES_TEST_TMP/took" ]]; then
+  : >"$LANES_TEST_TMP/took"
+  jq -nc --arg c "$WORK" '{session_id:"s2",session_title:"alpha",cwd:\$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
+fi
+exec "$(command -v git)" "\$@"
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/git"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "started a new session while clear-ready ran"
+  run reg alpha .session_id
+  assert_output s2
+  run reg alpha .clear_ready
+  assert_output false
+  run state alpha '.handshake.state // "none"'
+  refute_output ready
 }
 
 @test "a lane that moved to another work tree completes request then clear-ready there, twice" {

@@ -1,6 +1,8 @@
 # morning
 
-Questions for the human, queued while away mode is on (`lanes away on`). When the human is back, the lead asks them
+Questions for the human, queued while away mode is on (`lanes away on`) for this project: then the lead and the lanes
+registered in this project cannot use the ask tool; other projects and unregistered sessions are not affected. When
+the human is back, the lead asks them
 one at a time through the ask tool, records each answer where it belongs, and deletes the entry.
 
 ## Entry form

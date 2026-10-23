@@ -38,6 +38,26 @@ lead_ctx() {
   kill "$b"
 }
 
+@test "a watcher started from the lead's pane keys to the lead's project, whatever directory its shell is in" {
+  in_p1
+  lead_ctx "$P1" >/dev/null
+  sleep 30 &
+  a=$!
+  # The loop runs in P2, from the lead's pane (%9, registered from P1).
+  run bash -c "cd '$P2' && TMUX_PANE=%9 '$LANES' monitor-lock ci $a"
+  assert_success
+  run bash -c "cd '$P2' && printf 'x\tup\n' | TMUX_PANE=%9 '$LANES' monitor-diff ci"
+  assert_output "x: none -> up"
+  # P1 sees both the lock and the state; P2, outside the pane, sees neither.
+  run lead_ctx "$P1"
+  assert_output --partial "watchers not running: reviews context drift."
+  run bash -c "cd '$P1' && printf 'x\tup\n' | '$LANES' monitor-diff ci"
+  assert_output ""
+  run bash -c "cd '$P2' && '$LANES' monitor-lock ci $a"
+  assert_success
+  kill "$a"
+}
+
 @test "monitor-lock refuses a pid that is not running and a name that is not plain" {
   in_p1
   run "$LANES" monitor-lock ci 999999
@@ -160,6 +180,34 @@ lead_ctx() {
   grep -q '(MONITORS.md)' "$MD/SKILL.md"
   grep -q 'lanes monitor-lock "$name" \$\$' "$MD/MONITORS.md"
   for w in ci reviews context drift; do grep -q "(name \`$w\`" "$MD/MONITORS.md"; done
+}
+
+# md_pass <section number>: the code block of that MONITORS.md section, the pass() it defines.
+md_pass() { awk -v s="## $1. " 'index($0, s) == 1 {on = 1; next} on && /^```bash/ {c = 1; next} c && /^```/ {exit} c {print}' "$MD/MONITORS.md"; }
+
+# shim <name> <body>: a command in $LANES_TEST_TMP/shim (put it first on PATH).
+shim() { mkdir -p "$LANES_TEST_TMP/shim"; printf '#!/usr/bin/env bash\n%s\n' "$2" >"$LANES_TEST_TMP/shim/$1"; chmod +x "$LANES_TEST_TMP/shim/$1"; }
+
+@test "MONITORS.md: the context and drift passes fail when lanes fails, so the loop skips the diff instead of reporting all gone" {
+  shim lanes 'exit 1'
+  shim gh 'echo "#$3	OPEN abc1234 success"'
+  for sec in 3 4; do
+    run env PATH="$LANES_TEST_TMP/shim:$PATH" bash -c "$(md_pass "$sec")"$'\n''pass'
+    assert_failure
+    assert_output ""
+  done
+  # With lanes working, each pass prints its set.
+  mkdir -p "$LANES_TEST_TMP/j"
+  printf 'row #12\n' >"$LANES_TEST_TMP/j/tracker.md"
+  printf 'pr #7\n' >"$LANES_TEST_TMP/j/next-alpha.md"
+  shim lanes "if [[ \"\$1\" == journal-dir ]]; then echo '$LANES_TEST_TMP/j'; else echo '[{\"lane\":\"alpha\",\"at_threshold\":true,\"ctx\":\"fresh\"}]'; fi"
+  run env PATH="$LANES_TEST_TMP/shim:$PATH" bash -c "$(md_pass 3)"$'\n''pass'
+  assert_success
+  assert_output "alpha	at threshold"
+  run env PATH="$LANES_TEST_TMP/shim:$PATH" bash -c "$(md_pass 4)"$'\n''pass'
+  assert_success
+  assert_output "#7	OPEN abc1234 success
+#12	OPEN abc1234 success"
 }
 
 @test "MONITORS.md: every gh pr list call fetches the whole set, not the default 30" {

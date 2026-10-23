@@ -153,7 +153,8 @@ state"
   mkdir -p "$LANES_TEST_TMP/other"
   run bash -c "jq -nc --arg c '$LANES_TEST_TMP/other' '{session_id:\"o1\",session_title:\"alpha\",cwd:\$c,source:\"startup\"}' | TMUX_PANE=%99 '$LANES' register"
   assert_success
-  assert_output --partial "already in use by pane $first (a lane name is unique on this machine, across projects)"
+  assert_output --partial "already in use by session"
+  assert_output --partial "pane $first), which still runs: a lane name is unique on this machine, across projects"
   run reg alpha .cwd
   assert_output "$WORK"
 }
@@ -172,52 +173,63 @@ state"
   assert_output "$first"
 }
 
-@test "a dead pane's lane name is taken over by the new session" {
+@test "the same Claude Code process takes its own name back with a new session, in another pane or none" {
   register_lane alpha s1 %98
   run register_lane alpha s2 %99
   assert_success
-  run reg alpha .tmux_pane
-  assert_output %99
+  run reg alpha '[.tmux_pane, .session_id] | @json'
+  assert_output '["%99","s2"]'
+}
+
+@test "a dead lane's name is taken over: its sessions file is left behind, but its process is gone" {
+  make_repo
+  start_fake alpha
+  kill -9 "$FAKE_PID"
+  wait_for "fake gone" bash -c "! kill -0 $FAKE_PID 2>/dev/null"
+  [ -f "$(session_file)" ]
+  run register_lane alpha other-session %99
+  assert_success
+  run reg alpha '[.tmux_pane, .session_id] | @json'
+  assert_output '["%99","other-session"]'
 }
 
 # strip_entry <jq filter>: rewrite alpha's registry entry, as an older lanes version or a test of it would have left it.
 strip_entry() { local f="$LANES_DATA_DIR/lanes/alpha.json"; jq -c "$1" "$f" >"$f.x" && mv "$f.x" "$f"; }
 
-@test "an entry with no Claude Code pid keeps its name while its pane runs the process it registered from" {
+@test "an entry with no Claude Code pid proves no live session, so a new session takes the name" {
   make_repo
   start_fake alpha
-  first="$PANE"
-  for filter in 'del(.claude_pid)' 'del(.tmux_pid, .pane_pid)'; do
-    strip_entry "$filter"
-    run register_lane alpha other-session %99
-    assert_success
-    assert_output --partial "recorded no Claude Code pid: this session was not registered"
-    assert_output --partial "restart it there as 'claude --name alpha'"
-    assert_output --partial "close pane $first or delete $LANES_DATA_DIR/lanes/alpha.json"
-    run reg alpha .tmux_pane
-    assert_output "$first"
-  done
-}
-
-@test "an entry with no Claude Code pid whose pane now runs another process is taken over" {
-  make_repo
-  start_fake alpha
-  strip_entry 'del(.claude_pid) | .pane_pid = 1'
+  strip_entry 'del(.claude_pid)'
   run register_lane alpha other-session %99
   assert_success
-  run reg alpha .tmux_pane
-  assert_output %99
+  run reg alpha '[.tmux_pane, .session_id] | @json'
+  assert_output '["%99","other-session"]'
 }
 
 @test "a name check that fails is a refusal, never a pass: the new session is not registered and is told why" {
   make_repo
   start_fake alpha
   first="$PANE"
-  jq_shim '.session_id, (.tmux_pane // "")' 1+
+  jq_shim '(.claude_pid // "" | tostring), .session_id' 1+
   PATH="$LANES_TEST_TMP/shim:$PATH" run register_lane alpha other-session %99
   assert_success
-  assert_output --partial "check failed: identity_problem"
+  assert_output --partial "check failed: reading the registry entry"
   assert_output --partial "this session was not registered"
+  run reg alpha .tmux_pane
+  assert_output "$first"
+}
+
+@test "a live lane on another tmux server keeps its name: a session on this server does not take it" {
+  make_repo
+  start_fake alpha
+  first="$PANE"
+  # A second private server (TMUX_TMPDIR is the test's own); its first pane id can equal the lane's own.
+  tmux -L "$LANES_TMUX_SOCKET-other" new-session -d -s other -x 80 -y 20 "sleep 30"
+  other_pane="$(tmux -L "$LANES_TMUX_SOCKET-other" display -p -t other '#{pane_id}')"
+  run bash -c "LANES_TMUX_SOCKET='$LANES_TMUX_SOCKET-other' TMUX_PANE='$other_pane' '$LANES' register <<<'$(hook_json SessionStart o1 alpha startup)'"
+  tmux -L "$LANES_TMUX_SOCKET-other" kill-server 2>/dev/null || true
+  assert_success
+  assert_output --partial "already in use by session"
   run reg alpha .tmux_pane
   assert_output "$first"
 }
@@ -308,17 +320,155 @@ start_in() {
   assert_output '["cleared","s3","clear"]'
 }
 
-@test "a fork started from the lane's own pane (a /fork background copy) never takes the lane while its session runs" {
+@test "/branch in the lane's own pane registers the new session, while the sessions file still names the old one" {
+  make_repo
+  start_fake alpha
+  old="$(reg alpha .session_id)"
+  # During the SessionStart(fork) hook of /branch the process is the same and its sessions file lags (Claude Code 2.1.309).
+  [ "$(sess .sessionId)" = "$old" ]
+  run bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$FAKE_PID' '$LANES' register <<<'$(hook_json SessionStart b1 alpha fork)'"
+  assert_success
+  refute_output --partial "already in use"
+  run reg alpha '[.session_id, .tmux_pane, (.claude_pid | tostring)] | @json'
+  assert_output "[\"b1\",\"$PANE\",\"$FAKE_PID\"]"
+  run state alpha .start_source
+  assert_output fork
+}
+
+@test "a nested claude --name <lane> from the lane's own Bash tool (same pane, new process) never takes the name" {
   make_repo
   start_fake alpha
   sid="$(reg alpha .session_id)"
-  run bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$FAKE_PID' '$LANES' register <<<'$(hook_json SessionStart f1 alpha fork)'"
-  assert_success
-  assert_output --partial "already in use by pane $PANE"
-  run reg alpha .session_id
-  assert_output "$sid"
+  sleep 30 &
+  nested=$!
+  for src in startup fork; do
+    run bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$nested' '$LANES' register <<<'$(hook_json SessionStart n-$src alpha $src)'"
+    assert_success
+    assert_output --partial "already in use by session $sid"
+    run reg alpha .session_id
+    assert_output "$sid"
+  done
+  kill "$nested"
   run state alpha .start_source
   assert_output startup
+}
+
+# other_pid_register <session id> [source] [PATH prefix]: a SessionStart for alpha from another live process in the
+# lane's pane; sets OUTPUT and STATUS as run does.
+other_pid_register() {
+  local other
+  sleep 30 &
+  other=$!
+  run bash -c "PATH='${3:+$3:}$PATH' TMUX_PANE='$PANE' CLAUDE_PID='$other' '$LANES' register <<<'$(hook_json SessionStart "$1" alpha "${2:-startup}")'"
+  kill "$other"
+}
+
+@test "a second process resuming the lane's own session id (no --fork-session) is refused; the same process registers" {
+  make_repo
+  start_fake alpha
+  sid="$(reg alpha .session_id)"
+  for src in resume startup; do
+    other_pid_register "$sid" "$src"
+    assert_success
+    assert_output --partial "already in use by session $sid"
+    run reg alpha '(.claude_pid | tostring)'
+    assert_output "$FAKE_PID"
+  done
+  run bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$FAKE_PID' '$LANES' register <<<'$(hook_json SessionStart "$sid" alpha compact)'"
+  assert_success
+  refute_output --partial "lane name"
+  run state alpha .start_source
+  assert_output compact
+}
+
+@test "a name check that cannot decide never frees the name: a partly written or missing sessions file, a failing ps" {
+  make_repo
+  start_fake alpha
+  sid="$(reg alpha .session_id)"
+  f="$(session_file)"
+  cp "$f" "$LANES_TEST_TMP/sess"
+  for bad in '{"pid":' 'not json' '{"pid":1}' ''; do
+    printf '%s' "$bad" >"$f"
+    other_pid_register o1
+    assert_success
+    assert_output --partial "could not be checked against its registered session"
+    assert_output --partial "restart this session"
+    run reg alpha .session_id
+    assert_output "$sid"
+  done
+  # No file while the registered process still runs proves nothing either.
+  rm -f "$f"
+  other_pid_register o1
+  assert_output --partial "could not be checked against its registered session"
+  cp "$LANES_TEST_TMP/sess" "$f"
+  # A failing ps, in the non-Linux form of the start time read (uname answers Darwin).
+  mkdir -p "$LANES_TEST_TMP/shim"
+  printf '#!/usr/bin/env bash\necho Darwin\n' >"$LANES_TEST_TMP/shim/uname"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$LANES_TEST_TMP/shim/ps"
+  chmod +x "$LANES_TEST_TMP/shim/uname" "$LANES_TEST_TMP/shim/ps"
+  other_pid_register o1 startup "$LANES_TEST_TMP/shim"
+  assert_output --partial "(check failed: lane_session: the start time of pid $FAKE_PID could not be read"
+  run reg alpha .session_id
+  assert_output "$sid"
+}
+
+@test "register records Claude Code's start time, read by proc_start, beside its pid" {
+  make_repo
+  start_fake alpha
+  run reg alpha .claude_start
+  refute_output null
+  assert_output "$(bash -c 'source "$1"; proc_start "$2"' _ "$LANES" "$FAKE_PID")"
+}
+
+@test "a pid now running another process (a start time other than the recorded one) is proven gone, with no sessions file or a foreign one" {
+  make_repo
+  start_fake alpha
+  f="$(session_file)"
+  cp "$f" "$LANES_TEST_TMP/sess"
+  sid="$(jq -r .sessionId "$LANES_TEST_TMP/sess")"
+  for kind in missing foreign; do
+    case "$kind" in
+      missing) rm -f "$f" ;;
+      foreign) jq -c '.pid = 1' "$LANES_TEST_TMP/sess" >"$f" ;;
+    esac
+    # The recorded start time unchanged stays undecided, and so does an entry written before the time was recorded.
+    for rec in same none; do
+      [[ "$rec" == none ]] && strip_entry 'del(.claude_start)'
+      other_pid_register "o-$kind-$rec"
+      assert_output --partial "could not be checked against its registered session"
+      run reg alpha .session_id
+      assert_output "$sid"
+    done
+    strip_entry '.claude_start = "1"'
+    other_pid_register "o-$kind"
+    assert_success
+    run reg alpha .session_id
+    assert_output "o-$kind"
+    # The fake's own process takes its lane back, recording its start time again, for the next case.
+    bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$FAKE_PID' '$LANES' register <<<'$(hook_json SessionStart "$sid" alpha startup)'" >/dev/null 2>&1
+  done
+}
+
+@test "a name the old session is proven not to hold is free: another session in its file, a stale procStart, a gone pid" {
+  make_repo
+  for proof in sid procstart gone; do
+    start_fake alpha
+    case "$proof" in
+      sid) edit_session '.sessionId = "someone-else"' ;;
+      procstart) edit_session '.procStart = "1"' ;;
+      gone)
+        kill -9 "$FAKE_PID"
+        wait_for "gone" bash -c "! kill -0 $FAKE_PID 2>/dev/null"
+        rm -f "$(session_file)"
+        ;;
+    esac
+    other_pid_register "new-$proof"
+    assert_success
+    run reg alpha .session_id
+    assert_output "new-$proof"
+    lanes_tmux kill-session -t alpha 2>/dev/null || true
+    rm -f "$LANES_DATA_DIR/lanes/alpha.json"
+  done
 }
 
 @test "register refreshes the stable statusline link under the data dir when the plugin root is known" {
