@@ -244,9 +244,11 @@ state_of() { locks "${2:-:}; rc=0; holder_state '$1' || rc=\$?; echo \$rc"; }
   assert_output 2
   run state_of "$tag" "cksum() { return 1; }"
   assert_output 2
-  # Under a failing ps the held lock is waited for and left as it is.
-  run locks "ln -s '$tag' \"\$S/x.lnk\"; ps() { return 1; }; lock_take \"\$S/x.lnk\" 0 \$\$ || echo refused; readlink \"\$S/x.lnk\""
-  assert_output "refused
+  # When ps fails for the holder only, the taker still names itself, so the holder is undecided: the lock is waited
+  # for, refused as held and left as it is, never broken.
+  run locks "ln -s '$tag' \"\$S/x.lnk\"; ps() { [[ \"\$*\" == *' $live' ]] && return 1; darwin_ps \"\$@\"; }
+    lock_take \"\$S/x.lnk\" 0 \$\$ || echo \"refused rc=\$? \$LOCK_WHY\"; readlink \"\$S/x.lnk\""
+  assert_output "refused rc=1 held by another process (pid $live)
 $tag"
   # Proof of death still breaks it: a start time that differs, and a pid that no longer runs.
   run state_of "$live.1"
@@ -257,6 +259,43 @@ $tag"
   assert_output 1
   run locks "ln -sf '$tag' \"\$S/x.lnk\"; lock_take \"\$S/x.lnk\" 0 \$\$ && echo taken"
   assert_output taken
+}
+
+@test "a taker that cannot name itself says so, never 'held by another process', and touches no lock" {
+  sleep 30 &
+  live=$!
+  tag="$(locks "lock_tag $live")"
+  # ps fails for the taker's own pid only; the lock is free, then held by a live process.
+  for held in free live; do
+    run locks "[[ $held == live ]] && ln -s '$tag' \"\$S/x.lnk\"; me=\$\$; ps() { [[ \"\$*\" == *\" \$me\" ]] && return 1; darwin_ps \"\$@\"; }
+      lock_take \"\$S/x.lnk\" 0 || echo \"rc=\$? \$LOCK_WHY\"; readlink \"\$S/x.lnk\" || echo none"
+    assert_line --index 0 --regexp "^rc=2 the start time of pid [0-9]+, this lock's holder, could not be read"
+    refute_output --partial "another process"
+  done
+  assert_line --index 1 "$tag"
+  # A dead holder's lock is not broken by a breaker that cannot name itself either, though the new holder (another
+  # live pid) is named.
+  kill "$live"
+  wait "$live" 2>/dev/null || true
+  sleep 30 &
+  next=$!
+  run locks "ln -sfn '$tag' \"\$S/x.lnk\"; me=\$\$; ps() { [[ \"\$*\" == *\" \$me\" ]] && return 1; darwin_ps \"\$@\"; }
+    lock_take \"\$S/x.lnk\" 0 $next || echo \"rc=\$? \$LOCK_WHY\"; readlink \"\$S/x.lnk\""
+  kill "$next"
+  assert_line --index 0 --regexp "^rc=2 the start time of pid [0-9]+, the lanes process breaking a dead holder's lock, could not be read"
+  assert_line --index 1 "$tag"
+}
+
+@test "wait 0 with a break marker left by a dead breaker: the marker is dropped and the dead lock broken in one attempt" {
+  zombie_child
+  dead="$ZTAG"
+  kill "$ZPARENT"
+  run locks "ln -s '$dead' \"\$S/x.lnk\"; ln -s '$dead' \"\$S/x.lnk.break\"
+    lock_take \"\$S/x.lnk\" 0 \$\$ && echo taken; [[ \"\$(readlink \"\$S/x.lnk\")\" == \"\$LOCK_MINE\" ]] && echo mine
+    [[ -e \"\$S/x.lnk.break\" || -L \"\$S/x.lnk.break\" ]] && echo marker-left || echo marker-gone"
+  assert_output "taken
+mine
+marker-gone"
 }
 
 @test "the acquire is bounded by elapsed time, not attempts: a slow ps (macOS) with a live holder and marker ends within the wait" {

@@ -22,6 +22,25 @@ setup_lane() {
   assert_output "ready|$(git -C "$WORK" rev-parse HEAD)|finish item A1 and report done"
 }
 
+@test "a request and a clear-ready that cannot name their own process say so, never 'registry locked', and write nothing" {
+  setup_lane
+  register_lead
+  ps_fails_for self
+  export LANES_NO_FLOCK=1
+  PATH="$LANES_TEST_TMP/shim:$PATH" TMUX_PANE=%99 run "$LANES" request alpha
+  assert_failure
+  assert_output --regexp "registry lock not taken: the start time of pid [0-9]+, this lock's holder, could not be read"
+  refute_output --partial "registry locked"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --regexp "not clear-ready: registry lock not taken: the start time of pid [0-9]+"
+  refute_output --partial "registry locked"
+  run bash -c "jq -r '.handshake.state // \"none\"' '$LANES_DATA_DIR/lanes/state/alpha.json' 2>/dev/null || echo none"
+  assert_output none
+  run reg alpha .clear_ready
+  assert_output false
+}
+
 @test "clear-ready records the transcript and the turns it shows begun: prompts and goal verdicts, not tool results" {
   make_repo
   write_resume alpha
@@ -279,6 +298,32 @@ EOS
     run state alpha .handshake.worktree
     assert_output "$LANES_TEST_TMP/wt2"
   done
+}
+
+@test "a request that lands while clear-ready runs stands: clear-ready refuses, never overwrites it with ready" {
+  setup_lane
+  register_lead
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # After clear-ready read the record and before it takes the mutex (its read of the transcript path), the lead requests.
+  cat >"$LANES_TEST_TMP/shim/jq" <<EOS
+#!/usr/bin/env bash
+if [[ "\${1:-}" == -r && "\${2:-}" == '.transcript // ""' && ! -f "$LANES_TEST_TMP/requested" ]]; then
+  : >"$LANES_TEST_TMP/requested"
+  TMUX_PANE=%99 "$LANES" request alpha >"$LANES_TEST_TMP/request.out" 2>&1
+fi
+exec "$(command -v jq)" "\$@"
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/jq"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "a new 'lanes request alpha' arrived while this command ran"
+  assert_output --partial "run 'lanes clear-ready' again"
+  run cat "$LANES_TEST_TMP/request.out"
+  assert_output --partial "requested:"
+  run state alpha .handshake.state
+  assert_output requested
+  run reg alpha .clear_ready
+  assert_output false
 }
 
 @test "lanes request from a caller that is not the lead is refused and opens nothing" {

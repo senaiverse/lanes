@@ -171,19 +171,30 @@ holder_dead() {
 # seen half-written, and sets LOCK_MINE, the target to release with; a lock whose holder is proven dead (holder_state)
 # is broken (lock_break). The acquire gives up once <wait> whole seconds have passed by SECONDS, a builtin clock (bash
 # 4.4 has no EPOCHREALTIME, and date forks), so a slow liveness check never stretches it; the first try always runs.
+# Exits 1 while another holder has it, and 2 when this side's own holder cannot be named (lock_tag), since then no
+# lock can be taken or broken at all; LOCK_WHY says which, for the refusal.
 LOCK_MINE=""
+LOCK_WHY=""
 lock_take() {
   # The holder is read here: inside the $(...) below, BASHPID would be that subshell's.
-  local path="$1" end=$((SECONDS + $2)) first=1 seen holder="${3:-$BASHPID}"
-  LOCK_MINE="$(lock_tag "$holder")" || { LOCK_MINE=""; return 1; }
+  local path="$1" end=$((SECONDS + $2)) first=1 seen holder="${3:-$BASHPID}" rc
+  LOCK_MINE="$(lock_tag "$holder")" || { LOCK_MINE=""; lock_unnamed "$holder" "this lock's holder"; return 2; }
   until ln -s "$LOCK_MINE" "$path" 2>/dev/null; do
-    ((first || SECONDS < end)) || { LOCK_MINE=""; return 1; }
+    ((first || SECONDS < end)) || { LOCK_MINE=""; LOCK_WHY="held by another process (pid $(lock_holder "$path"))"; return 1; }
     first=0
     seen="$(readlink "$path" 2>/dev/null || true)"
-    if [[ -n "$seen" ]] && holder_dead "$seen" && lock_break "$path" "$seen"; then continue; fi
+    if [[ -n "$seen" ]] && holder_dead "$seen"; then
+      rc=0
+      lock_break "$path" "$seen" || rc=$?
+      ((rc == 0)) && continue
+      ((rc == 2)) && { LOCK_MINE=""; lock_unnamed "$BASHPID" "the lanes process breaking a dead holder's lock"; return 2; }
+    fi
     sleep 0.1
   done
 }
+
+# lock_unnamed <pid> <its part>: the reason no lock can be taken when the start time of that pid cannot be read.
+lock_unnamed() { LOCK_WHY="the start time of pid $1, $2, could not be read (ps or /proc failed), so lanes cannot name it in the lock"; }
 
 lock_holder() { local t; t="$(readlink "$1" 2>/dev/null || true)"; echo "${t%%.*}"; }
 
@@ -191,34 +202,45 @@ lock_holder() { local t; t="$(readlink "$1" 2>/dev/null || true)"; echo "${t%%.*
 lock_drop() { [[ "$(readlink "$1" 2>/dev/null || true)" == "$2" ]] && rm -f "$1"; return 0; }
 
 # lock_break <path> <target seen dead>: one breaker at a time holds <path>.break, and it removes the lock only if the
-# lock still has the target it saw dead, so a lock that a live process took meanwhile is never removed.
+# lock still has the target it saw dead, so a lock that a live process took meanwhile is never removed. A marker left
+# by a breaker proven dead is dropped and the marker taken again in the same call. Exits 1 when another breaker is live
+# or undecided, and 2 when this process cannot be named (lock_tag).
 lock_break() {
-  local marker="$1.break" me="$BASHPID" mine cur
-  mine="$(lock_tag "$me")" || return 1
-  if ! ln -s "$mine" "$marker" 2>/dev/null; then
+  local marker="$1.break" me="$BASHPID" mine cur try
+  mine="$(lock_tag "$me")" || return 2
+  for try in 1 2; do
+    if ln -s "$mine" "$marker" 2>/dev/null; then
+      lock_drop "$1" "$2"
+      lock_drop "$marker" "$mine"
+      return 0
+    fi
+    ((try == 1)) || return 1
     cur="$(readlink "$marker" 2>/dev/null || true)"
-    [[ -n "$cur" ]] && holder_dead "$cur" && lock_drop "$marker" "$cur"
-    return 1
-  fi
-  lock_drop "$1" "$2"
-  lock_drop "$marker" "$mine"
+    [[ -z "$cur" ]] || { holder_dead "$cur" && lock_drop "$marker" "$cur"; } || return 1
+  done
 }
 
 # ---- mutex: one short lock around every registry and state write -------------------------------------------------
 
 MUTEX_HELD=0
 MUTEX_MINE=""
-# mutex_take <seconds>: flock where it exists, else the symlink lock (stock macOS).
+# mutex_take <seconds>: flock where it exists, else the symlink lock (stock macOS); exits as lock_take, with LOCK_WHY.
 mutex_take() {
   mkdir -p "$STATE"
   if [[ -z "${LANES_NO_FLOCK:-}" ]] && command -v flock >/dev/null 2>&1; then
     exec 9>"$STATE/.mutex"
-    flock -w "$1" 9 || return 1
+    flock -w "$1" 9 || { LOCK_WHY="held by another process"; return 1; }
   else
-    lock_take "$STATE/.mutex.lnk" "$1" || return 1
+    lock_take "$STATE/.mutex.lnk" "$1" || return
     MUTEX_MINE="$LOCK_MINE"
   fi
   MUTEX_HELD=1
+}
+
+# mutex_refusal <mutex_take's exit status>: the one wording of a mutex not taken; "registry locked" only when another
+# process holds it, since a lanes that cannot name itself (exit 2) would be refused by every holder alike.
+mutex_refusal() {
+  if [[ "$1" == 2 ]]; then echo "registry lock not taken: $LOCK_WHY"; else echo "registry locked by another lanes process"; fi
 }
 
 mutex_drop() {
@@ -307,11 +329,13 @@ OS_NAME="$(uname -s)"
 # returns 1. A missing or empty file, bad JSON, a missing or mistyped key, a control character, a sessionId that is not
 # a session id, or a status outside idle|busy|waiting|shell is refused, never guessed.
 session_read() {
-  local f out
+  local f
   f="${2:-$HOME/.claude}/sessions/$1.json"
   SS_PROBLEM=""
   [[ -f "$f" ]] || { SS_PROBLEM="no Claude Code session file $f (the process exited, or it is not Claude Code)"; return 1; }
-  out="$(jq -r '
+  [[ -s "$f" ]] || { SS_PROBLEM="the session file $f is empty"; return 1; }
+  # Seven fields, the first "!<problem>" (and the rest empty) when the schema is not the known one.
+  jq_fields 7 '
     def need($k; $t): if has($k) | not then "no \"\($k)\" key" elif (.[$k] | type) != $t then "\"\($k)\" is a \(.[$k] | type), not a \($t)" else empty end;
     if type != "object" then "!not a JSON object"
     else ([need("pid"; "number"), need("procStart"; "string"), need("sessionId"; "string"), need("status"; "string"),
@@ -323,11 +347,12 @@ session_read() {
       elif (.status | IN("idle", "busy", "waiting", "shell") | not) then "!unknown status \"\(.status)\""
       elif .status == "waiting" and (.waitingFor | type) != "string" then "!status waiting without a waitingFor string"
       else [.pid, .procStart, .sessionId, .status, (.waitingFor // ""), .statusUpdatedAt,
-            (now * 1000 - .statusUpdatedAt | floor)] | map(tostring) | join("\u001f") end end' "$f" 2>/dev/null)" ||
+            (now * 1000 - .statusUpdatedAt | floor)] end end
+    | if type == "string" then ., ("", "", "", "", "", "") else .[] end' --file "$f" ||
     { SS_PROBLEM="the session file $f is not valid JSON"; return 1; }
-  [[ -n "$out" ]] || { SS_PROBLEM="the session file $f is empty"; return 1; }
-  [[ "$out" != "!"* ]] || { SS_PROBLEM="the session file $f has an unknown schema: ${out#!}"; return 1; }
-  IFS=$'\x1f' read -r SS_PID SS_PROCSTART SS_SID SS_STATUS SS_WAITING SS_UPDATED SS_AGE_MS <<<"$out"
+  [[ "${FIELDS[0]}" != "!"* ]] || { SS_PROBLEM="the session file $f has an unknown schema: ${FIELDS[0]#!}"; return 1; }
+  SS_PID="${FIELDS[0]}" SS_PROCSTART="${FIELDS[1]}" SS_SID="${FIELDS[2]}" SS_STATUS="${FIELDS[3]}"
+  SS_WAITING="${FIELDS[4]}" SS_UPDATED="${FIELDS[5]}" SS_AGE_MS="${FIELDS[6]}"
   valid_sid "$SS_SID" || { SS_PROBLEM="the session file $f has an unknown schema: sessionId \"$SS_SID\" is not a session id"; return 1; }
 }
 
@@ -520,13 +545,20 @@ WHY=""
 why_of() { WHY="$("$@")" || WHY="check failed: $1"; }
 check_failed() { [[ "$WHY" == "check failed: "* ]]; }
 
-# jq_fields <count> <filter> <json>: sets FIELDS to the <count> lines the filter prints for the document, or exits 1
-# when jq fails or prints another number of lines. jq's status is checked, never left to a process substitution that
-# hides it, so a crash cannot read as empty fields.
+# jq_fields <count> <filter> [json | --file <path>]: the one splitter of jq output into fields. Sets FIELDS to the
+# <count> values the filter prints for the document (default: stdin), a string as is and any other value as JSON, each
+# ended by a NUL, so a newline inside a value never shifts the next; a NUL inside a value, which no shell string holds,
+# reads as U+FFFD. A last "end" value proves jq ran the whole filter, so a crash or bad input exits 1, as does another
+# count.
 jq_fields() {
-  local out
-  out="$(jq -r "$2"', "end"' <<<"$3")" || return 1
-  mapfile -t FIELDS <<<"$out"
+  local prog="(($2) | if type == \"string\" then . else tojson end), \"end\" | gsub(\"\\u0000\"; \"\\ufffd\") + \"\\u0000\""
+  if [[ "${3:-}" == --file ]]; then
+    mapfile -d '' FIELDS < <(jq -j "$prog" "$4" 2>/dev/null)
+  elif (($# >= 3)); then
+    mapfile -d '' FIELDS < <(jq -j "$prog" <<<"$3" 2>/dev/null)
+  else
+    mapfile -d '' FIELDS < <(jq -j "$prog" 2>/dev/null)
+  fi
   ((${#FIELDS[@]} == $1 + 1)) && [[ "${FIELDS[$1]}" == end ]] || return 1
   unset 'FIELDS[$1]'
 }
@@ -593,17 +625,30 @@ lane_for_session() {
   return 1
 }
 
+# caller_server: the pid of the tmux server this command runs under, or nothing outside tmux. tmux sets TMUX to
+# "<socket path>,<server pid>,<session id, or -1>" (environ.c environ_for_session; tmux(1) calls it internal
+# information), so it is read from the right, since a socket path may hold a comma.
+caller_server() { if [[ "${TMUX:-}" =~ ,([0-9]+),-?[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"; fi; }
+
+# entry_on_pane <entry> <server pid> <pane>: the registry entry names that pane on that tmux server. A pane id is unique
+# only within one server (every server's first pane is %0), so both must match, and an unknown one matches nothing.
+entry_on_pane() {
+  [[ -n "$2" && -n "$3" ]] &&
+    [[ "$(jq -r '"\(.tmux_pid // "") \(.tmux_pane // "")"' <<<"$1" 2>/dev/null)" == "$2 $3" ]]
+}
+
+# lane_for_pane <pane> [server pid]: the lane registered on that pane of that server (default: the caller's server).
 lane_for_pane() {
-  local lane e
-  [[ -n "${1:-}" ]] || return 1
+  local lane e server
+  server="${2-$(caller_server)}"
   while IFS= read -r lane; do
     e="$(reg_read "$lane")" || continue
-    [[ "$(jq -r '.tmux_pane // ""' <<<"$e")" == "$1" ]] && { echo "$lane"; return 0; }
+    entry_on_pane "$e" "$server" "${1:-}" && { echo "$lane"; return 0; }
   done < <(each_lane)
   return 1
 }
 
-# caller_lane: the registered lane of the pane this command runs in, or nothing.
+# caller_lane: the registered lane of the pane this command runs in (TMUX_PANE on the caller's server), or nothing.
 caller_lane() { lane_for_pane "${TMUX_PANE:-}" || true; }
 
 # caller_project: the one rule for the caller's project (project_of): the registered cwd of the caller's lane when its
@@ -709,14 +754,15 @@ gc_sessions() {
   done
 }
 
-# release_pane <lane> <pane>: a pane runs one session, so any other lane entry naming it loses it (and clear-ready).
+# release_pane <lane> <server pid> <pane>: a pane runs one session, so any other lane entry naming that pane of that
+# server (entry_on_pane) loses it (and clear-ready); the same pane id on another server is another pane.
 release_pane() {
-  local other
-  [[ -n "$2" ]] || return 0
+  local other e
   while IFS= read -r other; do
-    [[ "$other" != "$1" && "$(reg_read "$other" | jq -r '.tmux_pane // ""' 2>/dev/null)" == "$2" ]] || continue
-    reg_update "$other" '.tmux_pane = null | .clear_ready = false'
-    notice "pane $2 was registered to lane '$other', which now has no pane"
+    if [[ "$other" != "$1" ]] && e="$(reg_read "$other")" && entry_on_pane "$e" "$2" "$3"; then
+      reg_update "$other" '.tmux_pane = null | .clear_ready = false'
+      notice "pane $3 was registered to lane '$other', which now has no pane"
+    fi
   done < <(each_lane)
 }
 
@@ -739,15 +785,15 @@ name_holder() {
 }
 
 cmd_register() {
-  local input lane sid cwd src tp pane role existing old_sid held ctx="" fresh wt down ids cpid="${CLAUDE_PID:-}" f=()
+  local input lane sid cwd src tp pane server rc role existing old_sid held ctx="" fresh wt down ids cpid="${CLAUDE_PID:-}" f=()
   input="$(cat || true)"
-  mapfile -t f < <(jq -r 'if type == "object" then (.session_title // ""), (.session_id // ""), (.cwd // ""), (.source // ""),
-    (.transcript_path // "" | tostring) else empty end' 2>/dev/null <<<"$input")
-  if ((${#f[@]} != 5)); then
+  if ! jq_fields 5 'if type == "object" then (.session_title // ""), (.session_id // ""), (.cwd // ""), (.source // ""),
+    (.transcript_path // "" | tostring) else empty end' "$input"; then
     notice "hook input is not a JSON object: nothing registered"
     hook_emit
     return 0
   fi
+  f=("${FIELDS[@]}")
   lane="${f[0]}" sid="${f[1]}" cwd="${f[2]}" src="${f[3]}" tp="${f[4]}" pane="${TMUX_PANE:-}"
   # The process comes from CLAUDE_PID and the session from the hook input (code.claude.com/docs/en/env-vars):
   # CLAUDE_CODE_SESSION_ID is not compared, since after --continue or --resume without an id it may hold the startup id.
@@ -758,7 +804,9 @@ cmd_register() {
     return 0
   fi
   [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]] && refresh_statusline_link "$CLAUDE_PLUGIN_ROOT"
-  mutex_take 5 || { notice "registry is locked by another lanes process: not registered this time"; hook_emit; return 0; }
+  rc=0
+  mutex_take 5 || rc=$?
+  ((rc == 0)) || { notice "$(mutex_refusal "$rc"): not registered this time"; hook_emit; return 0; }
   record_config "$cwd"
   if [[ -z "$lane" ]]; then
     notice "no session_title in the hook input: start every session as 'claude --name <lane>' so it can be a lane"
@@ -771,6 +819,9 @@ cmd_register() {
     return 0
   fi
   [[ -z "$pane" ]] && notice "TMUX_PANE is not set: lane '$lane' is registered without a pane, so 'lanes clear' cannot reach it; run it inside tmux"
+  server=""
+  [[ -n "$pane" ]] && server="$(caller_server)"
+  [[ -n "$pane" && -z "$server" ]] && notice "TMUX is '${TMUX:-}', not tmux's '<socket>,<server pid>,<session>': lane '$lane' is registered without its tmux server, so its pane is never matched to it; start it from a tmux pane"
   existing=""
   if existing="$(reg_read "$lane")"; then
     :
@@ -780,8 +831,9 @@ cmd_register() {
   fi
   role="lane" old_sid=""
   if [[ -n "$existing" ]]; then
-    mapfile -t f < <(jq -r '(.session_id // ""), (.role // "lane")' <<<"$existing")
-    old_sid="${f[0]}" role="${f[1]}"
+    jq_fields 2 '(.session_id // ""), (.role // "lane")' "$existing" ||
+      { notice "the registry entry for '$lane' could not be read: this session was not registered"; hook_emit; return 0; }
+    old_sid="${FIELDS[0]}" role="${FIELDS[1]}"
     # Also for the same session id: a second process resuming the session (no --fork-session) is another process.
     held="$(name_holder "$lane" "$existing" "$cpid")" ||
       held="lane name '$lane' could not be checked against its registered session (check failed: ${held:-name_holder}): this session was not registered; run 'lanes status', then restart this session"
@@ -794,21 +846,23 @@ cmd_register() {
   case "${LANES_ROLE:-}" in lead | lane) role="$LANES_ROLE" ;; esac
   fresh=1
   [[ -n "$existing" && "$old_sid" == "$sid" ]] && fresh=0
-  # Beside the pane id: the tmux server pid and the pane's pid (identity_problem), Claude Code's own pid and start time
-  # (lane_session, which proves a reused pid by it), and its config dir, where its sessions file is (null: ~/.claude).
+  # Beside the pane id: the caller's tmux server (caller_server; the pane id is unique only within it) and the pane's
+  # pid (identity_problem), Claude Code's own pid and start time (lane_session, which proves a reused pid by it), and
+  # its config dir, where its sessions file is (null: ~/.claude).
   ids="$( [[ -n "$pane" ]] && pane_identity "$pane" || true)"
   proc_start_get "$cpid" || true
   write_atomic "$(reg_file "$lane")" "$(jq -nc --argjson old "${existing:-null}" --arg lane "$lane" --arg sid "$sid" \
     --arg role "$role" --arg pane "$pane" --arg cwd "$cwd" --arg now "$(iso_now)" --argjson fresh "$fresh" --arg ids "$ids" \
-    --argjson cpid "$cpid" --arg cst "$PS_VALUE" --arg ccd "${CLAUDE_CONFIG_DIR:-}" '
+    --arg server "$server" --argjson cpid "$cpid" --arg cst "$PS_VALUE" --arg ccd "${CLAUDE_CONFIG_DIR:-}" '
     ($ids | split(" ") | map(tonumber? // null)) as $id
     | {lane: $lane, session_id: $sid, role: $role, tmux_pane: (if $pane == "" then null else $pane end),
-     tmux_pid: $id[0], pane_pid: $id[1], claude_pid: $cpid, claude_start: (if $cst == "" then null else $cst end),
+     tmux_pid: ($server | tonumber? // null), pane_pid: $id[1], claude_pid: $cpid,
+     claude_start: (if $cst == "" then null else $cst end),
      claude_config_dir: (if $ccd == "" then null else $ccd end),
      cwd: $cwd,
      used_pct: (if $fresh == 1 then null else $old.used_pct end),
      clear_ready: (if $fresh == 1 then false else ($old.clear_ready // false) end), updated_at: $now}')"
-  release_pane "$lane" "$pane"
+  release_pane "$lane" "$server" "$pane"
   valid_sid "$sid" && write_atomic "$DATA/sessions/$sid" "$lane"
   gc_sessions
   if ((fresh)); then
@@ -841,14 +895,14 @@ cmd_register() {
 # Activity is never recorded here, since it comes from the sessions file. Nothing is printed (a prompt's stdout
 # reaches the model), and jq reads stdin once, since a prompt can be far larger than an argument may be.
 cmd_hook() {
-  local kind="${1:-}" lane proj f=()
+  local kind="${1:-}" lane proj rc f=()
   case "$kind" in ask | prompt) ;; *) usage ;; esac
-  mapfile -t f < <(jq -r '
+  jq_fields 5 '
     if type == "object" then (.session_id // ""), (.session_title // ""), (.cwd // ""),
       ((.prompt // "") | if startswith("/") then .[0:200] else "" end),
       (.transcript_path // "" | tostring)
-    else empty end' 2>/dev/null)
-  ((${#f[@]} == 5)) || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
+    else empty end' || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
+  f=("${FIELDS[@]}")
   if [[ "$kind" == ask ]]; then
     # Only a session registered in a project in away mode, its lead or a lane, is refused; any other session asks.
     lane="$(lane_for_session "${f[0]}" "${f[1]}")" || return 0
@@ -861,7 +915,9 @@ cmd_hook() {
     return 0
   fi
   lane="$(lane_for_session "${f[0]}" "${f[1]}")" || return 0
-  mutex_take 3 || { echo "lanes: registry locked: prompt of '$lane' not recorded" >&2; return 0; }
+  rc=0
+  mutex_take 3 || rc=$?
+  ((rc == 0)) || { echo "lanes: $(mutex_refusal "$rc"): prompt of '$lane' not recorded" >&2; return 0; }
   # Ownership is decided again under the mutex: a hook of an old session that waited here must not write over the
   # session that took the lane meanwhile.
   [[ "$(lane_for_session "${f[0]}" "${f[1]}")" == "$lane" ]] || { mutex_drop; return 0; }

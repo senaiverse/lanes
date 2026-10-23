@@ -16,27 +16,42 @@ monitor_dir() { printf '%s/%s' "$MON" "$(hash_of "$1")"; }
 # monitor_live <lock>: the watcher holding <lock> is proven to run (holder_state, the rule of every lock).
 monitor_live() { holder_state "$(readlink "$1" 2>/dev/null || true)"; }
 
-# cmd_monitor_lock <name> <pid>: the watcher loop (its own $$) holds <name> in the caller's project (caller_project)
-# while it lives. A second start is refused while that holder runs; a lock whose holder is proven dead is reclaimed
+# monitor_project <name>: sets MON_PROJECT to the caller's project (caller_project), and refuses before any lock or
+# state is touched when the loop's own directory is in another project: a watcher reads its directory's repository
+# (gh, git), so its lock and what it reads must be one project.
+MON_PROJECT=""
+monitor_project() {
+  local here
+  MON_PROJECT="$(caller_project)"
+  here="$(project_of "$PWD")"
+  [[ "$here" == "$MON_PROJECT" ]] ||
+    die "monitor $1: this loop runs in $PWD, of project $here, not in this session's project $MON_PROJECT" "start the loop from a directory of that project (cd there first, as skills/lead/MONITORS.md says); nothing was locked or stored" 2
+}
+
+# cmd_monitor_lock <name> <pid>: the watcher loop (its own $$) holds <name> in its project (monitor_project) while it
+# lives. A second start is refused while that holder runs; a lock whose holder is proven dead is reclaimed
 # (lock_take). The lock is never released: the holder's death frees it.
 cmd_monitor_lock() {
-  local name="${1:-}" pid="${2:-}" lock
+  local name="${1:-}" pid="${2:-}" lock rc=0
   if ! valid_monitor "$name" || [[ ! "$pid" =~ ^[0-9]+$ ]]; then usage; fi
   lock_tag "$pid" >/dev/null || die "monitor $name: pid $pid is not running" "pass the watcher loop's own pid (\$\$)"
-  lock="$(monitor_dir "$(caller_project)")/$name.lnk"
+  monitor_project "$name"
+  lock="$(monitor_dir "$MON_PROJECT")/$name.lnk"
   mkdir -p "${lock%/*}"
-  lock_take "$lock" 0 "$pid" ||
-    die "monitor $name is already running (pid $(lock_holder "$lock"))" "leave it running; one watcher per signal"
+  lock_take "$lock" 0 "$pid" || rc=$?
+  ((rc != 2)) || die "monitor $name not started: $LOCK_WHY" "check that ps works, then start it again"
+  ((rc == 0)) || die "monitor $name is already running (pid $(lock_holder "$lock"))" "leave it running; one watcher per signal"
   echo "monitor $name: running as pid $pid"
 }
 
 # cmd_monitor_diff <name>: stdin is the whole current set, one "<item><TAB><state>" line per item. Prints
 # "<item>: <old> -> <new>" for each changed or new item (old "none") and "<item>: gone" for each item that left, then
-# stores the set for the caller's project (caller_project). The first pass prints every item once, as the baseline.
+# stores the set for its project (monitor_project). The first pass prints every item once, as the baseline.
 cmd_monitor_diff() {
   local name="${1:-}" cur old dir
   valid_monitor "$name" || usage
-  dir="$(monitor_dir "$(caller_project)")"
+  monitor_project "$name"
+  dir="$(monitor_dir "$MON_PROJECT")"
   mkdir -p "$dir"
   cur="$(jq -Rnc '[inputs | select(test("\t")) | split("\t") | {key: .[0], value: (.[1:] | join("\t"))}] | from_entries')"
   old="$(jq -c 'select(type == "object")' "$dir/$name.state" 2>/dev/null || true)"

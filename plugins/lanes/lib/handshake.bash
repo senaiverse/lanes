@@ -104,14 +104,14 @@ unused_problem() {
 # pane registered to a lane speaks only for that lane.
 self_lane() {
   local caller
+  caller="$(caller_lane)"
   if [[ -n "${1:-}" ]]; then
     valid_lane "$1" || die "invalid lane '$1'" "use the name the session was started with" 2
-    caller="$(caller_lane)"
     [[ -z "$caller" || "$caller" == "$1" ]] ||
       die "not clear-ready: pane ${TMUX_PANE:-} is lane $caller, not $1" "a lane reports only its own readiness: run 'lanes clear-ready' in $1's own pane" 2
     echo "$1"
-  elif lane_for_pane "${TMUX_PANE:-}"; then
-    :
+  elif [[ -n "$caller" ]]; then
+    echo "$caller"
   else
     die "cannot tell which lane this is" "run it inside the lane's tmux pane, or pass --lane <name>"
   fi
@@ -141,7 +141,7 @@ require_own_lane() {
 }
 
 cmd_request() {
-  local lane="${1:-}" e file block="" h="" wt
+  local lane="${1:-}" e file block="" h="" wt rc=0
   if ! valid_lane "$lane" || (($# != 1)); then usage; fi
   require_lead "requests a clear"
   require_own_lane "$lane"
@@ -151,7 +151,8 @@ cmd_request() {
   file="$(resume_path "$lane" "${wt:-$(jq -r .cwd <<<"$e")}")"
   block="$(resume_block "$file" || true)"
   [[ -n "$block" ]] && h="$(hash_of "$block")"
-  mutex_take 5 || die "registry locked" "retry in a moment"
+  mutex_take 5 || rc=$?
+  ((rc == 0)) || die "$(mutex_refusal "$rc")" "retry in a moment; nothing was requested"
   [[ "$(state_read "$lane" | jq -r '.handshake.state // ""')" != sending ]] ||
     die "a clear of $lane is in flight (handshake: sending)" "run 'lanes clear $lane' to finish or settle it before a new request"
   state_update "$lane" '.handshake = {state: "requested", requested_at: $now, request_resume_hash: $h,
@@ -164,7 +165,7 @@ cmd_request() {
 # cmd_clear_ready: the work tree is the one the lane runs this from (its Bash tool's directory), not the directory the
 # session started in. The goal re-sent after /clear is the RESUME Goal, its one source (RULES.md rule 6).
 cmd_clear_ready() {
-  local arg="" lane e st wt file block h goal tp turns
+  local arg="" lane e st wt file block h goal tp turns rc=0
   [[ "${1:-}" == "--lane" ]] && arg="${2:-}"
   lane="$(self_lane "$arg")"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "restart the session as 'claude --name $lane' inside tmux"
@@ -178,6 +179,8 @@ cmd_clear_ready() {
   [[ -z "$WHY" ]] || die "not clear-ready" "$(tr '\n' ';' <<<"$WHY")"
   h="$(hash_of "$block")"
   st="$(state_read "$lane")"
+  # The record proved here is the one ready replaces: a request that lands meanwhile stands (hs_cas_locked).
+  HS_WAS="$(jq -c '.handshake // null' <<<"$st")"
   if [[ "$(jq -r '.handshake.state // ""' <<<"$st")" == requested ]]; then
     why_of rewritten_problem "$file" "$h" "$(jq -r '.handshake.request_resume_hash // ""' <<<"$st")" \
       "$(jq -r '.handshake.requested_at // 0' <<<"$st")"
@@ -187,15 +190,18 @@ cmd_clear_ready() {
   # The turns begun so far, this one included: one more later means the lane worked on after reporting ready.
   tp="$(jq -r '.transcript // ""' <<<"$st")"
   turns="$(turn_starts "$tp")" || turns=""
-  mutex_take 5 || die "registry locked" "retry in a moment"
+  mutex_take 5 || rc=$?
+  ((rc == 0)) || die "not clear-ready: $(mutex_refusal "$rc")" "run 'lanes clear-ready' again in a moment"
   # Ownership is decided under the mutex: a session that took the lane meanwhile is not marked ready for the old one.
   [[ "$(reg_read "$lane" | jq -r .session_id 2>/dev/null)" == "$(jq -r .session_id <<<"$e")" ]] ||
     die "not clear-ready" "lane $lane started a new session while clear-ready ran: run it again"
-  state_update "$lane" '.handshake = {state: "ready", ready_at: $now, requested_at: .handshake.requested_at,
-      session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: (.prompts // 0), goal: $goal, attempts: 0,
+  hs_cas_locked "$lane" "$HS_SAME" '{state: "ready", ready_at: $now, requested_at: (. // {}).requested_at,
+      session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: $prompts, goal: $goal, attempts: 0,
       transcript: $tp, turns: $turns}' \
     --argjson now "$(now)" --arg sid "$(jq -r .session_id <<<"$e")" --arg wt "$wt" --arg head "$(git -C "$wt" rev-parse HEAD)" \
-    --arg h "$h" --arg goal "$goal" --arg tp "$tp" --arg turns "$turns"
+    --arg h "$h" --arg goal "$goal" --arg tp "$tp" --arg turns "$turns" \
+    --argjson prompts "$(state_read "$lane" | jq '.prompts // 0')" ||
+    die "not clear-ready" "$HS_WHY: run 'lanes clear-ready' again (after a new request, rewrite the RESUME block first)"
   reg_update "$lane" '.clear_ready = true'
   mutex_drop
   echo "clear-ready: $lane at $(git -C "$wt" rev-parse --short HEAD). Tell the lead \"clear-ready\", then stop and wait."
@@ -203,12 +209,13 @@ cmd_clear_ready() {
 
 # ---- screen: the one fact with no native signal, a human's draft in the input line -------------------------------
 
-# screen_read <pane>: sets COMPOSER (the typed text, all its wrapped lines; empty for the placeholder) and
-# COMPOSER_FOUND (0 when no `❯`+NBSP input line is on screen, as under a dialog or another program). The layout is
-# Claude Code 2.1.309's (tests/lanes/captures); the last input line counts, and the pattern holds under LC_ALL=C.
+# screen_read <pane>: sets COMPOSER (the typed text, all its wrapped lines; empty for the placeholder),
+# COMPOSER_FOUND (0 when no `❯`+NBSP input line is on screen, as under a dialog or another program) and SCREEN_INSERT
+# (1 when a footer line below the input box starts with vim's `-- INSERT --`). The layout is Claude Code 2.1.309's
+# (tests/lanes/captures); the last input line counts, and the pattern holds under LC_ALL=C.
 screen_read() {
   local pane="$1" raw plain i line idx=-1 body bottom
-  COMPOSER="" COMPOSER_FOUND=0
+  COMPOSER="" COMPOSER_FOUND=0 SCREEN_INSERT=0
   raw="$(tm capture-pane -p -e -t "$pane" 2>/dev/null)" || return 0
   # shellcheck disable=SC2001 # a regex over many lines; parameter expansion has no portable regex form
   plain="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$raw")"
@@ -220,13 +227,19 @@ screen_read() {
   done
   ((idx >= 0)) || return 0
   COMPOSER_FOUND=1
+  for ((bottom = idx + 1; bottom < ${#lines[@]}; bottom++)); do
+    [[ "${lines[bottom]}" == "─"* ]] && break
+  done
+  for ((i = bottom + 1; i < ${#lines[@]}; i++)); do
+    line="${lines[i]#"${lines[i]%%[![:space:]]*}"}"
+    [[ "$line" != "-- INSERT --"* ]] || SCREEN_INSERT=1
+  done
   body="${rawlines[idx]#*"$PROMPT_MARK"}"
   [[ "$body" != $'\e[2m'* ]] || return 0
   # The input wraps onto lines indented two spaces, down to the bottom rule; they join with one space.
   COMPOSER="$(sed $'s/\x1b\\[[0-9;]*m//g; s/[[:space:]]*$//' <<<"$body")"
-  for ((bottom = idx + 1; bottom < ${#lines[@]}; bottom++)); do
-    [[ "${lines[bottom]}" == "─"* ]] && break
-    line="${lines[bottom]#  }"
+  for ((i = idx + 1; i < bottom; i++)); do
+    line="${lines[i]#  }"
     COMPOSER+=" ${line%"${line##*[![:space:]]}"}"
   done
 }
@@ -253,9 +266,10 @@ composer_problem() {
 # ---- typed sends -------------------------------------------------------------------------------------------------
 
 # keys_check <lane> <pane> <session id>: sets WHY to why keys sent to the pane now would not reach that session of the
-# lane alone, or empty. In copy mode they go to tmux, with synchronize-panes to every pane of the window, and while
-# Claude Code is not the terminal's foreground program to whatever is; for those three HOLD_FIX names the human's
-# step, since the session is still proven and its clear-ready still holds (empty for any other objection).
+# lane alone as typed text, or empty. In copy mode they go to tmux, with synchronize-panes to every pane of the window,
+# while Claude Code is not the terminal's foreground program to whatever is, and in vim NORMAL mode they run as vim
+# commands; for those HOLD_FIX names the human's step, since the session is still proven and its clear-ready still
+# holds (empty for any other objection).
 keys_check() {
   HOLD_FIX=""
   case "$(tm display -p -t "$2" '#{pane_in_mode} #{pane_synchronized}' 2>/dev/null)" in
@@ -275,8 +289,73 @@ keys_check() {
   why_of identity_problem "$1" "$2" "$3"
   [[ -z "$WHY" ]] || return 0
   why_of foreground_problem "$1" "$2"
-  [[ -z "$WHY" ]] || check_failed ||
-    HOLD_FIX="bring Claude Code back to the foreground of pane $2 (fg in the shell it was started from)"
+  if [[ -n "$WHY" ]]; then
+    check_failed || HOLD_FIX="bring Claude Code back to the foreground of pane $2 (fg in the shell it was started from)"
+    return 0
+  fi
+  vim_problem "$1" "$2"
+  WHY="$VIM_WHY" HOLD_FIX="$VIM_FIX"
+}
+
+# vim_setting <lane>: prints "<editorMode> <statusLine.hideVimModeIndicator>" as the lane's Claude Code reads them,
+# the highest level that sets each winning (code.claude.com/docs/en/settings "Settings precedence": managed, then
+# --settings, project local, shared project, user). The files are the user settings under the lane's config dir, the
+# project's in its cwd, its local file there and at the repository root, then managed-settings.json and
+# managed-settings.d/*.json in alphabetical order (code.claude.com/docs/en/managed-settings); --settings, MDM and
+# server-managed settings are not visible to lanes. A file that exists but is not a JSON object fails, naming it.
+vim_setting() {
+  local e cfg cwd root mdir f files=() order=()
+  e="$(reg_read "$1")" || { echo "the registry entry for $1 is unreadable"; return 1; }
+  cfg="$(jq -r '.claude_config_dir // ""' <<<"$e")"
+  cwd="$(jq -r '.cwd // ""' <<<"$e")"
+  # The local file sits at the main checkout's root, which a worktree's common git dir names (settings docs).
+  root="$(cd "$cwd" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P || true)"
+  root="${root%/.git}"
+  mdir="${LANES_MANAGED_SETTINGS_DIR:-}"
+  if [[ -z "$mdir" ]]; then
+    if [[ "$OS_NAME" == Darwin ]]; then mdir="/Library/Application Support/ClaudeCode"; else mdir=/etc/claude-code; fi
+  fi
+  order=("${cfg:-$HOME/.claude}/settings.json" "$cwd/.claude/settings.json" "$cwd/.claude/settings.local.json")
+  [[ -z "$root" || "$root" == "$cwd" ]] || order+=("$root/.claude/settings.local.json")
+  order+=("$mdir/managed-settings.json")
+  # A glob skips hidden files and sorts by LC_COLLATE, here byte order.
+  local LC_COLLATE=C
+  for f in "$mdir"/managed-settings.d/*.json; do [[ -e "$f" ]] && order+=("$f"); done
+  for f in "${order[@]}"; do
+    [[ -e "$f" ]] || continue
+    jq -e 'type == "object"' "$f" >/dev/null 2>&1 ||
+      { echo "the settings file $f is not a readable JSON object"; return 1; }
+    files+=("$f")
+  done
+  ((${#files[@]})) || { echo "normal false"; return 0; }
+  jq -rs '(map(.editorMode | strings) | last // "normal") + " "
+    + (map(.statusLine | objects | .hideVimModeIndicator | booleans) | last // false | tostring)' "${files[@]}"
+}
+
+# vim_problem <lane> <pane>: sets VIM_WHY to why keys typed into the pane would not be taken as text under vim mode
+# (empty when they would) and VIM_FIX to the human's step, empty for a check that crashed. With editorMode vim the
+# footer must show `-- INSERT --` (NORMAL shows nothing, and its keys run as commands), so a hidden indicator is
+# always a refusal: the mode cannot be proven.
+VIM_WHY="" VIM_FIX=""
+vim_problem() {
+  local v mode hidden
+  VIM_WHY="" VIM_FIX=""
+  if ! v="$(vim_setting "$1")"; then
+    if [[ -z "$v" ]]; then VIM_WHY="check failed: vim_setting"; return 0; fi
+    VIM_WHY="$v, so vim mode cannot be ruled out" VIM_FIX="fix that settings file of lane $1"
+    return 0
+  fi
+  read -r mode hidden <<<"$v"
+  [[ "$mode" == vim ]] || return 0
+  if [[ "$hidden" == true ]]; then
+    VIM_WHY="lane $1 runs Claude Code in vim mode with its mode indicator hidden, so lanes cannot prove the input line takes text"
+    VIM_FIX="show the vim mode indicator (drop statusLine.hideVimModeIndicator) or set editorMode to normal for lane $1"
+    return 0
+  fi
+  screen_read "$2"
+  ((SCREEN_INSERT)) && return 0
+  VIM_WHY="lane $1 runs Claude Code in vim mode and pane $2 does not show -- INSERT --, so typed keys would run as vim commands"
+  VIM_FIX="press i in pane $2"
 }
 
 # foreground_problem <lane> <pane>: why the lane's Claude Code would not read keys typed into the pane now, or nothing.
@@ -368,10 +447,24 @@ erase_plan() {
       end'
 }
 
+# screen_settled <pane>: screen_read until two reads 0.2 s apart show the same input line (at most 10 reads), so no
+# plan starts from a screen still drawing our keys, which would show less than was typed; 1 when it kept changing.
+screen_settled() {
+  local i prev
+  screen_read "$1"
+  for ((i = 0; i < 9; i++)); do
+    prev="$COMPOSER_FOUND/$COMPOSER"
+    sleep 0.2
+    screen_read "$1"
+    [[ "$COMPOSER_FOUND/$COMPOSER" != "$prev" ]] || return 0
+  done
+  return 1
+}
+
 # erase_if_ours <lane> <pane> <text>: delete our typed text from its end, one burst of at most 64 Backspaces at a
-# time. Before each burst keys_check runs, then the input line is read and must hold only the part of our text not
-# yet deleted (or less of it), and the burst follows that read at once: a key typed after the read is all a burst can
-# reach. A screen that still shows more than is left is read again for up to a second. Sets ERASED for the message.
+# time. Before each burst keys_check runs, then the input line is read until it settles and must hold only the part
+# of our text not yet deleted (or less of it), and the burst follows that read at once: a key typed after the read is
+# all a burst can reach. A screen that still shows more than is left is read again for up to a second. Sets ERASED.
 erase_if_ours() {
   local left least len n keys plan sent=0 tries=0 burst=() keys_why
   left="$(printf '%s' "$3" | jq -Rs 'explode | length')" ||
@@ -379,7 +472,10 @@ erase_if_ours() {
   while :; do
     keys_check "$1" "$2" "$GUARD_SID"
     keys_why="$WHY"
-    screen_read "$2"
+    if ! screen_settled "$2"; then
+      ERASED="our typed text was left in the input line of $2, because the line kept changing (it shows '${COMPOSER:0:60}')"
+      return 0
+    fi
     plan=""
     ((!COMPOSER_FOUND)) || plan="$(erase_plan "$3" "$COMPOSER" "$left")"
     if [[ -z "$plan" ]] && ((!sent)); then
@@ -417,9 +513,14 @@ erase_if_ours() {
 # and ERASED set.
 submit() {
   local rc=0
-  # A kill (the Bash tool's timeout) deletes what was typed so far while the input line holds only that, and says so.
-  TYPED="" SUBMIT_PANE="$2" SUBMIT_LANE="$1"
-  trap 'if [[ -n "$TYPED" ]]; then erase_if_ours "$SUBMIT_LANE" "$SUBMIT_PANE" "$TYPED"; else ERASED="nothing was typed"; fi
+  # A kill (the Bash tool's timeout) deletes what was typed and not yet submitted while the input line holds only
+  # that, and says so. Text an Enter went to may have been submitted, so it is no longer ours to delete (ENTERED).
+  TYPED="" ENTERED=0 SUBMIT_PANE="$2" SUBMIT_LANE="$1"
+  trap 'if ((ENTERED)); then
+      echo "lanes: stopped after pressing Enter in $SUBMIT_PANE: the text may have been submitted, so nothing was deleted; look at the pane and run '"'lanes status'"'" >&2
+      exit 143
+    fi
+    if [[ -n "$TYPED" ]]; then erase_if_ours "$SUBMIT_LANE" "$SUBMIT_PANE" "$TYPED"; else ERASED="nothing was typed"; fi
     echo "lanes: stopped while typing into $SUBMIT_PANE: $ERASED" >&2; exit 143' TERM INT
   submit_keys "$@" || rc=$?
   trap 'exit 143' TERM INT # bin/lanes' own handler again
@@ -465,6 +566,9 @@ submit_keys() {
     erase_if_ours "$lane" "$pane" "$text"
     return 2
   fi
+  # From here the text may be submitted, so the kill trap deletes nothing (submit).
+  # shellcheck disable=SC2034 # read by submit's trap
+  TYPED="" ENTERED=1
   tm send-keys -t "$pane" Enter
   "$@" && return 0
   screen_read "$pane"
@@ -563,36 +667,75 @@ REFUSAL="not cleared"
 
 # clear_lock <lane>: one send at a time per lane, for lanes clear and lanes goal alike.
 clear_lock() {
-  local path="$STATE/$1.clear.lnk"
+  local path="$STATE/$1.clear.lnk" rc=0
   mkdir -p "$STATE"
-  lock_take "$path" 0 ||
+  lock_take "$path" 0 || rc=$?
+  ((rc != 2)) || die "the clear lock of $1 was not taken: $LOCK_WHY" "check that ps works, then run the command again; nothing was typed"
+  ((rc == 0)) ||
     die "another 'lanes clear $1' is running (or 'lanes goal $1'; pid $(lock_holder "$path"))" "let it finish; never run two at once"
   # shellcheck disable=SC2034 # on_exit in bin/lanes releases it
   CLEAR_LOCK="$path" CLEAR_MINE="$LOCK_MINE"
 }
 
-hs_set() { # hs_set <lane> <jq filter on .handshake> [args]
-  local lane="$1" filter="$2"
-  shift 2
-  mutex_take 5 || die "registry locked" "retry in a moment"
-  state_update "$lane" ".handshake |= ($filter)" "$@"
-  mutex_drop
+# Every handshake write of clear-ready and lanes clear is a compare-and-set: the record must still be HS_WAS, the one
+# the command last proved (read or wrote), so a request or another lanes command that changed it meanwhile is never
+# overwritten. HS_SAME is the usual test; HS_WHY says why a write did not happen.
+HS_WAS=null HS_WHY=""
+HS_SAME='. == $was'
+# The one change register makes on its own: SessionStart(clear) moves a sending record to cleared for the new session.
+HS_SAME_OR_CLEARED='. == $was or ($was.state == "sending" and .state == "cleared" and .cleared_session == $sid
+  and del(.state, .cleared_at, .cleared_session) == ($was | del(.state, .cleared_at, .cleared_session)))'
+
+# hs_cas_locked <lane> <test> <filter> [jq args]: under the caller's mutex, apply <filter> to the handshake record when
+# <test> holds for it ($was is HS_WAS), and make the result HS_WAS; else return 1 with HS_WHY set and the record left.
+hs_cas_locked() {
+  local lane="$1" test="$2" filter="$3" cur
+  shift 3
+  cur="$(state_read "$lane")"
+  if ! jq -e --argjson was "$HS_WAS" "$@" "(.handshake // null) | $test" <<<"$cur" >/dev/null; then
+    why_of ready_problem "$lane" "$(jq -r '.handshake.state // "none"' <<<"$cur")"
+    HS_WHY="${WHY:-another lanes command changed the handshake of $lane while this one ran}"
+    return 1
+  fi
+  state_update "$lane" ".handshake |= ($filter)" --argjson was "$HS_WAS" "$@" ||
+    { HS_WHY="the handshake record of $lane could not be written"; return 1; }
+  HS_WAS="$(state_read "$lane" | jq -c '.handshake // null')"
 }
 
-refuse_clear() { # refuse_clear <lane> <reason> <what to do>: drops clear-ready so the lane must report it again
-  mutex_take 5 && {
-    reg_update "$1" '.clear_ready = false' || true
-    state_update "$1" '.handshake.state = "stale" | .handshake.stale_reason = $r' --arg r "$2"
+# hs_cas <lane> <test> <filter> [jq args]: hs_cas_locked under its own mutex.
+hs_cas() {
+  local rc=0
+  mutex_take 5 || rc=$?
+  ((rc == 0)) || die "$(mutex_refusal "$rc")" "retry in a moment"
+  hs_cas_locked "$@" || rc=$?
+  mutex_drop
+  return "$rc"
+}
+
+# refuse_clear <lane> <reason> <what to do>: drops clear-ready so the lane must report it again; a record another
+# command changed meanwhile is left to it, and the message says so.
+refuse_clear() {
+  local note="" rc=0
+  mutex_take 5 || rc=$?
+  if ((rc == 0)); then
+    if hs_cas_locked "$1" "$HS_SAME" '.state = "stale" | .stale_reason = $r' --arg r "$2"; then
+      reg_update "$1" '.clear_ready = false' || true
+    else
+      note=" (the record was left as it is: $HS_WHY)"
+    fi
     mutex_drop
-  }
-  die "not cleared: $2" "$3"
+  else
+    note=" ($(mutex_refusal "$rc"), so the record was not changed)"
+  fi
+  die "not cleared: $2$note" "$3"
 }
 
 # refuse_keys <lane> <reason> <hold fix> <what to do>: a key-path hold (keys_check's HOLD_FIX) leaves the lane
 # clear-ready, since its session and work are unchanged, and names the human's step; anything else is refuse_clear's.
 refuse_keys() {
   [[ -n "$3" ]] || refuse_clear "$1" "$2" "$4"
-  hs_set "$1" '.state = "ready"'
+  hs_cas "$1" "$HS_SAME" '.state = "ready"' ||
+    die "not cleared: $2" "$3; the record was left as it is: $HS_WHY"
   die "not cleared: $2" "$3, then run 'lanes clear $1' again; the lane is still clear-ready"
 }
 
@@ -613,22 +756,24 @@ identity_problem() {
     { echo "pane $2 is on another tmux server than the one lane $1 registered from (tmux restarted, or the pane id was reused)"; return; }
   pid_within "${f[3]}" "${live[1]:-}" ||
     { echo "Claude Code pid ${f[3]} of lane $1 is not the process of pane $2 or a child of it"; return; }
+  # Another lane on this pane of this server (entry_on_pane); the same pane id on another server is another pane.
   while IFS= read -r other; do
-    [[ "$other" != "$1" && "$(reg_read "$other" | jq -r '.tmux_pane // ""' 2>/dev/null)" == "$2" ]] &&
+    [[ "$other" != "$1" ]] && e="$(reg_read "$other")" && entry_on_pane "$e" "${f[2]}" "$2" &&
       { echo "pane $2 is also registered to lane $other"; return; }
   done < <(each_lane)
   return 0
 }
 
-# target_checks <lane> <entry>: the registered pane exists, is not this pane, and keys sent to it reach this lane's
-# session alone (keys_check). Sets PANE_T.
+# target_checks <lane> <entry>: the registered pane exists, is not this pane (the caller's pane on the caller's server,
+# entry_on_pane), and keys sent to it reach this lane's session alone (keys_check). Sets PANE_T.
 target_checks() {
   local lane="$1" e="$2"
   PANE_T="$(jq -r '.tmux_pane // ""' <<<"$e")"
   [[ -n "$PANE_T" ]] || die "lane $lane has no tmux pane registered" "start it inside tmux as 'claude --name $lane'"
-  [[ "$PANE_T" != "${TMUX_PANE:-}" ]] || die "lane $lane is this pane" "a session never clears itself or types into its own pane; the human clears the lead"
+  ! entry_on_pane "$e" "$(caller_server)" "${TMUX_PANE:-}" || die "lane $lane is this pane" "a session never clears itself or types into its own pane; the human clears the lead"
   pane_exists "$PANE_T" || die "pane $PANE_T of lane $lane does not exist" "the lane is gone; restart it as 'claude --name $lane'"
   keys_check "$lane" "$PANE_T" "$(jq -r .session_id <<<"$e")"
+  [[ -z "$WHY" || -z "$HOLD_FIX" ]] || die "$REFUSAL: $WHY" "$HOLD_FIX, then run the command again; nothing was typed or written"
   [[ -z "$WHY" ]] || die "$REFUSAL: $WHY" "check 'lanes status'; never type into a pane whose session is not proven"
 }
 
@@ -655,42 +800,35 @@ changed_since_ready() {
     echo "the lane began another turn since clear-ready (its /goal went on, a background shell finished, or a message arrived)"
 }
 
-# final_verify <lane> <pane>: after the wait, prove again everything clear-ready proved and that the pane still hosts
-# this session; a failure drops clear-ready, except a key-path hold (refuse_keys). Activity is send_guard's, before
-# each key.
+# final_verify <lane> <pane>: after the wait, the record is still ready (it becomes HS_WAS, the one hs_sending moves)
+# and the pane still hosts this session; a failure drops clear-ready, except a key-path hold (refuse_keys). What
+# clear-ready proved (changed_since_ready) and activity are send_guard's, run before each key.
 final_verify() {
   local lane="$1" pane="$2" e st
-  e="$(reg_read "$lane")" || refuse_clear "$lane" "the registry entry became unreadable" "check 'lanes status'"
   st="$(state_read "$lane")"
+  HS_WAS="$(jq -c '.handshake // null' <<<"$st")"
+  e="$(reg_read "$lane")" || refuse_clear "$lane" "the registry entry became unreadable" "check 'lanes status'"
   why_of ready_problem "$lane" "$(jq -r '.handshake.state // "none"' <<<"$st")"
   [[ -z "$WHY" ]] || die "$REFUSAL: $WHY" "nothing was typed; the record was left as it is"
-  why_of changed_since_ready "$lane" "$e" "$st"
-  [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "ask the lane to finish, push and report clear-ready again"
   keys_check "$lane" "$pane" "$(jq -r .handshake.session_id <<<"$st")"
   [[ -z "$WHY" ]] || refuse_keys "$lane" "$WHY" "$HOLD_FIX" "check 'lanes status'; a pane belongs to the lane that registered last in it"
 }
 
 # ready_problem <lane> <handshake state>: why a clear may not go on from that record, or nothing when it is ready. A
-# record that changed while the clear ran belongs to whoever changed it, so the caller leaves it as it is.
+# record that changed while the command ran belongs to whoever changed it, so the caller leaves it as it is.
 ready_problem() {
   case "$2" in
     ready) ;;
-    requested) echo "a new 'lanes request $1' arrived while the clear ran; the request stands, so the lane reports clear-ready again first" ;;
-    *) echo "the handshake of $1 changed to '$2' while the clear ran" ;;
+    requested) echo "a new 'lanes request $1' arrived while this command ran; the request stands, so the lane reports clear-ready again first" ;;
+    *) echo "the handshake of $1 changed to '$2' while this command ran" ;;
   esac
 }
 
-# hs_sending <lane>: under the mutex, move a record that is still ready to sending, or refuse with ready_problem and
-# leave the record as it is (a request that landed after final_verify stands).
+# hs_sending <lane>: move the ready record final_verify proved to sending, or refuse and leave it as it is (a request
+# that landed after final_verify stands).
 hs_sending() {
-  local s
-  mutex_take 5 || die "registry locked" "retry in a moment"
-  s="$(state_read "$1" | jq -r '.handshake.state // "none"')"
-  why_of ready_problem "$1" "$s"
-  [[ -z "$WHY" ]] || die "$REFUSAL: $WHY" "nothing was typed; the record was left as it is"
-  state_update "$1" '.handshake |= (.state = "sending" | .attempts = ((.attempts // 0) + 1) | .sent_at = $now)' \
-    --argjson now "$(now)"
-  mutex_drop
+  hs_cas "$1" "$HS_SAME" '.state = "sending" | .attempts = ((.attempts // 0) + 1) | .sent_at = $now' \
+    --argjson now "$(now)" || die "$REFUSAL: $HS_WHY" "nothing was typed; the record was left as it is"
 }
 
 # idle_point <lane> <pane> <seconds> <session id> <ready 0|1> [shell]: settle, then arm send_guard with the
@@ -716,7 +854,9 @@ wait_arg() {
     WAIT_S="$2"
     shift 2
   done
-  [[ "$WAIT_S" =~ ^[0-9]+$ ]] || die "--wait '$WAIT_S' is not a number of seconds" "pass a whole number" 2
+  # The rule of the LANES_ timers (settings_check): a plain whole number in range, read as decimal.
+  int_in_range "$WAIT_S" 0 3600 || die "--wait '$WAIT_S' is not a whole number of seconds from 0 to 3600" "pass one in that range" 2
+  WAIT_S=$((10#$WAIT_S))
 }
 
 # restart_problem <lane> <session id>: why that session of the lane is not the one a /clear created, or nothing.
@@ -732,7 +872,7 @@ restart_problem() {
 }
 
 cmd_clear() {
-  local lane="${1:-}" wait_s e st hs pane sid goal new_sid rc=0 age
+  local lane="${1:-}" wait_s e st hs pane sid goal new_sid rc=0 age note
   valid_lane "$lane" || usage
   shift
   wait_arg "$@"
@@ -742,7 +882,8 @@ cmd_clear() {
   clear_lock "$lane"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane' (missing, half-written or corrupt)" "the lane re-registers on its next session start; check 'lanes status'"
   st="$(state_read "$lane")"
-  hs="$(jq -r '.handshake.state // "none"' <<<"$st")"
+  HS_WAS="$(jq -c '.handshake // null' <<<"$st")"
+  hs="$(jq -r '.state // "none"' <<<"$HS_WAS")"
   sid="$(jq -r .session_id <<<"$e")"
   target_checks "$lane" "$e"
   pane="$PANE_T"
@@ -751,18 +892,18 @@ cmd_clear() {
   # /clear created, before anyone has prompted it.
   case "$hs" in
     sending)
-      age=$(($(now) - $(jq -r '.handshake.sent_at // 0' <<<"$st")))
+      age=$(($(now) - $(jq -r '.sent_at // 0' <<<"$HS_WAS")))
       ((age <= REQUEST_TIMEOUT)) ||
         refuse_clear "$lane" "an earlier clear stopped at sending $age s ago, older than LANES_REQUEST_TIMEOUT ($REQUEST_TIMEOUT s)" "start a new handshake with 'lanes request $lane'"
-      if [[ "$sid" != "$(jq -r .handshake.session_id <<<"$st")" ]]; then
+      if [[ "$sid" != "$(jq -r .session_id <<<"$HS_WAS")" ]]; then
         why_of restart_problem "$lane" "$sid"
         [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "the goal is not sent into a session no /clear created; start a new handshake with 'lanes request $lane'"
-        hs_set "$lane" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' --argjson now "$(now)" --arg sid "$sid"
-        st="$(state_read "$lane")"
+        hs_cas "$lane" "$HS_SAME" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' \
+          --argjson now "$(now)" --arg sid "$sid" || die "$REFUSAL: $HS_WHY" "nothing was typed; the record was left as it is"
         hs=cleared
       else
         echo "lanes: an earlier clear of $lane stopped before /clear landed; checking again from the start" >&2
-        hs_set "$lane" '.state = "ready"'
+        hs_cas "$lane" "$HS_SAME" '.state = "ready"' || die "$REFUSAL: $HS_WHY" "nothing was typed; the record was left as it is"
         hs=ready
       fi
       ;;
@@ -770,9 +911,9 @@ cmd_clear() {
     *) die "lane $lane is not clear-ready (handshake: $hs)" "ask the lane to finish, push and run 'lanes clear-ready'" ;;
   esac
   if [[ "$hs" == cleared ]]; then
-    [[ "$(jq -r '.handshake.cleared_session // ""' <<<"$st")" == "$sid" ]] ||
+    [[ "$(jq -r '.cleared_session // ""' <<<"$HS_WAS")" == "$sid" ]] ||
       die "lane $lane cleared or restarted in another session since this handshake's /clear" "the goal is not resent into it; start a new handshake with 'lanes request $lane'"
-    age=$(($(now) - $(jq -r '.handshake.cleared_at // 0' <<<"$st")))
+    age=$(($(now) - $(jq -r '.cleared_at // 0' <<<"$HS_WAS")))
     ((age <= REQUEST_TIMEOUT)) ||
       die "the handshake's /clear landed $age s ago, older than LANES_REQUEST_TIMEOUT ($REQUEST_TIMEOUT s)" "the goal is not resent so late; set it with 'lanes goal $lane' or start a new handshake"
     why_of unused_problem "$lane" "$sid"
@@ -793,7 +934,7 @@ cmd_clear() {
     # The record is left at sending: a rerun finds whether /clear landed late (a new session) or starts over.
     ((rc != 3)) || die "/clear was sent to $pane once, then $MOVED" "it may have been taken late ($ERASED); run 'lanes status', then 'lanes clear $lane' again, which resumes from the record"
     if ((rc != 0)); then
-      hs_set "$lane" '.state = "failed" | .failed = "clear not confirmed"'
+      hs_cas "$lane" "$HS_SAME" '.state = "failed" | .failed = "clear not confirmed"' || true
       die "/clear was sent to $pane but no new session appeared in its sessions file and the registry" "look at the pane; the clear is not confirmed and was not retried further"
     fi
   fi
@@ -801,11 +942,16 @@ cmd_clear() {
   e="$(reg_read "$lane")" || die "registry entry for '$lane' unreadable after /clear" "check 'lanes status'"
   new_sid="$(jq -r .session_id <<<"$e")"
   if [[ "$hs" == ready ]]; then
+    # A restarted session leaves the record at sending (register moves it only on a /clear), so refuse_clear finds it.
     why_of restart_problem "$lane" "$new_sid"
     [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "the goal is not sent into a session no /clear created; look at the pane, then start a new handshake with 'lanes request $lane'"
+    # The sending record, or register's cleared one for this session, is what this clear proved; anything else (a
+    # request that landed after /clear) stands, and no goal is sent from it.
+    hs_cas "$lane" "$HS_SAME_OR_CLEARED" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' \
+      --argjson now "$(now)" --arg sid "$new_sid" ||
+      die "$REFUSAL: /clear landed in $pane, then $HS_WHY" "the goal was not sent and the record was left as it is; wait for the lane's new 'clear-ready', or set the goal with 'lanes goal $lane'"
   fi
-  [[ "$hs" != ready ]] || hs_set "$lane" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' --argjson now "$(now)" --arg sid "$new_sid"
-  goal="$(state_read "$lane" | jq -r '.handshake.goal // ""')"
+  goal="$(jq -r '.goal // ""' <<<"$HS_WAS")"
   if [[ -n "$goal" ]]; then
     wait_composer_empty "$pane" || die "the cleared session in $pane shows no empty input line" "look at the pane; the goal was not sent"
     idle_point "$lane" "$pane" "$wait_s" "$new_sid" 0
@@ -820,13 +966,22 @@ cmd_clear() {
     fi
     ((rc != 3)) || die "/goal was sent to $pane once, then $MOVED" "it may have been taken late ($ERASED); look at the pane and 'lanes status' before sending it again"
     if ((rc != 0)); then
-      hs_set "$lane" '.state = "failed" | .failed = "goal not confirmed"'
+      hs_cas "$lane" "$HS_SAME" '.state = "failed" | .failed = "goal not confirmed"' || true
       die "/goal was typed into $pane but the session never received it" "look at the pane and set the goal with 'lanes goal $lane'"
     fi
   fi
-  hs_set "$lane" '.state = "done" | .done_at = $now' --argjson now "$(now)"
-  mutex_take 5 && { reg_update "$lane" '.clear_ready = false' || true; mutex_drop; }
-  echo "cleared: $lane (pane $pane) has a new session${goal:+ and its goal is set}"
+  # A record another command changed meanwhile (a new request) keeps its own clear_ready.
+  note=""
+  rc=0
+  mutex_take 5 || rc=$?
+  ((rc == 0)) || die "$(mutex_refusal "$rc")" "the clear landed${goal:+ and its goal is set}, but its record was not closed; check 'lanes status'"
+  if hs_cas_locked "$lane" "$HS_SAME" '.state = "done" | .done_at = $now' --argjson now "$(now)"; then
+    reg_update "$lane" '.clear_ready = false' || true
+  else
+    note="; its record was left as it is: $HS_WHY"
+  fi
+  mutex_drop
+  echo "cleared: $lane (pane $pane) has a new session${goal:+ and its goal is set}$note"
 }
 
 # cmd_goal <lane> <text> [--wait s]: the lead sets or replaces a lane's /goal (a new /goal replaces an active one,

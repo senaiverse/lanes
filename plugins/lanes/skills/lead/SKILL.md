@@ -31,7 +31,8 @@ Done when every lane has one item in flight and a tracker row that names it.
 ## 3. Watch the lanes
 
 At the start of each session, start every watcher the SessionStart context lists as down: CI, review score, lane
-context and journal drift, one endless Monitor each. Their commands are in [MONITORS.md](MONITORS.md).
+context and journal drift, one endless Monitor each, run from a directory of your own project. Their commands are in
+[MONITORS.md](MONITORS.md).
 
 Run `lanes status` at each check; it lists your own project's lead and lanes only. A row reads lane, role, pane, context, activity, goal, readiness and handshake:
 
@@ -69,7 +70,8 @@ Done when `lanes status` shows the lane with handshake `done` and the lane has a
 
 When `lanes clear` refuses, its message names the cause and the fix; act on that cause. See
 [HANDSHAKE.md](HANDSHAKE.md) for each refusal. When a request times out (`request-timed-out`), ask the human
-(step 6) instead of clearing.
+(step 6) instead of clearing. A lane in vim mode must be in INSERT for `lanes clear` and `lanes goal`; the refusal
+says to press i in its pane.
 
 ### Set or replace a lane's goal
 

@@ -38,24 +38,41 @@ lead_ctx() {
   kill "$b"
 }
 
-@test "a watcher started from the lead's pane keys to the lead's project, whatever directory its shell is in" {
+@test "a watcher whose directory is in another project than the lead's is refused before it locks or stores anything" {
   in_p1
   lead_ctx "$P1" >/dev/null
   sleep 30 &
   a=$!
-  # The loop runs in P2, from the lead's pane (%9, registered from P1).
+  # The loop runs in P2, from the lead's pane (%9, registered from P1): its gh and git would read P2.
   run bash -c "cd '$P2' && TMUX_PANE=%9 '$LANES' monitor-lock ci $a"
-  assert_success
+  assert_failure 2
+  assert_output --partial "monitor ci: this loop runs in $P2, of project $P2, not in this session's project $P1"
+  assert_output --partial "nothing was locked"
   run bash -c "cd '$P2' && printf 'x\tup\n' | TMUX_PANE=%9 '$LANES' monitor-diff ci"
+  assert_failure 2
+  run bash -c "ls -A '$LANES_DATA_DIR/monitors' 2>/dev/null"
+  assert_output ""
+  # From the lead's own project the same pane starts it, and P1 sees the lock and the state.
+  run bash -c "cd '$P1' && TMUX_PANE=%9 '$LANES' monitor-lock ci $a"
+  assert_success
+  run bash -c "cd '$P1' && printf 'x\tup\n' | TMUX_PANE=%9 '$LANES' monitor-diff ci"
   assert_output "x: none -> up"
-  # P1 sees both the lock and the state; P2, outside the pane, sees neither.
   run lead_ctx "$P1"
   assert_output --partial "watchers not running: reviews context drift."
-  run bash -c "cd '$P1' && printf 'x\tup\n' | '$LANES' monitor-diff ci"
-  assert_output ""
-  run bash -c "cd '$P2' && '$LANES' monitor-lock ci $a"
-  assert_success
   kill "$a"
+}
+
+@test "monitor-lock says the holder could not be named, never 'already running', when its start time cannot be read" {
+  in_p1
+  sleep 30 &
+  a=$!
+  # The pid check passes, then every later read of the watcher's start time fails (ps fails for that pid only).
+  seen="$LANES_TEST_TMP/seen"
+  run bash -c "source '$LANES'; $DARWIN; ps() { if [[ \"\$*\" == *' $a' ]]; then [[ -e '$seen' ]] && return 1; : >'$seen'; fi; darwin_ps \"\$@\"; }; cmd_monitor_lock ci $a"
+  kill "$a"
+  assert_failure
+  assert_output --partial "monitor ci not started: the start time of pid $a, this lock's holder, could not be read"
+  refute_output --partial "already running"
 }
 
 @test "monitor-lock refuses a pid that is not running and a name that is not plain" {

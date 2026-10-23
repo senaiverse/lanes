@@ -40,6 +40,42 @@ verdict() {
   assert_output "prompt=0 composer="
 }
 
+@test "after a turn the empty input line is the bare prompt, with no placeholder: an empty composer" {
+  for cap in 10-vim-08-normal-empty-after-turn 10-vim-09-insert-empty-after-turn; do
+    run verdict "$cap"
+    assert_output "prompt=1 composer="
+  done
+}
+
+# insert_of <capture>: "insert=<0|1> composer=<text>", the footer's vim INSERT indicator as screen_read reads it.
+insert_of() {
+  bash -c '
+    source "$1"
+    cap="$2"
+    tm() { cat "$cap"; }
+    screen_read x
+    printf "insert=%s composer=%s\n" "$SCREEN_INSERT" "$COMPOSER"
+  ' _ "$LANES" "$CAPS/$1.ansi"
+}
+
+@test "vim INSERT mode is read from the footer, whose words are separate colour runs; NORMAL shows nothing there" {
+  for cap in 10-vim-01-insert-empty 10-vim-09-insert-empty-after-turn; do
+    run insert_of "$cap"
+    assert_output "insert=1 composer="
+  done
+  run insert_of 10-vim-05-insert-typed-goal
+  assert_output "insert=1 composer=/goal abc"
+  for cap in 10-vim-02-normal-empty 10-vim-08-normal-empty-after-turn; do
+    run insert_of "$cap"
+    assert_output "insert=0 composer="
+  done
+  run insert_of 10-vim-06-normal-with-text
+  assert_output --partial "insert=0 composer="
+  # Without vim mode the footer has no indicator either.
+  run insert_of 01-idle
+  assert_output "insert=0 composer="
+}
+
 @test "a long composer wrapped over several lines is read whole" {
   run verdict 07-long-typed
   assert_output --partial "composer=/goal word001 word002"

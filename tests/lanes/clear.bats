@@ -33,6 +33,31 @@ mark_sending() {
   assert_output false
 }
 
+@test "a lead on another tmux server whose pane id equals the lane's is neither this pane nor a second lane on it" {
+  ready_lane alpha
+  other="$LANES_TEST_TMP/other-server,999999,0"
+  hook_json SessionStart sl lead startup | TMUX="$other" TMUX_PANE="$PANE" LANES_ROLE=lead "$LANES" register >/dev/null 2>&1
+  run reg lead '[.tmux_pane, .tmux_pid] | @json'
+  assert_output "[\"$PANE\",999999]"
+  TMUX="$other" TMUX_PANE="$PANE" run "$LANES" clear alpha
+  assert_success
+  assert_output --partial "cleared: alpha"
+}
+
+@test "a clear that cannot name its own process says so and types nothing" {
+  ready_lane alpha
+  register_lead
+  ps_fails_for self
+  PATH="$LANES_TEST_TMP/shim:$PATH" TMUX_PANE=%99 run "$LANES" clear alpha
+  assert_failure
+  assert_output --regexp "the clear lock of alpha was not taken: the start time of pid [0-9]+, this lock's holder, could not be read"
+  refute_output --partial "is running"
+  run keys_sent
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output ready
+}
+
 @test "SessionStart(clear) re-injected the RESUME block into the cleared session" {
   ready_lane alpha
   as_lead clear alpha >/dev/null
@@ -471,6 +496,25 @@ refused_untouched_at() {
   assert_output 0
 }
 
+@test "--wait follows the timer rule: leading zeros are decimal, and a value out of 0..3600 or not whole is refused" {
+  ready_lane alpha
+  for bad in 3601 -1 1.5 "" 0x10 1234567890; do
+    run as_lead clear alpha --wait "$bad"
+    assert_failure 2
+    assert_output --partial "--wait '$bad' is not a whole number of seconds from 0 to 3600"
+  done
+  run keys_sent
+  assert_output 0
+  # 08 and 010 are 8 and 10 seconds (not octal): a lane busy for good is refused after them, with that number.
+  edit_session '.status = "busy" | .statusUpdatedAt = (now * 1000 | floor)'
+  run as_lead clear alpha --wait 08
+  assert_failure
+  assert_output --partial "stayed busy for 8 s"
+  run as_lead goal alpha "ship B2" --wait 010
+  assert_failure
+  assert_output --partial "stayed busy for 10 s"
+}
+
 @test "a RESUME Goal ending in ';' is typed whole: tmux never reads the semicolon as a separator" {
   make_repo
   write_resume alpha 'ship item A1;'
@@ -676,6 +720,32 @@ bounded_hook() {
   assert_failure
   assert_output --partial "lanes goal alpha"
   run submitted "/goal"
+  assert_output 0
+}
+
+@test "a cleared record whose session is busy with a prompt it took says so at once, not after the wait for idle" {
+  ready_lane alpha
+  sid="$(reg alpha .session_id)"
+  f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq --arg s "$sid" --argjson n "$(date +%s)" '.handshake.state="cleared" | .handshake.cleared_session=$s | .handshake.cleared_at=$n | .handshake.goal="ship A1" | .prompts=1' "$f" >"$f.n" && mv "$f.n" "$f"
+  edit_session '.status = "busy" | .statusUpdatedAt = (now * 1000 | floor)'
+  run as_lead clear alpha --wait 3
+  assert_failure
+  assert_output --partial "already took 1 prompt(s)"
+  refute_output --partial "stayed busy"
+  run keys_sent
+  assert_output 0
+}
+
+@test "a cleared record whose counters are another session's (register wrote the registry, not yet the state) gets no goal" {
+  ready_lane alpha
+  sid="$(reg alpha .session_id)"
+  f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq --arg s "$sid" --argjson n "$(date +%s)" --arg t "$LANES_TEST_TMP/none.jsonl" '.handshake.state="cleared" | .handshake.cleared_session=$s | .handshake.cleared_at=$n | .handshake.goal="ship A1" | .session_id="the-old-session" | .prompts=0 | .transcript=$t' "$f" >"$f.n" && mv "$f.n" "$f"
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "the lane's record is not yet that of session $sid"
+  run keys_sent
   assert_output 0
 }
 

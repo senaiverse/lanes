@@ -14,8 +14,11 @@ job.
   (`monitors/<project checksum>/<name>.state`).
 - **One instance per name and project:** the loop starts with `lanes monitor-lock <name> $$`, which refuses a second
   start while the first is alive and reclaims the name from a dead one. The project is the lead's own, the repository
-  it registered from (all its worktrees are one), whatever directory the loop runs in; outside a registered pane it is
-  the repository the loop runs in. Two projects each run their own.
+  it registered from (all its worktrees are one); outside a registered pane it is the repository the loop runs in.
+  Two projects each run their own.
+- **Run it from your own project:** `cd` into your repository (or one of its worktrees) before the loop starts, since
+  `gh` and `git` read the directory they run in. `monitor-lock` and `monitor-diff` refuse a loop whose directory is in
+  another project, and lock nothing.
 - **Back off, never die:** when any command a pass reads fails (`gh`, `lanes`), the pass fails and the loop skips the
   diff for it (a partial or empty set would report items as gone), prints one line, doubles the wait up to 10 minutes,
   and keeps looping. So a pass keeps each command's output and checks its exit status before it reads it; a pipe

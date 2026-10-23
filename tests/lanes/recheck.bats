@@ -61,7 +61,7 @@ register_beta_on_pane() { register_lane beta sb "$PANE" >/dev/null 2>&1; }
 @test "a lane restarted after clear-ready (a new session, the same pane, no prompt yet) is refused as a changed session" {
   ready_lane alpha
   edit_session '.sessionId = "restarted"'
-  hook_json SessionStart restarted alpha startup | CLAUDE_PID="$FAKE_PID" TMUX_PANE="$PANE" "$LANES" register >/dev/null 2>&1
+  hook_json SessionStart restarted alpha startup | CLAUDE_PID="$FAKE_PID" TMUX="$(server_tmux)" TMUX_PANE="$PANE" "$LANES" register >/dev/null 2>&1
   run as_lead clear alpha
   assert_failure
   assert_output --partial "the session changed since clear-ready"
@@ -181,15 +181,28 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
   assert_output 0
 }
 
-@test "clear refuses when another registry entry names the lane's pane" {
+# beta_entry <server pid>: a registry entry for lane beta on alpha's pane id, on that tmux server.
+beta_entry() {
+  jq -nc --arg p "$PANE" --argjson s "$1" '{lane:"beta",session_id:"sb",role:"lane",tmux_pane:$p,tmux_pid:$s,cwd:"/",
+    used_pct:null,clear_ready:false}' >"$LANES_DATA_DIR/lanes/beta.json"
+}
+
+@test "clear refuses when another registry entry names the lane's pane on the lane's tmux server" {
   ready_lane alpha
-  jq -nc --arg p "$PANE" '{lane:"beta",session_id:"sb",role:"lane",tmux_pane:$p,cwd:"/",used_pct:null,clear_ready:false}' \
-    >"$LANES_DATA_DIR/lanes/beta.json"
+  beta_entry "$(reg alpha .tmux_pid)"
   run as_lead clear alpha
   assert_failure
   assert_output --partial "is also registered to lane beta"
   run keys_sent
   assert_output 0
+}
+
+@test "an entry with the lane's pane id on another tmux server is another pane: the clear lands" {
+  ready_lane alpha
+  beta_entry 999999
+  run as_lead clear alpha
+  assert_success
+  assert_output --partial "cleared: alpha"
 }
 
 @test "a registration on the lane's pane while clear waits is refused before any key" {
@@ -529,7 +542,7 @@ EOS
   request_after_nth_fg_check 2
   PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
-  assert_output --partial "a new 'lanes request alpha' arrived while the clear ran"
+  assert_output --partial "a new 'lanes request alpha' arrived while this command ran"
   run cat "$LANES_TEST_TMP/request.out"
   assert_output --partial "requested:"
   run state alpha .handshake.state
@@ -538,13 +551,204 @@ EOS
   assert_output 0
 }
 
+@test "a request landing after /clear landed stands: no goal is sent from it and it is never turned back into cleared" {
+  ready_lane alpha
+  register_lead
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # Once register has moved the record to cleared (SessionStart(clear)), the lead requests before lanes clear writes.
+  cat >"$LANES_TEST_TMP/shim/jq" <<EOS
+#!/usr/bin/env bash
+if [[ ! -f "$LANES_TEST_TMP/requested" ]] &&
+  [[ "\$("$(command -v jq)" -r '.handshake.state // ""' "$LANES_DATA_DIR/lanes/state/alpha.json" 2>/dev/null)" == cleared ]]; then
+  : >"$LANES_TEST_TMP/requested"
+  TMUX_PANE=%99 "$LANES" request alpha >"$LANES_TEST_TMP/request.out" 2>&1
+fi
+exec "$(command -v jq)" "\$@"
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/jq"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "/clear landed in $PANE, then a new 'lanes request alpha' arrived while this command ran"
+  assert_output --partial "the goal was not sent"
+  run cat "$LANES_TEST_TMP/request.out"
+  assert_output --partial "requested:"
+  run state alpha .handshake.state
+  assert_output requested
+  run submitted /clear
+  assert_output 1
+  run submitted /goal
+  assert_output 0
+}
+
+@test "a refusal that drops clear-ready never overwrites a request that landed meanwhile" {
+  ready_lane alpha
+  dirty_tree
+  # The first foreground check is the target check, right after lanes clear read the record.
+  request_after_nth_fg_check 1
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "uncommitted changes"
+  assert_output --partial "(the record was left as it is: a new 'lanes request alpha' arrived"
+  run state alpha .handshake.state
+  assert_output requested
+  run keys_sent
+  assert_output 0
+}
+
+@test "a request landing after the goal was typed stands: the clear reports success and never closes the new record as done" {
+  ready_lane alpha
+  register_lead
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # Once the fake took the /goal, the lead requests before lanes clear closes the record.
+  cat >"$LANES_TEST_TMP/shim/jq" <<EOS
+#!/usr/bin/env bash
+if [[ ! -f "$LANES_TEST_TMP/requested" ]] && grep -q '^SUBMIT /goal ' "$FAKE_LOG"; then
+  : >"$LANES_TEST_TMP/requested"
+  TMUX_PANE=%99 "$LANES" request alpha >"$LANES_TEST_TMP/request.out" 2>&1
+fi
+exec "$(command -v jq)" "\$@"
+EOS
+  chmod +x "$LANES_TEST_TMP/shim/jq"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_success
+  assert_output --partial "and its goal is set; its record was left as it is: a new 'lanes request alpha' arrived"
+  run cat "$LANES_TEST_TMP/request.out"
+  assert_output --partial "requested:"
+  run state alpha .handshake.state
+  assert_output requested
+  # The goal's turn ends before teardown removes the folder the fake writes into.
+  wait_status idle
+}
+
 @test "a request landing while clear waits for idle stops the clear with the true reason, and stands" {
   ready_lane alpha
   clear_during_wait as_lead request alpha
   assert [ "$RC" -ne 0 ]
-  [[ "$OUT" == *"a new 'lanes request alpha' arrived while the clear ran"* ]]
+  [[ "$OUT" == *"a new 'lanes request alpha' arrived while this command ran"* ]]
   run state alpha .handshake.state
   assert_output requested
+  run keys_sent
+  assert_output 0
+}
+
+# vim_lane <file> <JSON> [<file> <JSON>...] -- [VAR=value...]: a clear-ready lane whose Claude Code reads the given
+# settings: "user", "project", "local" or "managed.d/<name>"; project files are committed and pushed so the tree stays
+# clean. The managed directory is a private one, never the host's.
+vim_lane() {
+  export LANES_MANAGED_SETTINGS_DIR="$LANES_TEST_TMP/managed"
+  make_repo
+  mkdir -p "$CLAUDE_CONFIG_DIR" "$WORK/.claude" "$LANES_MANAGED_SETTINGS_DIR/managed-settings.d"
+  while (($#)) && [[ "$1" != -- ]]; do
+    case "$1" in
+      user) printf '%s\n' "$2" >"$CLAUDE_CONFIG_DIR/settings.json" ;;
+      project) printf '%s\n' "$2" >"$WORK/.claude/settings.json" ;;
+      local) printf '%s\n' "$2" >"$WORK/.claude/settings.local.json" ;;
+      managed.d/*) printf '%s\n' "$2" >"$LANES_MANAGED_SETTINGS_DIR/managed-settings.d/${1#managed.d/}" ;;
+    esac
+    shift 2
+  done
+  shift
+  git -C "$WORK" add -A && git -C "$WORK" commit -q --allow-empty -m settings && git -C "$WORK" push -q
+  write_resume alpha
+  start_fake alpha "$@"
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+}
+
+@test "vim mode in NORMAL: nothing is typed, clear-ready is kept, and the fix is to press i" {
+  vim_lane user '{"editorMode":"vim"}' -- FAKE_VIM=normal
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "does not show -- INSERT --"
+  assert_output --partial "press i in pane $PANE, then run the command again"
+  run keys_sent
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output ready
+  # Pressed while clear waits for idle, NORMAL is caught again before the first key, and clear-ready is kept.
+  lanes_tmux send-keys -t "$PANE" -l -- i
+  wait_for "INSERT drawn" pane_has "-- INSERT --"
+  clear_during_wait lanes_tmux send-keys -t "$PANE" Escape
+  assert [ "$RC" -ne 0 ]
+  [[ "$OUT" == *"press i in pane $PANE, then run 'lanes clear alpha' again"* ]]
+  # The fake saw only the human's two keys.
+  run keys_sent
+  assert_output 2
+  run reg alpha .clear_ready
+  assert_output true
+  run state alpha .handshake.state
+  assert_output ready
+}
+
+@test "vim mode in INSERT: the clear and its goal land" {
+  vim_lane user '{"editorMode":"vim"}' -- FAKE_VIM=insert
+  run as_lead clear alpha
+  assert_success
+  assert_output --partial "and its goal is set"
+  run submitted /clear
+  assert_output 1
+}
+
+@test "vim mode with its indicator hidden is always refused, even in INSERT: the mode cannot be proven" {
+  vim_lane user '{"editorMode":"vim","statusLine":{"type":"command","command":"true","hideVimModeIndicator":true}}' -- \
+    FAKE_VIM=insert FAKE_VIM_HIDDEN=1
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "mode indicator hidden"
+  assert_output --partial "show the vim mode indicator"
+  run keys_sent
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output ready
+}
+
+@test "settings precedence: a project local editorMode normal overrides the user's vim, and the clear lands" {
+  vim_lane user '{"editorMode":"vim"}' local '{"editorMode":"normal"}' --
+  run as_lead clear alpha
+  assert_success
+}
+
+@test "settings precedence: a shared project vim with no user setting is vim, and NORMAL is refused" {
+  vim_lane project '{"editorMode":"vim"}' -- FAKE_VIM=normal
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "does not show -- INSERT --"
+}
+
+@test "settings precedence: a managed drop-in vim overrides a project local normal, and NORMAL is refused" {
+  vim_lane local '{"editorMode":"normal"}' managed.d/10-vim.json '{"editorMode":"vim"}' -- FAKE_VIM=normal
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "does not show -- INSERT --"
+}
+
+@test "a settings file that is not JSON is refused by name: vim mode cannot be ruled out" {
+  vim_lane user '{"editorMode":' --
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "the settings file $CLAUDE_CONFIG_DIR/settings.json is not a readable JSON object"
+  run keys_sent
+  assert_output 0
+}
+
+@test "a lane in a git worktree reads the local settings at the main checkout's root, as Claude Code keeps them there" {
+  export LANES_MANAGED_SETTINGS_DIR="$LANES_TEST_TMP/managed"
+  make_repo
+  git -C "$WORK" worktree add -q "$LANES_TEST_TMP/wt" -b side
+  mkdir -p "$WORK/.claude"
+  printf '{"editorMode":"vim"}\n' >"$WORK/.claude/settings.local.json"
+  hook_json SessionStart s1 alpha startup | jq -c --arg c "$LANES_TEST_TMP/wt" '.cwd = $c' |
+    TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
+  run bash -c 'source "$1"; vim_setting alpha' _ "$LANES"
+  assert_output "vim false"
+}
+
+@test "lanes goal into vim NORMAL is refused and types nothing" {
+  vim_lane user '{"editorMode":"vim"}' -- FAKE_VIM=normal
+  run as_lead goal alpha "ship B2"
+  assert_failure
+  assert_output --partial "goal not sent"
+  assert_output --partial "press i in pane $PANE"
   run keys_sent
   assert_output 0
 }

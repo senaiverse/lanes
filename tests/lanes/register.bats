@@ -401,12 +401,12 @@ other_pid_register() {
   other_pid_register o1
   assert_output --partial "could not be checked against its registered session"
   cp "$LANES_TEST_TMP/sess" "$f"
-  # A failing ps, in the non-Linux form of the start time read (uname answers Darwin).
-  mkdir -p "$LANES_TEST_TMP/shim"
-  printf '#!/usr/bin/env bash\necho Darwin\n' >"$LANES_TEST_TMP/shim/uname"
-  printf '#!/usr/bin/env bash\nexit 1\n' >"$LANES_TEST_TMP/shim/ps"
-  chmod +x "$LANES_TEST_TMP/shim/uname" "$LANES_TEST_TMP/shim/ps"
+  # A ps that fails for the registered Claude Code only, in the non-Linux form of the start time read (uname answers
+  # Darwin); lanes still names itself, so a symlink mutex (macOS, no flock) is taken.
+  ps_fails_for "$FAKE_PID"
+  export LANES_NO_FLOCK=1
   other_pid_register o1 startup "$LANES_TEST_TMP/shim"
+  refute_output --partial "registry lock"
   assert_output --partial "(check failed: lane_session: the start time of pid $FAKE_PID could not be read"
   run reg alpha .session_id
   assert_output "$sid"
@@ -531,4 +531,136 @@ clear_ctx_with() {
   assert_output "b1
 g1
 s1"
+}
+
+@test "a register that cannot name itself for the symlink mutex says so, never 'locked by another lanes process'" {
+  ps_fails_for self
+  sleep 30 &
+  cpid=$!
+  run bash -c "PATH='$LANES_TEST_TMP/shim:$PATH' LANES_NO_FLOCK=1 CLAUDE_PID=$cpid TMUX_PANE=%7 '$LANES' register <<<'$(hook_json SessionStart s1 alpha startup)'"
+  kill "$cpid"
+  assert_success
+  assert_output --regexp "registry lock not taken: the start time of pid [0-9]+, this lock's holder, could not be read"
+  refute_output --partial "another"
+  assert [ ! -e "$LANES_DATA_DIR/lanes/alpha.json" ]
+}
+
+@test "a new session on a pane takes it from the lane that held it: that lane has no pane and is no longer clear-ready" {
+  register_lane alpha s1 %7 >/dev/null
+  strip_entry '.clear_ready = true'
+  run register_lane beta b1 %7
+  assert_output --partial "pane %7 was registered to lane 'alpha', which now has no pane"
+  run reg alpha '[.tmux_pane, .clear_ready] | @json'
+  assert_output '[null,false]'
+  run reg beta .tmux_pane
+  assert_output %7
+}
+
+@test "a new session of a lane resets clear_ready; the same session registering again keeps it" {
+  register_lane alpha s1 %7 >/dev/null
+  strip_entry '.clear_ready = true'
+  hook_json SessionStart s1 alpha resume | TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
+  run reg alpha .clear_ready
+  assert_output true
+  hook_json SessionStart s2 alpha clear | TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
+  run reg alpha .clear_ready
+  assert_output false
+}
+
+# server_pane <socket>: start a tmux server on <socket> whose first pane (%0) prints its own TMUX, and set SRV_TMUX to it.
+server_pane() {
+  rm -f "$LANES_TEST_TMP/tmux-env"
+  tmux -L "$1" new-session -d -s run -x 80 -y 20 "printf '%s %s\n' \"\$TMUX\" \"\$TMUX_PANE\" >'$LANES_TEST_TMP/tmux-env.x'; mv '$LANES_TEST_TMP/tmux-env.x' '$LANES_TEST_TMP/tmux-env'; sleep 60"
+  wait_for "pane of $1" test -s "$LANES_TEST_TMP/tmux-env"
+  read -r SRV_TMUX pane <"$LANES_TEST_TMP/tmux-env"
+  [ "$pane" = %0 ]
+}
+
+# from <socket> <TMUX> <lanes args...>: run lanes as a command in that server's %0 does.
+from() { local s="$1" t="$2"; shift 2; LANES_TMUX_SOCKET="$s" TMUX="$t" TMUX_PANE=%0 "$LANES" "$@"; }
+
+@test "a second tmux server with the same %0 neither takes the lead's pane nor acts as the lead" {
+  make_repo
+  A="$LANES_TMUX_SOCKET" B="$LANES_TMUX_SOCKET-b"
+  server_pane "$A"
+  TA="$SRV_TMUX"
+  server_pane "$B"
+  TB="$SRV_TMUX"
+  for order in lead-first lane-first; do
+    rm -rf "$LANES_DATA_DIR/lanes"
+    for who in $([[ $order == lead-first ]] && echo "lead laneb" || echo "laneb lead"); do
+      if [[ "$who" == lead ]]; then
+        LANES_ROLE=lead run from "$A" "$TA" register <<<"$(hook_json SessionStart sl lead startup)"
+      else
+        run from "$B" "$TB" register <<<"$(hook_json SessionStart sb laneb startup)"
+      fi
+      refute_output --partial "now has no pane"
+    done
+    run jq -r '"\(.lane) \(.tmux_pane) \(.tmux_pid)"' "$LANES_DATA_DIR/lanes/lead.json" "$LANES_DATA_DIR/lanes/laneb.json"
+    assert_output "lead %0 $(tmux -L "$A" display -p '#{pid}')
+laneb %0 $(tmux -L "$B" display -p '#{pid}')"
+  done
+  # From B's %0 the caller is laneb: not the lead, and away mode records laneb as its setter.
+  run from "$B" "$TB" request laneb
+  assert_failure
+  assert_output --partial "only the lead requests a clear"
+  run from "$B" "$TB" away on
+  assert_success
+  run jq -r .set_by "$(bash -c 'source "$1"; away_file "$2"' _ "$LANES" "$WORK/.git")"
+  assert_output laneb
+  # From A's %0 the caller is the lead.
+  run from "$A" "$TA" request laneb
+  refute_output --partial "only the lead"
+  tmux -L "$B" kill-server 2>/dev/null || true
+}
+
+@test "a pane matches no lane when the caller's TMUX does not name a tmux server" {
+  register_lane alpha s1 %7 >/dev/null
+  for t in "" "garbage" "/s,x,0"; do
+    run bash -c "TMUX='$t' TMUX_PANE=%7 '$LANES' clear-ready"
+    assert_output --partial "cannot tell which lane this is"
+  done
+  # The server is TMUX's pid, read from the right of a socket path that holds commas, session -1 included.
+  run bash -c "TMUX='/s,7,x,41,-1' TMUX_PANE=%7 '$LANES' register <<<'$(hook_json SessionStart s1 alpha startup)'"
+  refute_output --partial "not tmux's"
+  run reg alpha '.tmux_pid | @json'
+  assert_output 41
+  run bash -c "env -u TMUX TMUX_PANE=%7 '$LANES' register <<<'$(hook_json SessionStart s1 alpha startup)'"
+  assert_output --partial "TMUX is '', not tmux's '<socket>,<server pid>,<session>'"
+  run reg alpha '.tmux_pid | @json'
+  assert_output null
+  # An unknown server on both sides is no match.
+  run bash -c "env -u TMUX TMUX_PANE=%7 '$LANES' clear-ready"
+  assert_output --partial "cannot tell which lane this is"
+}
+
+# hook_with <jq object fields>: alpha's SessionStart input with the given fields over the usual ones.
+hook_with() { jq -c --argjson o "$1" '. + $o' <<<"$(hook_json SessionStart s1 alpha startup)"; }
+
+@test "a newline in any register field never shifts the next: cwd, transcript path and source are kept whole" {
+  dir=$'/tmp/a\nb'
+  run bash -c "TMUX_PANE=%7 '$LANES' register <<<'$(hook_with "$(jq -nc --arg c "$dir" '{cwd: $c, transcript_path: "/t/x\ny.jsonl", source: "start\nup"}')")'"
+  assert_success
+  refute_output --partial "not a JSON object"
+  run reg alpha '.cwd | @json'
+  assert_output '"/tmp/a\nb"'
+  run state alpha '[.transcript, .start_source] | @json'
+  assert_output '["/t/x\ny.jsonl","start\nup"]'
+  # A title with a newline is an unusable lane name, said as such.
+  run bash -c "TMUX_PANE=%7 '$LANES' register <<<'$(hook_with '{"session_title": "al\npha"}')'"
+  assert_output --partial "lane name 'al"
+  assert_output --partial "is not usable"
+  refute_output --partial "not a JSON object"
+}
+
+@test "a newline in any prompt hook field never shifts the next, and a NUL in a prompt reads as U+FFFD" {
+  register_lane alpha s1 %7 >/dev/null
+  jq -nc '{session_id: "s1", session_title: "alpha", cwd: "/x\ny", prompt: "/goal one\ntwo", transcript_path: "/t/p\nq.jsonl"}' |
+    "$LANES" hook prompt
+  run state alpha '[.prompts, .last_command, .transcript] | @json'
+  assert_output '[1,"/goal one\ntwo","/t/p\nq.jsonl"]'
+  # A title with a newline names no lane, so the session index finds it.
+  jq -nc '{session_id: "s1", session_title: "al\npha", prompt: "/x\u0000y"}' | "$LANES" hook prompt
+  run state alpha '[.prompts, .last_command] | @json'
+  assert_output "[2,\"/x$(printf '\357\277\275')y\"]"
 }

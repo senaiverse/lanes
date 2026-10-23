@@ -104,6 +104,28 @@ two_projects() {
   assert_output ""
 }
 
+@test "an away record whose file name collides with another project's is not that project's away mode" {
+  two_projects
+  # Force a checksum collision: B's away file holds A's record, as if A's path had B's checksum.
+  fb="$(bash -c 'source "$1"; away_file "$2"' _ "$LANES" "$LANES_TEST_TMP/B/.git")"
+  mkdir -p "${fb%/*}"
+  jq -nc --arg p "$LANES_TEST_TMP/A/.git" '{away: true, project: $p, since: "2026-01-01T00:00:00Z", set_by: "leadA"}' >"$fb"
+  run bash -c "cd '$LANES_TEST_TMP/B' && '$LANES' away status"
+  assert_output "away mode off for $LANES_TEST_TMP/B/.git"
+  run decision sb "$LANES_TEST_TMP/B"
+  assert_output allow
+}
+
+@test "a newline in the ask hook's cwd or title never shifts its fields: the session is still refused in away mode" {
+  make_repo
+  register_lane alpha s1 %7 >/dev/null
+  "$LANES" away on >/dev/null
+  run bash -c "jq -nc '{session_id: \"s1\", session_title: \"x\ny\", cwd: \"/a\nb\", tool_name: \"AskUserQuestion\"}' | '$LANES' hook ask"
+  assert_success
+  run jq -r .hookSpecificOutput.permissionDecision <<<"$output"
+  assert_output deny
+}
+
 @test "an unknown away argument is a usage error" {
   run "$LANES" away maybe
   assert_failure 2

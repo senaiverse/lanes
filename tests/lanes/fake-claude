@@ -19,6 +19,10 @@ goal=""
 goal_left=0
 # FAKE_DRAFT_AT_FIRST_KEY=1: a human starts a draft just before the first typed key arrives.
 draft_at_key="${FAKE_DRAFT_AT_FIRST_KEY:-}"
+# FAKE_VIM=insert|normal: vim editor mode as measured on 2.1.309. The footer shows `-- INSERT --` in INSERT (unless
+# FAKE_VIM_HIDDEN), nothing in NORMAL; in NORMAL a key is a command (i or a enters INSERT, others are logged and
+# dropped), Backspace deletes nothing, Enter submits, and the mode survives a submit. Escape leaves INSERT.
+vim="${FAKE_VIM:-}"
 busy=0
 turn_end=0
 shell_end=0
@@ -129,7 +133,8 @@ draw() {
     rest="${composer:WIDTH}"
     while [[ -n "$rest" ]]; do printf '  %s\r\n' "${rest:0:WIDTH}"; rest="${rest:WIDTH}"; done
   fi
-  printf '%s\r\n  Haiku 5.5 | fake-claude %s\r\n  ⏸ manual mode on\r\n' '──────────────────────────────────────────────────────────────────────────────────────────────────' "$SID"
+  printf '%s\r\n  Haiku 5.5 | fake-claude %s\r\n  %s⏸ manual mode on\r\n' '──────────────────────────────────────────────────────────────────────────────────────────────────' "$SID" \
+    "$([[ "$vim" == insert && -z "${FAKE_VIM_HIDDEN:-}" ]] && printf -- '-- INSERT -- ')"
 }
 
 start_turn() {
@@ -243,6 +248,16 @@ while :; do
       i=0
       while ((i < ${#burst})); do
         k="${burst:i:1}"
+        if [[ "$vim" == normal && "$k" != $'\r' && "$k" != $'\n' ]]; then
+          if [[ "$k" == [ia] ]]; then vim=insert; else log "VIM-NORMAL-KEY"; fi
+          i=$((i + 1))
+          continue
+        fi
+        if [[ "$vim" == insert && "$k" == $'\e' ]]; then
+          vim=normal
+          i=$((i + 1))
+          continue
+        fi
         case "$k" in
           $'\r' | $'\n') enter ;;
           $'\e')

@@ -79,7 +79,19 @@ EOF
   export LIVE_PID
   LIVE_PID="$(started lanes-live || true)"
   [[ "$LIVE_PID" =~ ^[0-9]+$ ]] || { echo "no SessionStart with CLAUDE_PID within 30 s; the screen: $s" >&2; return 1; }
+  # The lead's own pane on this tmux server: LEAD_TMUX and LEAD_PANE are what that pane's own shell sees, so the lead's
+  # registration and its lanes commands carry the pane identity a real lead's do.
+  export LEAD_TMUX LEAD_PANE
+  tmux -L "$LIVE_SOCK" new-window -d -t live -n lead -c "$LIVE_DIR" \
+    "printf '%s %s\n' \"\$TMUX\" \"\$TMUX_PANE\" >'$LIVE_ROOT/lead-env.x'; mv '$LIVE_ROOT/lead-env.x' '$LIVE_ROOT/lead-env'; exec sleep 3600"
+  for ((i = 0; i < 50; i++)); do [[ -s "$LIVE_ROOT/lead-env" ]] && break; sleep 0.1; done
+  read -r LEAD_TMUX LEAD_PANE <"$LIVE_ROOT/lead-env" || { echo "the lead pane never reported its TMUX" >&2; return 1; }
+  [[ "$LEAD_PANE" == "$(tmux -L "$LIVE_SOCK" display -p -t live:lead '#{pane_id}')" && "$LEAD_PANE" != "$MAIN" ]] ||
+    { echo "the lead pane reported '$LEAD_PANE', not its own pane id" >&2; return 1; }
 }
+
+# as_lead <lanes args...>: lanes run as the lead's Bash tool runs it, from the lead's pane.
+as_lead() { TMUX="$LEAD_TMUX" TMUX_PANE="$LEAD_PANE" "$LANES" "$@"; }
 
 teardown_file() {
   [[ -n "${LIVE_SOCK:-}" ]] && tmux -L "$LIVE_SOCK" kill-server 2>/dev/null
@@ -342,15 +354,22 @@ SessionStart clear"
   sleep 2
   run bash -c "tmux -L '$LIVE_SOCK' capture-pane -p -t '$MAIN' | grep -c 'No goal set'"
   assert_output 1
+  # A bare /goal leaves its panel open; the next probe needs an idle session, so the panel is closed here.
+  note "after a bare /goal: status $(st)"
+  [[ "$(st)" != waiting* ]] || { key Escape; wait_st '^idle' 5; }
 }
 
 @test "lanes clear and lanes goal against the real session: what lanes types lands, and every guard passes on the way" {
   wait_st '^idle' 20
   run jq -r '[.tmux_pane, (.claude_pid | tostring)] | join(" ")' "$LANES_DATA_DIR/lanes/lanes-live.json"
   assert_output "$MAIN $LIVE_PID"
-  # A lead to send from: registered as the lead role on a pane id that is not the lane's.
-  jq -nc --arg c "$LIVE_DIR" '{hook_event_name: "SessionStart", session_id: "00000000-0000-4000-8000-000000000099",
-    session_title: "live-lead", cwd: $c, source: "startup"}' | LANES_ROLE=lead TMUX_PANE=%99 CLAUDE_PID=$$ "$LANES" register >/dev/null
+  # A lead to send from: registered as the lead role from its own pane on this tmux server (setup_file).
+  out="$(jq -nc --arg c "$LIVE_DIR" '{hook_event_name: "SessionStart", session_id: "00000000-0000-4000-8000-000000000099",
+    session_title: "live-lead", cwd: $c, source: "startup"}' |
+    LANES_ROLE=lead TMUX="$LEAD_TMUX" TMUX_PANE="$LEAD_PANE" CLAUDE_PID=$$ "$LANES" register 2>&1)"
+  [[ "$out" != *"not tmux's"* && "$out" != *"not registered"* ]] || { echo "the lead's registration warned: $out" >&2; false; }
+  run jq -r '[.role, .tmux_pane, (.tmux_pid | tostring)] | join(" ")' "$LANES_DATA_DIR/lanes/live-lead.json"
+  assert_output "lead $LEAD_PANE $(tmux -L "$LIVE_SOCK" display -p '#{pid}')"
   run bash -c 'cd "$1" && "$2" clear-ready --lane lanes-live' _ "$LIVE_DIR" "$LANES"
   assert_success
   old_sid="$(jq -r .sessionId "$(f)")"
@@ -359,7 +378,7 @@ SessionStart clear"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>%q\nexec %q "$@"\n' "$LIVE_ROOT/tmux-calls" "$(command -v tmux)" >"$LIVE_ROOT/shim/tmux"
   chmod +x "$LIVE_ROOT/shim/tmux"
   : >"$LIVE_ROOT/tmux-calls"
-  PATH="$LIVE_ROOT/shim:$PATH" TMUX_PANE=%99 run "$LANES" clear lanes-live --wait 60
+  PATH="$LIVE_ROOT/shim:$PATH" run as_lead clear lanes-live --wait 60
   note "lanes clear: status $status: $output"
   assert_success
   assert_output --partial "cleared: lanes-live"
@@ -376,13 +395,34 @@ SessionStart clear"
   assert_line "/goal $GOAL1"
   # The RESUME goal runs its loop and hands back; then the lead replaces the goal without a /clear.
   wait_st '^idle' 90
-  run env TMUX_PANE=%99 "$LANES" goal lanes-live "$GOAL2" --wait 60
+  run as_lead goal lanes-live "$GOAL2" --wait 60
   note "lanes goal: status $status: $output"
   assert_success
   assert_output --partial "goal set: lanes-live"
   run jq -r --arg s "$new_sid" 'select(.ev == "UserPromptSubmit" and .sid_in == $s) | .prompt' "$LIVE_OUT/hooks.log"
   assert_line "/goal $GOAL2"
   wait_st '^idle' 90
+}
+
+@test "lanes goal with a goal of about 1000 characters lands whole, as one /goal prompt and never a paste" {
+  wait_st '^idle' 20
+  local long="you have replied with the single word long; reply only long, never use tools" i=0
+  while ((${#long} < 1000)); do
+    long+="; note $((++i)): this clause only makes the condition longer and asks for nothing more"
+  done
+  note "long goal: ${#long} characters"
+  before="$(count UserPromptSubmit)"
+  run as_lead goal lanes-live "$long" --wait 60
+  note "lanes goal (long): status $status: $output"
+  assert_success
+  assert_output --partial "goal set: lanes-live"
+  # One prompt, the whole /goal command as typed: a paste would arrive as "[Pasted text ...]" or not dispatch.
+  run count UserPromptSubmit
+  assert_output "$((before + 1))"
+  run jq -r 'select(.ev == "UserPromptSubmit") | .prompt' "$LIVE_OUT/hooks.log"
+  assert_line "/goal $long"
+  refute_output --partial "[Pasted text"
+  wait_st '^idle' 120
 }
 
 @test "a session started with --continue --name registers under that name, with the hook input's session_id" {

@@ -378,3 +378,95 @@ composer_squashed() {
   run grep -c '^SUBMIT' "$FAKE_LOG"
   assert_output 0
 }
+
+@test "a kill while a slow screen still draws our chunks deletes all of our text: the plan waits for the screen to settle" {
+  goal_setup FAKE_DRAW_LAG_MS=100
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # The last chunk of "/goal abc" in chunks of 3 is "abc": right after it, lanes is killed, as the Bash tool does.
+  printf '#!/usr/bin/env bash\n%q "$@"\nrc=$?\n[[ " $* " == *" -l -- abc "* ]] && kill -TERM $PPID\nexit $rc\n' \
+    "$(command -v tmux)" >"$LANES_TEST_TMP/shim/tmux"
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+  register_lead
+  RC=0
+  LANES_SEND_CHUNK=3 TMUX_PANE=%99 PATH="$LANES_TEST_TMP/shim:$PATH" "$LANES" goal alpha abc >"$LANES_TEST_TMP/out" 2>&1 || RC=$?
+  assert [ "$RC" -eq 143 ]
+  run cat "$LANES_TEST_TMP/out"
+  assert_output --partial "stopped while typing into $PANE: our typed text was deleted"
+  wait_for "all of our text deleted" pane_has 'Try "refactor'
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
+}
+
+@test "our typed text is never erased into another session of the same process: a kill after an in-place switch leaves it" {
+  goal_setup
+  long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
+  long="${long%; }"
+  shim_hold_after_chunk
+  register_lead
+  TMUX_PANE=%99 PATH="$LANES_TEST_TMP/shim:$PATH" "$LANES" goal alpha "$long" >"$LANES_TEST_TMP/out" 2>&1 &
+  pid=$!
+  wait_for "first chunk typed" test -f "$LANES_TEST_TMP/typed"
+  # The same Claude Code process now runs another session (as /resume does), in its sessions file and the registry.
+  edit_session '.sessionId = "s-switched"'
+  hook_json SessionStart s-switched alpha resume | TMUX="$(server_tmux)" TMUX_PANE="$PANE" CLAUDE_PID="$FAKE_PID" "$LANES" register >/dev/null 2>&1
+  kill -TERM "$pid"
+  RC=0
+  wait "$pid" || RC=$?
+  OUT="$(cat "$LANES_TEST_TMP/out")"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"our typed text was left in the input line of $PANE, because the session of lane alpha changed"* ]]
+  typed="/goal $long"
+  typed="${typed:0:256}"
+  run composer_squashed
+  assert_output "${typed// /}"
+}
+
+# kill_after_enter <lanes args...>: start lanes from the lead's pane, wait until the fake got the Enter of a /goal or
+# /clear, type HUMAN_KEYS (if set) as a human, then kill lanes while it waits for the confirmation; RC and OUT as
+# kill_goal_after_first_chunk.
+kill_after_enter() {
+  register_lead
+  LANES_CLEAR_TIMEOUT=10 TMUX_PANE=%99 "$LANES" "$@" >"$LANES_TEST_TMP/out" 2>&1 &
+  local pid=$!
+  wait_for "Enter received" grep -qE '^(SUBMIT|ENTER-SWALLOWED)' "$FAKE_LOG"
+  sleep 0.5
+  if [[ -n "${HUMAN_KEYS:-}" ]]; then
+    lanes_tmux send-keys -t "$PANE" -l -- "$HUMAN_KEYS"
+    wait_for "human keys drawn" pane_has "❯"$'\xc2\xa0'"$HUMAN_KEYS"
+  fi
+  kill -TERM "$pid"
+  RC=0
+  wait "$pid" || RC=$?
+  OUT="$(cat "$LANES_TEST_TMP/out")"
+}
+
+@test "a kill after the Enter of /goal never deletes: a human's '/' typed into the empty line stays" {
+  goal_setup FAKE_GOAL_NO_HOOK=1
+  HUMAN_KEYS=/ kill_after_enter goal alpha "ship B2"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"stopped after pressing Enter in $PANE: the text may have been submitted, so nothing was deleted"* ]]
+  run composer_squashed
+  assert_output "/"
+}
+
+@test "a kill after an Enter that was not taken leaves the /goal in the input line: it is no longer ours to delete" {
+  goal_setup FAKE_SWALLOW_ENTERS=2
+  kill_after_enter goal alpha "ship B2"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"nothing was deleted"* ]]
+  run composer_squashed
+  assert_output "/goalshipB2"
+}
+
+@test "a kill after the Enter of /clear never deletes: the /clear left in the input line stays" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_SWALLOW_ENTERS=2
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  kill_after_enter clear alpha
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"stopped after pressing Enter in $PANE"*"nothing was deleted"* ]]
+  run composer_squashed
+  assert_output "/clear"
+}

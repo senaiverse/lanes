@@ -21,6 +21,11 @@ setup() {
   # from a test gets this shell as its CLAUDE_PID, which has no sessions file, so such a lane is never proven in a pane.
   export CLAUDE_CONFIG_DIR="$LANES_TEST_TMP/claude-config" CLAUDE_PID=$$
   unset CLAUDE_CODE_SESSION_ID
+  # The test shell acts as a pane of a pretend tmux server (pid $$), in tmux's "<socket>,<server pid>,<session>" form,
+  # so a lane it registers and a command it runs with one TMUX_PANE are one pane. A fake pane gets its real server's.
+  export TMUX="$TMUX_TMPDIR/test-shell,$$,0"
+  # Claude Code's managed settings (vim mode) are read from here, never the machine's /etc/claude-code.
+  export LANES_MANAGED_SETTINGS_DIR="$LANES_TEST_TMP/managed"
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
   WORK="$LANES_TEST_TMP/work"
@@ -50,9 +55,17 @@ make_repo() {
   cd "$WORK" || return 1
 }
 
-# write_resume <lane> [goal] [next]: a valid RESUME block in .lanes/next-<lane>.md, committed and pushed.
+# write_resume <lane> [goal] [next]: a valid RESUME block in .lanes/next-<lane>.md, committed and pushed. While the
+# lane has an open request, the commit is dated after it unless the caller sets GIT_COMMITTER_DATE: a host's wall
+# clock can step back seconds (WSL2 here, -2.9 s every 27 s), which would date a commit made after the request before it.
 write_resume() {
-  local lane="$1" goal="${2:-finish item A1 and report done}" next="${3:-run the tests for A1}"
+  local lane="$1" goal="${2:-finish item A1 and report done}" next="${3:-run the tests for A1}" at t
+  at="$(jq -r 'select(.handshake.state == "requested") | .handshake.requested_at' "$LANES_DATA_DIR/lanes/state/$lane.json" 2>/dev/null || true)"
+  if [[ -z "${GIT_COMMITTER_DATE:-}" && "$at" =~ ^[0-9]+$ ]]; then
+    t="$(date +%s)"
+    ((t > at)) || t=$((at + 1))
+    local -x GIT_COMMITTER_DATE="$t +0000"
+  fi
   mkdir -p "$WORK/.lanes"
   cat >"$WORK/.lanes/next-$lane.md" <<EOF
 # next-$lane
@@ -90,10 +103,13 @@ hook_json() {
     '{hook_event_name:$e,session_id:$s,session_title:$t,cwd:$c,source:$src}'
 }
 
-# register_lane <lane> <session_id> [pane]: run the SessionStart hook as Claude Code would.
+# register_lane <lane> <session_id> [pane]: run the SessionStart hook as Claude Code would, with the TMUX of the test's
+# tmux server when the pane is one of its own (server_tmux), else the test shell's.
 register_lane() {
-  local pane="${3:-}"
-  hook_json SessionStart "$2" "$1" startup | TMUX_PANE="$pane" "$LANES" register
+  local pane="${3:-}" t="$TMUX"
+  # tmux falls back to another pane for a missing target, so the printed id must be the pane's own.
+  [[ -n "$pane" && "$(lanes_tmux display -p -t "$pane" '#{pane_id}' 2>/dev/null)" == "$pane" ]] && t="$(server_tmux)"
+  hook_json SessionStart "$2" "$1" startup | TMUX="$t" TMUX_PANE="$pane" "$LANES" register
 }
 
 # start_fake <lane> [VAR=value...]: a fake Claude pane in its own tmux session, registered as <lane>. Sets PANE to
@@ -158,6 +174,30 @@ EOF
   chmod +x "$LANES_TEST_TMP/shim/jq"
 }
 
+# ps_fails_for <pid|self>: shims in $LANES_TEST_TMP/shim (put it first on PATH): uname answers Darwin, so lanes reads
+# start times through ps, and ps fails for <pid> only, or with "self" for any of its ancestors (lanes and its
+# subshells), so a test fails exactly the read it names, on Linux and macOS alike.
+ps_fails_for() {
+  mkdir -p "$LANES_TEST_TMP/shim"
+  printf '#!/usr/bin/env bash\necho Darwin\n' >"$LANES_TEST_TMP/shim/uname"
+  cat >"$LANES_TEST_TMP/shim/ps" <<EOF
+#!/usr/bin/env bash
+pid="\${!#}" bad="$1"
+if [[ "\$bad" == self ]]; then
+  p=\$PPID
+  for _ in 1 2 3 4 5 6; do
+    [[ "\$pid" == "\$p" ]] && exit 1
+    p="\$($(command -v ps) -o ppid= -p "\$p" | tr -d ' ')"
+    [[ -n "\$p" ]] || break
+  done
+elif [[ "\$pid" == "\$bad" ]]; then
+  exit 1
+fi
+exec $(command -v ps) "\$@"
+EOF
+  chmod +x "$LANES_TEST_TMP/shim/uname" "$LANES_TEST_TMP/shim/ps"
+}
+
 # wait_for <what> <cmd...>: poll up to 5 s.
 wait_for() {
   local what="$1" _
@@ -208,6 +248,10 @@ zombie_child() {
   kill -9 "$ZPID"
   wait_for "zombie" bash -c "ps -o stat= -p $ZPID | grep -q '^Z'"
 }
+
+# server_tmux: the TMUX value a pane of the test's tmux server carries, for a hook or command a test runs from the
+# test shell as if from that pane (a restart or a second session in a fake's pane).
+server_tmux() { lanes_tmux display -p '#{socket_path},#{pid},#{session_id}' | tr -d '$'; }
 
 pane_has() { lanes_tmux capture-pane -p -t "$PANE" | grep -qF -- "$1"; }
 
