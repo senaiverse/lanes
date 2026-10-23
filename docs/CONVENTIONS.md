@@ -54,7 +54,9 @@
   private deny-list. It reads the list from
   `docs/PORT-SOURCES.local.md` when that file is present, or from `LANES_DENY_LIST` otherwise. It runs as the local
   pre-push hook, not in CI (DECISIONS 23). The hook also checks the author, committer and message of every commit being
-  pushed (`deny-gate.sh --commits`).
+  pushed (`deny-gate.sh --commits`), and refuses a push whose tip commit has unresolved conflict markers
+  (`scripts/marker-gate.sh`). Both scripts run every git call they parse through `git_plain`, which pins the git config
+  keys that reshape output, so user config cannot change what they read.
 
 ## Process
 
