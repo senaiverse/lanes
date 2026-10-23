@@ -26,26 +26,6 @@ CI="$BATS_TEST_DIRNAME/../../.github/workflows/ci.yml"
   grep -q 'bash-version.bats' "$CI"
 }
 
-# The lines of the windows job (up to the next top-level job).
-windows_job() { awk '/^  windows:/{f=1;next} f&&/^  [a-z]/{f=0} f' "$CI"; }
-
-@test "a windows job runs in Git Bash on windows-latest with a time limit and a SHA-pinned checkout" {
-  local job
-  job="$(windows_job)"
-  [ -n "$job" ] || { echo "no windows job in $CI" >&2; false; }
-  grep -qE 'runs-on: windows-latest$' <<< "$job"
-  grep -qE 'shell: bash$' <<< "$job"
-  grep -qE 'timeout-minutes: 15$' <<< "$job"
-  grep -qE 'uses: actions/checkout@[0-9a-f]{40} # v[0-9]' <<< "$job"
-}
-
-@test "the windows job runs only the suites of plugins supported on native Windows" {
-  local job
-  job="$(windows_job)"
-  grep -q 'scripts/test.sh tests/lanes-plancheck' <<< "$job"
-  ! grep -q 'tests/lanes-prodfence' <<< "$job"
-}
-
 @test "git attributes keep LF in every shell file and the plan template so Windows checkouts run" {
   local pat attrs="$BATS_TEST_DIRNAME/../../.gitattributes"
   for pat in '*.sh' '*.bash' '*.bats' 'plugins/*/bin/*' '.githooks/*' 'plugins/lanes-plancheck/templates/plan.md'; do

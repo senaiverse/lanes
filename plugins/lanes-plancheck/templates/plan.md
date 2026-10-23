@@ -1,6 +1,6 @@
 # Plan: <title>
 
-<!-- The level-2 headings below are the required plan fields: lanes-plancheck reads them from this file. -->
+<!-- The level-2 headings below are the required plan fields. -->
 
 ## Goal
 

@@ -171,42 +171,14 @@ core reads `lanes@lanes`. Requirements: tmux, jq and Bash 4+.
 
 | Plugin | What it does | Required? | Status |
 |---|---|---|---|
-| `lanes` | The core. The journal template, the clear handshake, the lead and lane skills, session registry, `lanes-statusline`. | Required for the lead and lane workflow | Coming in v0.1 |
-| `lanes-guards` | Three guards: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. | Optional, needs `lanes` | Coming in v0.1 |
-| `lanes-waves` | Release waves: theme branches, one integration branch, review PRs by area, one merge. | Optional, needs `lanes` | Coming in v0.1 |
-| `lanes-jobs` | `lanes-job`: run a long command in a pooled tmux window and read the result from a STATUS file. | Optional, works alone | Available |
+| `lanes` | The core: lead and lane skills. Lanes on a `/goal` in tmux, cleared at a context threshold, resumed from a RESUME block. | Required for the lead and lane workflow | Available |
+| `lanes-jobs` | A skill: run heavy commands in a shared tmux server and read the result from a STATUS file. | Optional, works alone | Available |
 | `lanes-review` | An adversarial reviewer agent for a branch range or a pull request. Instructed not to edit; not sandboxed. | Optional, works alone | Available |
 | `lanes-prodfence` | The production fence: refuses any session's tool call that mentions a configured production marker or protected path, so only the human acts on production. A mistake fence, not a sandbox. | Optional, works alone | Available |
-| `lanes-plancheck` | `lanes-plancheck`: checks that a plan file carries its required fields before a lane builds it. | Optional, works alone | Available |
+| `lanes-plancheck` | A skill: check that a plan file carries its required fields before a lane builds it. | Optional, works alone | Available |
 
-A plugin marked "coming" is not in the marketplace yet, and its install command fails until it lands.
-
-There is no CI-watcher plugin. Watching CI runs, review scores, lane fill levels and journal drift is a set of
-instructions in the core's lead skill (`MONITORS.md`, coming with the core). Code stays only where something is
-enforced, holds state or acts on a session.
-
-<details>
-<summary>Setup the core needs (v0.1 preview: the <code>/lanes:setup</code> skill, coming with the <code>lanes</code> plugin)</summary>
-
-A plugin cannot set your status line (checked in `docs/M0-FINDINGS.md`, question 1). The core therefore asks you to
-wire two things yourself.
-
-1. **The status line.** The lead reads each lane's fill level from the status line data
-   (`context_window.used_percentage`). The `/lanes:setup` skill prints the exact `statusLine` block to add to your Claude Code
-   settings. It points at `lanes-statusline`, which records the fill level and prints a status line.
-2. **Named sessions.** Start every session with a name:
-
-   ```
-   claude --name <lane>
-   ```
-
-   The name is how lanes and Claude Code's own messaging address a session. It survives `/clear`. A session started
-   without `--name` gets a generated name that lanes cannot rely on.
-
-`/lanes:setup` also writes the journal template into `.lanes/` and offers to add `@.lanes/RULES.md` to your
-`CLAUDE.md`. It asks first, and it never overwrites a file.
-
-</details>
+The plugins are skills: instructions the sessions follow with plain `tmux`, `git` and `claude` commands. Only
+`lanes-prodfence` carries a script, because refusing a tool call needs a hook.
 
 <details>
 <summary>Requirements and the Bash 3.2 note on macOS</summary>
@@ -217,24 +189,7 @@ wire two things yourself.
   version first and stops with a one-line message if it is too old.
 - **git**, and `gh` if you use `lanes-waves` or `lanes-review` with pull requests.
 - **Claude Code 2.1.224 or later.**
-- Linux, macOS, or WSL. On native Windows, only `lanes-plancheck`, through Git for Windows (its Git Bash ships Bash
-  5 and jq).
-
-</details>
-
-<details>
-<summary>Using lanes-plancheck</summary>
-
-The plan template lives in the plugin at `templates/plan.md`. Its level-2 headings are the required fields, and the
-checker reads them from that file: Goal, Done when, Scope, Must not, Steps, Tests, Edge cases, and the rest of the
-template. Copy the template, fill it in, and run the checker on the file:
-
-```
-lanes-plancheck <plan-file>
-```
-
-A project can override the required fields with `.lanes/plan-fields`. Run `lanes-plancheck` with a path that does not
-exist to see its error message.
+- Linux, macOS, or WSL.
 
 </details>
 

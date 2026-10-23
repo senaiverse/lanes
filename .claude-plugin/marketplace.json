@@ -13,12 +13,12 @@
     {
       "name": "lanes-jobs",
       "source": "./plugins/lanes-jobs",
-      "description": "Tmux pane pool with STATUS files and slot locks (lanes-job)."
+      "description": "Skill: run heavy commands in a shared tmux server and read a STATUS file."
     },
     {
       "name": "lanes-plancheck",
       "source": "./plugins/lanes-plancheck",
-      "description": "Plan field checker (lanes-plancheck)."
+      "description": "Skill: check a plan has every required field before sending it."
     },
     {
       "name": "lanes-review",
