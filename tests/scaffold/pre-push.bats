@@ -13,7 +13,7 @@ setup() {
   git -C "$REPO" config user.email t@example.invalid
   git -C "$REPO" config user.name t
   mkdir -p "$REPO/scripts" "$REPO/.githooks"
-  cp "$ROOT/scripts/deny-gate.sh" "$ROOT/scripts/install-hooks.sh" "$REPO/scripts/"
+  cp "$ROOT"/scripts/*.sh "$REPO/scripts/"
   cp "$ROOT/.githooks/pre-push" "$REPO/.githooks/"
   git -C "$REPO" remote add origin "$REMOTE"
   unset LANES_DENY_LIST
@@ -149,6 +149,70 @@ commit_file() { # $1 file, $2 message
   assert_output --partial "author"
   run git -C "$REMOTE" rev-parse --verify feature
   assert_failure
+}
+
+# Conflict markers: the hook refuses a push whose tip tree holds an unresolved merge conflict.
+conflict_text() { printf 'keep\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/main\n'; }
+
+@test "a pushed commit with conflict markers is refused and names each file:line" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/.gitignore"
+  printf 'Title\n=======\n' > "$REPO/notes.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial ".gitignore:2"
+  assert_output --partial ".gitignore:4"
+  assert_output --partial ".gitignore:6"
+  refute_output --partial "notes.md"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "the pushed commit is checked, not the work tree" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  echo resolved > "$REPO/a.txt"
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial "a.txt:2"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "a clean push passes the conflict-marker check" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  printf 'text\n  <<<<<<< indented\n<<<<<<<\n========\n' > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  conflict_text > "$REPO/b.txt"   # untracked in the work tree: not pushed, so not checked
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_success
+}
+
+@test "a markdown setext underline of seven = with no other marker passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  printf 'Title\n=======\n\nLonger heading\n==============\n' > "$REPO/README.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+}
+
+@test "only the tip tree is checked: a marker fixed by a later pushed commit passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  conflict_text > "$REPO/a.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm broken
+  echo resolved > "$REPO/a.txt"
+  git -C "$REPO" commit -qam fixed
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
 }
 
 @test "deleting a branch passes" {
