@@ -23,7 +23,7 @@ P="$BATS_TEST_DIRNAME/../../plugins/lanes"
 @test "hooks.json wires the three events the core needs, and no Stop hook (activity comes from the sessions file)" {
   run jq -r '[.hooks | to_entries[] | "\(.key)=\(.value[0].matcher // "*")=\(.value[0].hooks[0].command | split(" ")[1:] | join(" "))"] | sort | .[]' "$P/hooks/hooks.json"
   assert_output 'PreToolUse=AskUserQuestion=hook ask
-SessionStart=startup|resume|clear|compact=register
+SessionStart=startup|resume|clear|compact|fork=register
 UserPromptSubmit=*=hook prompt'
 }
 
@@ -72,4 +72,11 @@ Suggested skills"
   f="$P/templates/journal/RULES.md"
   [ "$(grep -cE '^[0-9]+\. ' "$f")" -ge 8 ]
   [ "$(wc -l <"$f")" -lt 80 ]
+}
+
+@test "no lanes test starts a process group with a tool macOS lacks, so none skips there for want of it" {
+  # The name is split so this line does not match itself.
+  run grep -rnE '^[^#]*(^|[^[:alnum:]_])set''sid([^[:alnum:]_]|$)' "$BATS_TEST_DIRNAME"
+  assert_failure 1
+  assert_output ""
 }

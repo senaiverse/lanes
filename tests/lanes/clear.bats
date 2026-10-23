@@ -5,14 +5,21 @@
 # the goal.
 
 load helper
+load lead
 
 submitted() { grep -c "^SUBMIT $1" "$FAKE_LOG" || true; }
 keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
+# mark_sending: the lead was killed after it recorded sending (the Bash tool's SIGKILL), now.
+mark_sending() {
+  local f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq '.handshake.state = "sending" | .handshake.sent_at = (now | floor)' "$f" >"$f.x" && mv "$f.x" "$f"
+}
+
 @test "the happy path: /clear lands (new session), then the goal from RESUME is set" {
   ready_lane alpha
   old="$(reg alpha .session_id)"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   assert_output --partial "cleared: alpha"
   refute [ "$(reg alpha .session_id)" = "$old" ]
@@ -28,7 +35,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
 @test "SessionStart(clear) re-injected the RESUME block into the cleared session" {
   ready_lane alpha
-  "$LANES" clear alpha >/dev/null
+  as_lead clear alpha >/dev/null
   run jq -r '.hookSpecificOutput.additionalContext' "$FAKE_LOG.hookout"
   assert_output --partial "run the tests for A1"
 }
@@ -37,17 +44,57 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   make_repo
   write_resume alpha
   start_fake alpha
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "not clear-ready"
   run submitted /clear
   assert_output 0
 }
 
+# tmux_shim <version>: a tmux in $LANES_TEST_TMP/shim (put it first on PATH) whose -V reports <version>; every other
+# call goes to the real tmux.
+tmux_shim() {
+  mkdir -p "$LANES_TEST_TMP/shim"
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ "$a" == -V ]] && { echo %q; exit 0; }; done\nexec %q "$@"\n' \
+    "$1" "$(command -v tmux)" >"$LANES_TEST_TMP/shim/tmux"
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+@test "on tmux older than 3.0 (no send-keys -H) lanes clear and lanes goal refuse before any key" {
+  ready_lane alpha
+  tmux_shim "tmux 2.9a"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure 2
+  assert_output --partial "tmux 2.9a is older than 3.0"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead goal alpha "ship it"
+  assert_failure 2
+  assert_output --partial "tmux 2.9a is older than 3.0"
+  run keys_sent
+  assert_output 0
+  run submitted /
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output ready
+}
+
+@test "tmux versions: 3.0 and later in every form tmux prints pass; older or unreadable ones are refused" {
+  for v in "tmux 3.0" "tmux 3.0a" "tmux 3.4" "tmux 10.1" "tmux next-3.6" "tmux master" "tmux openbsd-7.6"; do
+    tmux_shim "$v"
+    run env PATH="$LANES_TEST_TMP/shim:$PATH" bash -c 'source "$1"; tmux_check && echo ok' _ "$LANES"
+    assert_output ok
+  done
+  for v in "tmux 2.9" "tmux 1.8" "tmux next-2.9" "" "screen 4.0"; do
+    tmux_shim "$v"
+    run env PATH="$LANES_TEST_TMP/shim:$PATH" bash -c 'source "$1"; tmux_check && echo ok' _ "$LANES"
+    assert_failure 2
+    assert_output --partial "lanes: tmux"
+  done
+}
+
 @test "missing pane: the registered pane is gone" {
   ready_lane alpha
   lanes_tmux kill-pane -t "$PANE"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "does not exist"
 }
@@ -57,7 +104,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   write_resume alpha
   register_lane alpha s1 "" >/dev/null 2>&1
   "$LANES" clear-ready --lane alpha >/dev/null
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "no tmux pane registered"
 }
@@ -65,7 +112,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "registry_half_written_is_rejected by clear" {
   ready_lane alpha
   printf '{"lane":"alpha","session_id":' >"$LANES_DATA_DIR/lanes/alpha.json"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "half-written or corrupt"
 }
@@ -74,7 +121,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   ready_lane alpha
   lanes_tmux respawn-pane -k -t "$PANE" "bash --norc"
   wait_for "sessions file removed on exit" bash -c "[ ! -e '$(session_file)' ]"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "no Claude Code session file"
   run grep -c '^BURST' "$FAKE_LOG"
@@ -84,7 +131,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "clear_refuses_pane_in_copy_mode" {
   ready_lane alpha
   lanes_tmux copy-mode -t "$PANE"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "copy mode"
 }
@@ -94,7 +141,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   lanes_tmux send-keys -t "$PANE" -l -- "more work"
   lanes_tmux send-keys -t "$PANE" Enter
   wait_status busy
-  run "$LANES" clear alpha --wait 1
+  run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "received a new prompt"
   run submitted /clear
@@ -106,7 +153,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   write_resume alpha
   start_fake alpha FAKE_BUSY_FOREVER=1
   "$LANES" clear-ready --lane alpha >/dev/null
-  run "$LANES" clear alpha --wait 1
+  run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "stayed busy for 1 s"
   assert_output --partial "look at the pane"
@@ -116,7 +163,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
 @test "clear_rechecks_idle_after_gap: idle for less than LANES_IDLE_GAP is not idle yet, and --wait runs out" {
   ready_lane alpha
-  LANES_IDLE_GAP=30 run "$LANES" clear alpha --wait 1
+  LANES_IDLE_GAP=30 run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "did not stay idle for 30 s"
   run keys_sent
@@ -127,7 +174,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   ready_lane alpha
   edit_session '.statusUpdatedAt = (now * 1000 | floor)'
   SECONDS=0
-  LANES_IDLE_GAP=2 run "$LANES" clear alpha --wait 10
+  LANES_IDLE_GAP=2 run as_lead clear alpha --wait 10
   assert_success
   [ "$SECONDS" -ge 2 ]
 }
@@ -135,7 +182,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "a busy status refuses after --wait, whatever the screen shows" {
   ready_lane alpha
   edit_session '.status = "busy" | .statusUpdatedAt = (now * 1000 | floor)'
-  run "$LANES" clear alpha --wait 1
+  run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "stayed busy for 1 s"
   run keys_sent
@@ -145,7 +192,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "clear_refuses_if_head_or_resume_changed_since_ready: a new commit drops clear-ready" {
   ready_lane alpha
   git -C "$WORK" commit -q --allow-empty -m after && git -C "$WORK" push -q
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "HEAD moved since clear-ready"
   run reg alpha .clear_ready
@@ -155,7 +202,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "a RESUME rewritten and committed after clear-ready moves HEAD and drops clear-ready" {
   ready_lane alpha
   write_resume alpha "a newer goal"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "HEAD moved since clear-ready"
   run reg alpha .clear_ready
@@ -165,14 +212,14 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 @test "dirty tree at clear time is refused" {
   ready_lane alpha
   printf 'z\n' >>"$WORK/file"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "uncommitted changes"
 }
 
 @test "clear_refuses_nonempty_composer: a human's draft is never overwritten" {
   ready_lane alpha FAKE_DRAFT="half a thought"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "holds text"
   run submitted /clear
@@ -181,7 +228,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
 @test "clear_refuses_when_permission_prompt_open: the sessions file says waiting, and names what for" {
   ready_lane alpha FAKE_DIALOG=1
-  run "$LANES" clear alpha --wait 1
+  run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "is waiting for its human (permission prompt)"
   run keys_sent
@@ -195,7 +242,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
   wait_status shell
   "$LANES" clear-ready --lane alpha >/dev/null
   before="$(keys_sent)"
-  run "$LANES" clear alpha --wait 1
+  run as_lead clear alpha --wait 1
   assert_failure
   assert_output --partial "has a background shell running"
   run keys_sent
@@ -204,7 +251,7 @@ keys_sent() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
 @test "no Escape is sent: the first key of a clear is the typed /clear, which a turn only queues" {
   ready_lane alpha
-  "$LANES" clear alpha >/dev/null
+  as_lead clear alpha >/dev/null
   run grep -c '^ESC$' "$FAKE_LOG"
   assert_output 0
   run bash -c "grep -E '^(BURST|SUBMIT)' '$FAKE_LOG' | head -n 3"
@@ -215,7 +262,7 @@ SUBMIT /clear"
 
 @test "clear_detects_enter_swallowed_and_retries_once" {
   ready_lane alpha FAKE_SWALLOW_ENTERS=1
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   assert_output --partial "pressing it once more"
   run grep -c ENTER-SWALLOWED "$FAKE_LOG"
@@ -226,7 +273,7 @@ SUBMIT /clear"
 
 @test "clear_fails_loud_after_max_retries: Enter lost twice is a loud failure, no third Enter" {
   ready_lane alpha FAKE_SWALLOW_ENTERS=5
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "no new session appeared"
   run grep -c ENTER-SWALLOWED "$FAKE_LOG"
@@ -237,7 +284,7 @@ SUBMIT /clear"
 
 @test "goal_confirmed_by_prompt_hook: a goal the session never receives is a loud failure" {
   ready_lane alpha FAKE_GOAL_NO_HOOK=1
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "/goal was typed"
   run state alpha .handshake.state
@@ -254,7 +301,7 @@ SUBMIT /clear"
   mkdir -p "$LANES_TEST_TMP/shim"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexec %s "$@"\n' "$LANES_TEST_TMP/tmux.log" "$(command -v tmux)" >"$LANES_TEST_TMP/shim/tmux"
   chmod +x "$LANES_TEST_TMP/shim/tmux"
-  LANES_SEND_CHUNK=64 PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  LANES_SEND_CHUNK=64 PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_success
   run grep -c 'paste-buffer\|load-buffer' "$LANES_TEST_TMP/tmux.log"
   assert_output 0
@@ -264,21 +311,12 @@ SUBMIT /clear"
   assert_output 1
 }
 
-@test "a configured chunk over 512 is refused before anything is typed" {
-  ready_lane alpha
-  LANES_SEND_CHUNK=900 run "$LANES" clear alpha
-  assert_failure
-  assert_output --partial "LANES_SEND_CHUNK"
-  run keys_sent
-  assert_output 0
-}
-
 @test "second_clear_while_locked_refused" {
   ready_lane alpha
   sleep 30 &
   holder=$!
-  ln -s "$holder.1234" "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk"
-  run "$LANES" clear alpha
+  ln -s "$(lock_tag_of "$holder")" "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk"
+  run as_lead clear alpha
   kill "$holder"
   assert_failure
   assert_output --partial "another 'lanes clear alpha' is running"
@@ -290,10 +328,23 @@ SUBMIT /clear"
 @test "a stale clear lock from a dead lead is taken over, and the lock is gone afterwards" {
   ready_lane alpha
   ln -s 999999.1234 "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   assert [ ! -L "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk" ]
   assert [ ! -L "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk.break" ]
+}
+
+@test "a clear lock whose holder's pid now runs another process is dead and is taken over" {
+  ready_lane alpha
+  sleep 30 &
+  other=$!
+  # The lead died and the system gave its pid to another process: the pid runs, with another start time.
+  ln -s "$other.1234" "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk"
+  run as_lead clear alpha
+  kill "$other"
+  assert_success
+  assert_output --partial "cleared: alpha"
+  assert [ ! -L "$LANES_DATA_DIR/lanes/state/alpha.clear.lnk" ]
 }
 
 @test "lead_restart_resumes_handshake_from_record: /clear landed, the goal did not; a rerun sends only the goal" {
@@ -301,8 +352,8 @@ SUBMIT /clear"
   lanes_tmux send-keys -t "$PANE" -l -- "/clear"
   lanes_tmux send-keys -t "$PANE" Enter
   wait_for "new session recorded" bash -c "[ \"\$(jq -r .session_id '$LANES_DATA_DIR/lanes/state/alpha.json')\" != \"\$(jq -r .handshake.session_id '$LANES_DATA_DIR/lanes/state/alpha.json')\" ]"
-  jq '.handshake.state = "sending" | .handshake.sent_at = (now | floor)' "$LANES_DATA_DIR/lanes/state/alpha.json" >"$LANES_TEST_TMP/s" && mv "$LANES_TEST_TMP/s" "$LANES_DATA_DIR/lanes/state/alpha.json"
-  run "$LANES" clear alpha
+  mark_sending
+  run as_lead clear alpha
   assert_success
   run submitted /clear
   assert_output 1
@@ -312,19 +363,101 @@ SUBMIT /clear"
 
 @test "lead restarted before /clear landed: the record says sending, the session is unchanged, so it starts over" {
   ready_lane alpha
-  jq '.handshake.state = "sending" | .handshake.sent_at = (now | floor)' "$LANES_DATA_DIR/lanes/state/alpha.json" >"$LANES_TEST_TMP/s" && mv "$LANES_TEST_TMP/s" "$LANES_DATA_DIR/lanes/state/alpha.json"
-  run "$LANES" clear alpha
+  mark_sending
+  run as_lead clear alpha
   assert_success
   assert_output --partial "checking again from the start"
   run submitted /clear
   assert_output 1
 }
 
-@test "a lane never clears its own pane" {
+@test "the lead never clears its own pane" {
   ready_lane alpha
-  TMUX_PANE="$PANE" run "$LANES" clear alpha
+  run as_lead clear lead
   assert_failure
   assert_output --partial "never clears itself"
+}
+
+@test "lanes clear from a caller that is not the lead is refused and types nothing" {
+  ready_lane alpha
+  register_lane beta sb %98 >/dev/null 2>&1
+  TMUX_PANE=%98 run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "only the lead"
+  TMUX_PANE="$PANE" run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "only the lead"
+  run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "only the lead"
+  run keys_sent
+  assert_output 0
+  run reg alpha .clear_ready
+  assert_output true
+}
+
+@test "lanes clear refuses an unknown argument or a --wait without its value with usage, and types nothing" {
+  ready_lane alpha
+  run as_lead clear alpha --bogus
+  assert_failure 2
+  assert_output --partial "usage"
+  run as_lead clear alpha --wait
+  assert_failure 2
+  assert_output --partial "usage"
+  run as_lead clear alpha --wait 5 extra
+  assert_failure 2
+  assert_output --partial "usage"
+  run keys_sent
+  assert_output 0
+}
+
+@test "a RESUME Goal ending in ';' is typed whole: tmux never reads the semicolon as a separator" {
+  make_repo
+  write_resume alpha 'ship item A1;'
+  start_fake alpha
+  "$LANES" clear-ready --lane alpha >/dev/null
+  run as_lead clear alpha
+  assert_success
+  run grep -cx 'SUBMIT /goal ship item A1;' "$FAKE_LOG"
+  assert_output 1
+  run bash -c "tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -c 'Try \"refactor'"
+  assert_output 1
+}
+
+@test "a sending record and a lane restarted, not cleared, is refused: the new session gets no goal" {
+  ready_lane alpha
+  mark_sending
+  lanes_tmux kill-session -t alpha
+  start_fake alpha
+  run state alpha .start_source
+  assert_output startup
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "the lane restarted (source startup) instead of clearing"
+  run submitted /
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output stale
+  run reg alpha .clear_ready
+  assert_output false
+}
+
+@test "a lane restarted while lanes clear waits for its /clear to land is refused, not cleared: no goal is typed" {
+  ready_lane alpha FAKE_SWALLOW_ENTERS=2
+  as_lead clear alpha >"$LANES_TEST_TMP/out" 2>&1 &
+  pid=$!
+  wait_for "first Enter swallowed" grep -q ENTER-SWALLOWED "$FAKE_LOG"
+  lanes_tmux kill-session -t alpha
+  start_fake alpha
+  rc=0
+  wait "$pid" || rc=$?
+  assert [ "$rc" -ne 0 ]
+  run cat "$LANES_TEST_TMP/out"
+  assert_output --partial "the lane restarted (source startup) instead of clearing"
+  run submitted /
+  assert_output 0
+  run state alpha .handshake.state
+  assert_output stale
 }
 
 @test "the no-flock mutex: a live holder is waited for and never broken; once it dies the lock is taken over" {
@@ -332,17 +465,45 @@ SUBMIT /clear"
   export LANES_NO_FLOCK=1
   sleep 30 &
   holder=$!
-  ln -s "$holder.1234" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  tag="$(lock_tag_of "$holder")"
+  ln -s "$tag" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
   jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt 2>/dev/null
   run state alpha .prompts
   assert_output 0
-  assert [ "$(readlink "$LANES_DATA_DIR/lanes/state/.mutex.lnk")" = "$holder.1234" ]
+  assert [ "$(readlink "$LANES_DATA_DIR/lanes/state/.mutex.lnk")" = "$tag" ]
   kill "$holder"
   wait "$holder" 2>/dev/null || true
   jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
   run state alpha .prompts
   assert_output 1
   assert [ ! -L "$LANES_DATA_DIR/lanes/state/.mutex.lnk" ]
+}
+
+@test "the no-flock mutex: a holder whose pid now runs another process is dead, and the lock is taken over at once" {
+  register_lane alpha s1 %7 >/dev/null
+  export LANES_NO_FLOCK=1
+  sleep 30 &
+  other=$!
+  ln -s "$other.1234" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  SECONDS=0
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
+  kill "$other"
+  [ "$SECONDS" -lt 2 ] || { echo "waited $SECONDS s for a dead holder" >&2; false; }
+  run state alpha .prompts
+  assert_output 1
+  assert [ ! -L "$LANES_DATA_DIR/lanes/state/.mutex.lnk" ]
+}
+
+@test "the no-flock mutex: a zombie holder (exited, not reaped) is dead, and the lock is taken over" {
+  register_lane alpha s1 %7 >/dev/null
+  export LANES_NO_FLOCK=1
+  zombie_child
+  ln -s "$ZTAG" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  jq -nc '{session_id:"s1",session_title:"alpha",prompt:"hi"}' | "$LANES" hook prompt
+  kill "$ZPARENT"
+  wait "$ZPARENT" 2>/dev/null || true
+  run state alpha .prompts
+  assert_output 1
 }
 
 @test "a dead mutex holder is taken over by exactly one of many racing processes: no update is lost" {
@@ -403,8 +564,8 @@ bounded_hook() {
   mkdir -p "$LANES_TEST_TMP/shim"
   sleep 30 &
   live=$!
-  ln -s "$live.1" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
-  ln -s "$live.2" "$LANES_DATA_DIR/lanes/state/.mutex.lnk.break"
+  ln -s "$(lock_tag_of "$live")" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  ln -s "$(lock_tag_of "$live")" "$LANES_DATA_DIR/lanes/state/.mutex.lnk.break"
   bounded_hook
   kill "$live"
   [ "$RC" -ne 124 ]
@@ -422,7 +583,7 @@ bounded_hook() {
   sleep 0.5
   sid="$(reg alpha .session_id)"
   jq --arg s "$sid" '.handshake.state = "cleared" | .handshake.cleared_at = 1000 | .handshake.cleared_session = $s' "$LANES_DATA_DIR/lanes/state/alpha.json" >"$LANES_TEST_TMP/s" && mv "$LANES_TEST_TMP/s" "$LANES_DATA_DIR/lanes/state/alpha.json"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "older than"
   run submitted "/goal"
@@ -431,7 +592,7 @@ bounded_hook() {
 
 @test "a cleared record from another session is not resumed: the lane cleared or restarted since" {
   ready_lane alpha
-  jq '.handshake.state = "sending" | .handshake.sent_at = (now | floor)' "$LANES_DATA_DIR/lanes/state/alpha.json" >"$LANES_TEST_TMP/s" && mv "$LANES_TEST_TMP/s" "$LANES_DATA_DIR/lanes/state/alpha.json"
+  mark_sending
   lanes_tmux send-keys -t "$PANE" -l -- "/clear"
   lanes_tmux send-keys -t "$PANE" Enter
   wait_for "cleared" bash -c "[ \"\$(jq -r .handshake.state '$LANES_DATA_DIR/lanes/state/alpha.json')\" = cleared ]"
@@ -439,7 +600,7 @@ bounded_hook() {
   lanes_tmux send-keys -t "$PANE" Enter
   wait_for "second session" bash -c "[ \$(grep -c '^SUBMIT /clear' '$FAKE_LOG') = 2 ]"
   sleep 0.5
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "another session"
   run submitted "/goal"
@@ -451,7 +612,7 @@ bounded_hook() {
   sid="$(reg alpha .session_id)"
   f="$LANES_DATA_DIR/lanes/state/alpha.json"
   jq --arg s "$sid" --argjson n "$(date +%s)" '.handshake.state="cleared" | .handshake.cleared_session=$s | .handshake.cleared_at=$n | .prompts=3 | .goal=null' "$f" >"$f.n" && mv "$f.n" "$f"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "lanes goal alpha"
   run submitted "/goal"
@@ -462,7 +623,7 @@ bounded_hook() {
   ready_lane alpha
   f="$LANES_DATA_DIR/lanes/state/alpha.json"
   jq '.handshake.state="sending" | .handshake.session_id="old-session" | .handshake.sent_at=1000000000 | .handshake.goal="three day old goal"' "$f" >"$f.n" && mv "$f.n" "$f"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "older than"
   run grep -c '^SUBMIT' "$FAKE_LOG"
@@ -475,7 +636,7 @@ bounded_hook() {
   ready_lane alpha
   lanes_tmux split-window -d -t "$PANE" "sleep 300"
   lanes_tmux set-window-option -t "$PANE" synchronize-panes on
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "has synchronize-panes on"
   run keys_sent
@@ -488,7 +649,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
 @test "a Stop hook's feedback after clear-ready (a /goal verdict sending the loop on) is a new turn: refused" {
   ready_lane alpha
   add_turn_entry '{"type":"user","isMeta":true,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"Stop hook feedback:\n[ship A1]: not yet"}}'
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "began another turn since clear-ready"
   run keys_sent
@@ -500,7 +661,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
 @test "a background task's notification after clear-ready is a new turn: refused" {
   ready_lane alpha
   add_turn_entry '{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}}'
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "began another turn since clear-ready"
   run keys_sent
@@ -512,7 +673,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
   add_turn_entry '{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fake","content":"clear-ready: alpha","is_error":false}]}}'
   add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"clear-ready"}]}}'
   add_turn_entry '{"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:01.100Z"}'
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -520,7 +681,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
   ready_lane alpha
   f="$LANES_DATA_DIR/lanes/state/alpha.json"
   jq '.handshake.turns = ""' "$f" >"$f.n" && mv "$f.n" "$f"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "could not be read"
   run keys_sent
@@ -530,7 +691,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
 @test "a check that crashes is a refusal, never a pass: nothing is typed" {
   ready_lane alpha
   jq_shim '(.tmux_pid // "" | tostring)' 1+
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "check failed: identity_problem"
   run keys_sent
@@ -541,7 +702,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
   ready_lane alpha
   # The first read is the identity proof; the second is the wait for idle, the one a torn write can hit.
   jq_shim "/sessions/$FAKE_PID.json" 2
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_success
   run submitted /clear
   assert_output 1
@@ -550,7 +711,7 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
 @test "two unreadable sessions file reads in a row while waiting for idle are refused" {
   ready_lane alpha
   jq_shim "/sessions/$FAKE_PID.json" 2+
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "is not valid JSON"
   run keys_sent
@@ -563,7 +724,8 @@ add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
   printf '#!/usr/bin/env bash\n%q "$@"\nrc=$?\nif [[ " $* " == *"-l -- /clear"* ]]; then : >%q; sleep 2; fi\nexit $rc\n' \
     "$(command -v tmux)" "$LANES_TEST_TMP/typed" >"$LANES_TEST_TMP/shim/tmux"
   chmod +x "$LANES_TEST_TMP/shim/tmux"
-  PATH="$LANES_TEST_TMP/shim:$PATH" "$LANES" clear alpha >"$LANES_TEST_TMP/out" 2>&1 &
+  register_lead
+  TMUX_PANE=%99 PATH="$LANES_TEST_TMP/shim:$PATH" "$LANES" clear alpha >"$LANES_TEST_TMP/out" 2>&1 &
   pid=$!
   wait_for "typed /clear" test -f "$LANES_TEST_TMP/typed"
   kill -TERM "$pid"

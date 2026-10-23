@@ -86,6 +86,28 @@ load helper
   assert [ ! -e "$WORK/CLAUDE.md" ]
 }
 
+@test "--claude-md with no value prints the usage and writes nothing" {
+  make_repo
+  cd "$WORK"
+  run "$LANES" init --claude-md
+  assert_failure 2
+  assert_output --partial "lanes: usage:"
+  assert [ ! -e "$WORK/.lanes" ]
+}
+
+@test "init writes the journal into the folder recorded for its own project" {
+  make_repo
+  hook_json SessionStart s1 alpha startup | TMUX_PANE=%7 CLAUDE_PLUGIN_OPTION_JOURNAL_DIR=journal "$LANES" register 2>/dev/null >/dev/null
+  mkdir -p "$LANES_TEST_TMP/other"
+  jq -nc --arg c "$LANES_TEST_TMP/other" '{session_id:"o1",session_title:"beta",cwd:$c,source:"startup"}' |
+    TMUX_PANE=%8 CLAUDE_PLUGIN_OPTION_JOURNAL_DIR=elsewhere "$LANES" register 2>/dev/null >/dev/null
+  cd "$WORK"
+  run "$LANES" init --claude-md no
+  assert_success
+  assert_output --partial "journal: $WORK/journal"
+  assert [ -f "$WORK/journal/RULES.md" ]
+}
+
 @test "init from a subdirectory writes the journal at the git top level" {
   make_repo
   mkdir -p "$WORK/sub/dir"

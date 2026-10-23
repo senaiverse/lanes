@@ -4,6 +4,7 @@
 # collapsed: a number, unknown and stale.
 
 load helper
+load lead
 
 # statusline_input <lane> <session> <pct|null>
 statusline_input() {
@@ -12,6 +13,18 @@ statusline_input() {
 
 # sl <lane> <session> <pct> [command]: one status line update through the given command (default the plugin's).
 sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
+
+# in_new_group <input file> <command...>: run the command in the background as the leader of a new process group, so a
+# TERM to the group reaches every process of it. Job control (set -m) does that in Bash on Linux and macOS alike, where
+# macOS has no setsid. Sets GROUP_PID.
+in_new_group() {
+  local in="$1"
+  shift
+  set -m
+  "$@" <"$in" >/dev/null &
+  GROUP_PID=$!
+  set +m
+}
 
 @test "statusline records used_pct for the registered session and prints one line" {
   register_lane alpha s1 %7 >/dev/null
@@ -54,14 +67,12 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
 
 @test "statusline_cancelled_mid_write_leaves_old_file_intact: TERM at random points never leaves half a file" {
   register_lane alpha s1 %7 >/dev/null
-  command -v setsid >/dev/null || skip "setsid is needed to signal the whole process group"
   for i in $(seq 1 60); do
     statusline_input alpha s1 "$i" >"$LANES_TEST_TMP/in"
-    setsid "$STATUSLINE" <"$LANES_TEST_TMP/in" >/dev/null &
-    pid=$!
+    in_new_group "$LANES_TEST_TMP/in" "$STATUSLINE"
     sleep "0.0$((RANDOM % 4))$((RANDOM % 10))"
-    kill -TERM -- "-$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill -TERM -- "-$GROUP_PID" 2>/dev/null || true
+    wait "$GROUP_PID" 2>/dev/null || true
     jq -e '.lane == "alpha" and .session_id == "s1"' "$LANES_DATA_DIR/lanes/alpha.json" >/dev/null
   done
   run bash -c "ls -A '$LANES_DATA_DIR/lanes' | grep -c '^\.tmp' || true"
@@ -69,17 +80,16 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
 }
 
 @test "a status line cancelled between its temp write and the rename leaves no temp file and the old entry" {
-  command -v setsid >/dev/null || skip "setsid is needed to signal the whole process group"
   register_lane alpha s1 %7 >/dev/null
   mkdir -p "$LANES_TEST_TMP/slow"
   printf '#!/usr/bin/env bash\nsleep 2\nexec %s "$@"\n' "$(command -v mv)" >"$LANES_TEST_TMP/slow/mv"
   chmod +x "$LANES_TEST_TMP/slow/mv"
   statusline_input alpha s1 61 >"$LANES_TEST_TMP/in"
-  PATH="$LANES_TEST_TMP/slow:$PATH" setsid "$STATUSLINE" <"$LANES_TEST_TMP/in" >/dev/null &
-  pid=$!
+  in_new_group "$LANES_TEST_TMP/in" env PATH="$LANES_TEST_TMP/slow:$PATH" "$STATUSLINE"
   wait_for "temp file" bash -c "ls -A '$LANES_DATA_DIR/lanes' | grep -q '^\.tmp'"
-  kill -TERM -- "-$pid"
-  wait "$pid" 2>/dev/null || true
+  [ "$(ps -o pgid= -p "$GROUP_PID" | tr -d ' ')" = "$GROUP_PID" ]
+  kill -TERM -- "-$GROUP_PID"
+  wait "$GROUP_PID" 2>/dev/null || true
   run reg alpha .used_pct
   assert_output null
   run bash -c "ls -A '$LANES_DATA_DIR/lanes' | grep -c '^\.tmp' || true"
@@ -121,10 +131,65 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
   hook_json SessionStart s1 alpha startup | TMUX_PANE=%7 CLAUDE_PLUGIN_OPTION_THRESHOLD=50 "$LANES" register
   sl alpha s1 55 >/dev/null
   run "$LANES" status
-  assert_output --partial "threshold 50%"
-  assert_output --partial AT-THRESHOLD
+  assert_output --partial "ctx 55% AT-THRESHOLD"
+  run bash -c "'$LANES' status --json | jq -r '.[0].threshold'"
+  assert_output 50
   LANES_THRESHOLD=60 run "$LANES" status
   refute_output --partial AT-THRESHOLD
+}
+
+@test "each lane's threshold is its own project's option, in status and in its status line, whichever started last" {
+  mkdir -p "$LANES_TEST_TMP/A" "$LANES_TEST_TMP/B"
+  for p in A:alpha:a1:50 B:beta:b1:90; do
+    IFS=: read -r dir lane sid thr <<<"$p"
+    jq -nc --arg s "$sid" --arg t "$lane" --arg c "$LANES_TEST_TMP/$dir" '{session_id:$s,session_title:$t,cwd:$c,source:"startup"}' |
+      TMUX_PANE="%$thr" CLAUDE_PLUGIN_OPTION_THRESHOLD="$thr" "$LANES" register 2>/dev/null
+  done
+  run sl alpha a1 60
+  assert_output "lanes alpha ctx 60% at threshold"
+  run sl beta b1 60
+  assert_output "lanes beta ctx 60%"
+  run bash -c "'$LANES' status --json | jq -c 'map([.lane, .threshold, .at_threshold])'"
+  assert_output '[["alpha",50,true],["beta",90,false]]'
+  run bash -c "'$LANES' status | grep '^alpha'"
+  assert_output --partial "ctx 60% AT-THRESHOLD"
+  run bash -c "'$LANES' status | grep '^beta'"
+  assert_output --partial "ctx 60%"
+  refute_output --partial AT-THRESHOLD
+}
+
+@test "each timing and chunk variable, not a plain number in its range, is refused before the command reads it" {
+  register_lane alpha s1 %7 >/dev/null
+  for spec in LANES_CLEAR_TIMEOUT:0 LANES_PCT_STALE:0 LANES_SEND_GAP:0 LANES_REQUEST_TIMEOUT:-1 LANES_SEND_CHUNK:0 \
+    LANES_CLEAR_TIMEOUT:3601 LANES_PCT_STALE:604801 LANES_REQUEST_TIMEOUT:604801 LANES_SEND_GAP:5.001 LANES_SEND_CHUNK:513; do
+    for v in "${spec#*:}" abc 1e3 1.2.3 ' 5' 12x; do
+      run env "${spec%%:*}=$v" "$LANES" status
+      assert_failure 2
+      assert_output --partial "${spec%%:*}=$v is not a"
+    done
+  done
+  # A leading zero is decimal, never octal: 08 is eight seconds, not an arithmetic error.
+  for ok in LANES_CLEAR_TIMEOUT=1 LANES_CLEAR_TIMEOUT=08 LANES_PCT_STALE=0900 LANES_PCT_STALE=604800 LANES_REQUEST_TIMEOUT=0 LANES_SEND_GAP=0.001 LANES_SEND_GAP=5 \
+    LANES_SEND_CHUNK=1 LANES_SEND_CHUNK=0512; do
+    run env "$ok" "$LANES" status
+    assert_success
+  done
+}
+
+@test "a bad timing or chunk variable stops lanes clear and lanes goal before any key reaches the lane" {
+  ready_lane alpha
+  before="$(cat "$LANES_DATA_DIR/lanes/state/alpha.json")"
+  for bad in LANES_CLEAR_TIMEOUT=abc LANES_SEND_GAP=abc LANES_REQUEST_TIMEOUT=abc LANES_SEND_CHUNK=900; do
+    run env "$bad" "$LANES" clear alpha
+    assert_failure 2
+    run env "$bad" "$LANES" goal alpha "ship it"
+    assert_failure 2
+  done
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
+  refute pane_has '/clear'
+  refute pane_has 'ship it'
+  [ "$(cat "$LANES_DATA_DIR/lanes/state/alpha.json")" = "$before" ]
 }
 
 @test "empty journal and empty registry: status says how to start a lane" {
@@ -166,10 +231,10 @@ sl() { statusline_input "$1" "$2" "$3" | "${4:-$STATUSLINE}"; }
   make_repo
   write_resume alpha
   register_lane alpha s1 %7 >/dev/null
-  "$LANES" request alpha >/dev/null
-  run bash -c "'$LANES' status --json | jq -r '.[0].handshake'"
+  as_lead request alpha >/dev/null
+  run bash -c "'$LANES' status --json | jq -r '.[] | select(.lane == \"alpha\") | .handshake'"
   assert_output requested
-  LANES_REQUEST_TIMEOUT=0 run bash -c "sleep 1; '$LANES' status --json | jq -r '.[0].handshake'"
+  LANES_REQUEST_TIMEOUT=0 run bash -c "sleep 1; '$LANES' status --json | jq -r '.[] | select(.lane == \"alpha\") | .handshake'"
   assert_output request-timed-out
 }
 
@@ -236,7 +301,7 @@ old_writer_after_new_session() {
   export LANES_NO_FLOCK=1
   sleep 30 &
   holder=$!
-  ln -s "$holder.1" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
+  ln -s "$(lock_tag_of "$holder")" "$LANES_DATA_DIR/lanes/state/.mutex.lnk"
   "$@" &
   writer=$!
   sleep 0.5

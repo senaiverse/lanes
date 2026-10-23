@@ -22,7 +22,8 @@ skill, MIT: https://github.com/mattpocock/skills
 <!-- Plan file, tracker row, commits, PR, logs: paths or URLs only. -->
 
 ### Running
-<!-- Jobs, background shells, CI runs still going, with where their results land. "Nothing" if none. -->
+<!-- Jobs outside this session still going (CI runs, tmux jobs), with where their results land. "Nothing" if none.
+     Stop or finish this session's own background shells before clear-ready: lanes clear refuses while one runs. -->
 
 ### Suggested skills
 <!-- The skills to load first after the clear, for example: lane -->

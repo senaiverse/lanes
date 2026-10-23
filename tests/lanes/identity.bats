@@ -6,11 +6,12 @@
 # foreground process group and not stopped. Each test breaks one check; nothing may be typed.
 
 load helper
+load lead
 
 keys_typed() { grep -c -E '^(BURST|ESC)' "$FAKE_LOG" || true; }
 
 refused_untouched() { # refused_untouched <message part>
-  run "$LANES" clear alpha --wait 2
+  run as_lead clear alpha --wait 2
   assert_failure
   assert_output --partial "$1"
   run keys_typed
@@ -19,7 +20,7 @@ refused_untouched() { # refused_untouched <message part>
 
 @test "the proof holds for a live fake: the clear lands (the baseline every test below breaks once)" {
   ready_lane alpha
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -63,7 +64,7 @@ refused_untouched() { # refused_untouched <message part>
   "$LANES" clear-ready --lane alpha >/dev/null
   f="$LANES_DATA_DIR/lanes/alpha.json"
   jq --argjson p "$other_pid" --arg s "$other_sid" '.claude_pid = $p | .session_id = $s' "$f" >"$f.x" && mv "$f.x" "$f"
-  run "$LANES" clear alpha --wait 2
+  run as_lead clear alpha --wait 2
   assert_failure
   assert_output --partial "Claude Code pid $other_pid of lane alpha is not the process of pane $PANE or a child of it"
   run keys_typed
@@ -85,7 +86,7 @@ refused_untouched() { # refused_untouched <message part>
   [ "$FAKE_PID" != "$(lanes_tmux display -p -t alpha '#{pane_pid}')" ]
   run "$LANES" clear-ready --lane alpha
   assert_success
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -95,7 +96,7 @@ refused_untouched() { # refused_untouched <message part>
   shell_pane
   fake_from_shell alpha "bash '$LANES_TEST_TMP/run-fake' alpha"
   "$LANES" clear-ready --lane alpha >/dev/null
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -118,7 +119,7 @@ refused_untouched() { # refused_untouched <message part>
   # Ignoring SIGTTOU and SIGTTIN lets a background job set up the terminal and poll it, as a tool's child can.
   fake_from_shell nested "(trap '' TTOU TTIN; exec bash '$LANES_TEST_TMP/run-fake' nested) &"
   "$LANES" clear-ready --lane nested >/dev/null
-  run "$LANES" clear nested --wait 2
+  run as_lead clear nested --wait 2
   assert_failure
   assert_output --partial "Claude Code pid $FAKE_PID of lane nested is not the foreground program of pane $PANE"
   run keys_typed
@@ -155,7 +156,7 @@ zombie_fake() {
 
 @test "a zombie Claude Code is not proven: clear refuses it as stale" {
   zombie_fake alpha
-  run "$LANES" clear alpha --wait 2
+  run as_lead clear alpha --wait 2
   assert_failure
   assert_output --partial "the session file of pid $FAKE_PID is stale"
 }

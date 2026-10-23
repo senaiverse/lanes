@@ -134,20 +134,12 @@ start_odd() {
 }
 
 @test "proc_start of a zombie (exited, not yet reaped by its parent) gives nothing, in both forms" {
-  # The parent starts a child, then becomes a sleep, which never waits; the child is killed only after that exec,
-  # since bash itself would reap it.
-  bash -c 'sleep 30 & echo "$!" >"$1"; exec sleep 30' _ "$LANES_TEST_TMP/zpid" &
-  parent=$!
-  wait_for "child pid" test -s "$LANES_TEST_TMP/zpid"
-  zpid="$(<"$LANES_TEST_TMP/zpid")"
-  wait_for "parent exec" bash -c "[ \"\$(ps -o args= -p $parent)\" = 'sleep 30' ]"
-  kill -9 "$zpid"
-  wait_for "zombie" bash -c "ps -o stat= -p $zpid | grep -q '^Z'"
-  run bash -c 'source "$1"; proc_start "$2" || echo gone' _ "$LANES" "$zpid"
+  zombie_child
+  run bash -c 'source "$1"; proc_start "$2" || echo gone' _ "$LANES" "$ZPID"
   linux="$output"
-  run bash -c 'source "$1"; OS_NAME=Darwin; proc_start "$2" || echo gone' _ "$LANES" "$zpid"
-  kill "$parent"
-  wait "$parent" 2>/dev/null || true
+  run bash -c 'source "$1"; OS_NAME=Darwin; proc_start "$2" || echo gone' _ "$LANES" "$ZPID"
+  kill "$ZPARENT"
+  wait "$ZPARENT" 2>/dev/null || true
   assert_equal "$linux" gone
   assert_output gone
 }

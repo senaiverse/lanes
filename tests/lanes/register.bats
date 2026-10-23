@@ -146,6 +146,18 @@ state"
   assert_output "$first"
 }
 
+@test "a lane name is unique on this machine: a session of another project with a held name is refused, and told so" {
+  make_repo
+  start_fake alpha
+  first="$PANE"
+  mkdir -p "$LANES_TEST_TMP/other"
+  run bash -c "jq -nc --arg c '$LANES_TEST_TMP/other' '{session_id:\"o1\",session_title:\"alpha\",cwd:\$c,source:\"startup\"}' | TMUX_PANE=%99 '$LANES' register"
+  assert_success
+  assert_output --partial "already in use by pane $first (a lane name is unique on this machine, across projects)"
+  run reg alpha .cwd
+  assert_output "$WORK"
+}
+
 @test "a lane whose Claude Code a human stopped (Ctrl-Z) keeps its name: a new session does not take it" {
   make_repo
   shell_pane
@@ -227,11 +239,86 @@ strip_entry() { local f="$LANES_DATA_DIR/lanes/alpha.json"; jq -c "$1" "$f" >"$f
   assert_output lead
 }
 
-@test "plugin options reach the hook and are recorded for bin/ commands" {
+@test "plugin options reach the hook and are recorded for bin/ commands, under the session's project" {
   register_lane alpha s1 %7 >/dev/null
   hook_json SessionStart s1 alpha startup | TMUX_PANE=%7 CLAUDE_PLUGIN_OPTION_THRESHOLD=55 CLAUDE_PLUGIN_OPTION_JOURNAL_DIR=journal "$LANES" register
   run jq -c . "$LANES_DATA_DIR/lanes/state/config.json"
-  assert_output '{"threshold":55,"journal_dir":"journal"}'
+  assert_output "{\"$WORK\":{\"threshold\":55,\"journal_dir\":\"journal\"}}"
+}
+
+# two_projects: repositories A, with a second worktree A-wt, and B. start_in <dir> <lane> <session> [source]
+# [VAR=value...]: that lane's SessionStart from <dir>, with the given plugin options in its environment.
+two_projects() {
+  local p
+  for p in A B; do
+    git init -q -b main "$LANES_TEST_TMP/$p"
+    git -C "$LANES_TEST_TMP/$p" commit -q --allow-empty -m init
+  done
+  git -C "$LANES_TEST_TMP/A" worktree add -q -b wt "$LANES_TEST_TMP/A-wt"
+}
+start_in() {
+  local dir="$1" lane="$2" sid="$3" src="$4"
+  shift 4
+  jq -nc --arg s "$sid" --arg t "$lane" --arg c "$dir" --arg src "$src" '{session_id:$s,session_title:$t,cwd:$c,source:$src}' |
+    env TMUX_PANE="%$RANDOM" "$@" "$LANES" register 2>/dev/null
+}
+
+@test "two projects keep their own journal_dir: each lane's journal is its project's, whichever session started last" {
+  two_projects
+  start_in "$LANES_TEST_TMP/A" alpha a1 startup CLAUDE_PLUGIN_OPTION_JOURNAL_DIR=ja >/dev/null
+  start_in "$LANES_TEST_TMP/B" beta b1 startup CLAUDE_PLUGIN_OPTION_JOURNAL_DIR=jb >/dev/null
+  run jq -c 'keys' "$LANES_DATA_DIR/lanes/state/config.json"
+  assert_output "[\"$LANES_TEST_TMP/A/.git\",\"$LANES_TEST_TMP/B/.git\"]"
+  run bash -c "cd '$LANES_TEST_TMP/A' && '$LANES' journal-dir"
+  assert_output "$LANES_TEST_TMP/A/ja"
+  run bash -c "cd '$LANES_TEST_TMP/A-wt' && '$LANES' journal-dir"
+  assert_output "$LANES_TEST_TMP/A-wt/ja"
+  run bash -c "cd '$LANES_TEST_TMP/B' && '$LANES' journal-dir"
+  assert_output "$LANES_TEST_TMP/B/jb"
+  ctx="$(start_in "$LANES_TEST_TMP/A" alpha a2 clear | jq -r .hookSpecificOutput.additionalContext)"
+  run echo "$ctx"
+  assert_output --partial "No RESUME block was found at $LANES_TEST_TMP/A/ja/next-alpha.md"
+}
+
+@test "register keeps how each session began as start_source: startup, then resume, compact and fork, then clear" {
+  register_lane alpha s1 %7 >/dev/null
+  run state alpha .start_source
+  assert_output startup
+  for src in resume compact fork; do
+    hook_json SessionStart s1 alpha "$src" | TMUX_PANE=%7 "$LANES" register >/dev/null
+    run state alpha .start_source
+    assert_output "$src"
+  done
+  hook_json SessionStart s2 alpha clear | TMUX_PANE=%7 "$LANES" register >/dev/null
+  run state alpha .start_source
+  assert_output clear
+}
+
+@test "only a clear turns a sending handshake into cleared: a new session that restarted, resumed or forked leaves it sending" {
+  register_lane alpha s1 %7 >/dev/null
+  f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq -c '.handshake = {state: "sending", session_id: "s1"}' "$f" >"$f.x" && mv "$f.x" "$f"
+  for src in startup resume fork; do
+    hook_json SessionStart "s-$src" alpha "$src" | TMUX_PANE=%7 "$LANES" register >/dev/null
+    run state alpha '[.handshake.state, .session_id, .start_source] | @json'
+    assert_output "[\"sending\",\"s-$src\",\"$src\"]"
+  done
+  hook_json SessionStart s3 alpha clear | TMUX_PANE=%7 "$LANES" register >/dev/null
+  run state alpha '[.handshake.state, .handshake.cleared_session, .start_source] | @json'
+  assert_output '["cleared","s3","clear"]'
+}
+
+@test "a fork started from the lane's own pane (a /fork background copy) never takes the lane while its session runs" {
+  make_repo
+  start_fake alpha
+  sid="$(reg alpha .session_id)"
+  run bash -c "TMUX_PANE='$PANE' CLAUDE_PID='$FAKE_PID' '$LANES' register <<<'$(hook_json SessionStart f1 alpha fork)'"
+  assert_success
+  assert_output --partial "already in use by pane $PANE"
+  run reg alpha .session_id
+  assert_output "$sid"
+  run state alpha .start_source
+  assert_output startup
 }
 
 @test "register refreshes the stable statusline link under the data dir when the plugin root is known" {

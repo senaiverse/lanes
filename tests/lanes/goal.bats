@@ -4,6 +4,7 @@
 # a goal loop keeps the sessions file busy across its turns, so clear waits for the loop to hand control back.
 
 load helper
+load lead
 
 submits() { grep -E '^SUBMIT ' "$FAKE_LOG" | cut -d' ' -f2- || true; }
 
@@ -22,7 +23,7 @@ goal_lane() {
 
 @test "a lane with an active goal is cleared by /clear alone, then the RESUME Goal is set, never the live one" {
   goal_lane
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   assert_output --partial "cleared: alpha"
   run submits
@@ -44,7 +45,7 @@ goal_lane() {
   assert_success
   run state alpha .handshake.goal
   assert_output "finish item A1 and report done"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   run grep -c '^SUBMIT /goal an old goal' "$FAKE_LOG"
   assert_output 0
@@ -60,7 +61,7 @@ goal_lane() {
   "$LANES" clear-ready --lane alpha >/dev/null
   n="$(grep -c '^GOAL-CONTINUE$' "$FAKE_LOG" || true)"
   wait_for "another goal turn" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -gt $n ]"
-  run "$LANES" clear alpha --wait 5
+  run as_lead clear alpha --wait 5
   assert_failure
   assert_output --partial "began another turn since clear-ready"
   run grep -c '^BURST' "$FAKE_LOG"
@@ -74,7 +75,7 @@ goal_lane() {
   write_resume alpha
   start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=1000 FAKE_TURN_MS=60000
   "$LANES" clear-ready --lane alpha >/dev/null
-  run "$LANES" clear alpha --wait 2
+  run as_lead clear alpha --wait 2
   assert_failure
   assert_output --partial "stayed busy for 2 s"
   run grep -c '^BURST' "$FAKE_LOG"
@@ -87,14 +88,12 @@ goal_lane() {
   make_repo
   write_resume alpha
   register_lane alpha s1 %7 >/dev/null
-  run "$LANES" request alpha
+  run as_lead request alpha
   assert_success
   refute_output --partial "goal"
 }
 
 # ---- lanes goal <lane> "<text>": the lead sets or replaces a lane's goal without clearing it -----------------------
-
-as_lead() { TMUX_PANE=%99 "$LANES" "$@"; }
 
 goal_setup() {
   make_repo
@@ -170,7 +169,7 @@ goal_setup() {
   write_resume alpha "ship B2 instead"
   run "$LANES" clear-ready --lane alpha
   assert_success
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   run submits
   assert_output "/goal ship B2 instead
@@ -221,7 +220,7 @@ goal_setup() {
   write_resume alpha "   ship A1 with spaces   "
   start_fake alpha
   "$LANES" clear-ready --lane alpha >/dev/null
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
   run grep -c '^SUBMIT /goal ship A1 with spaces$' "$FAKE_LOG"
   assert_output 1
@@ -255,4 +254,110 @@ goal_setup() {
   assert_success
   run grep -c '^SUBMIT /goal ship B2$' "$FAKE_LOG"
   assert_output 1
+}
+
+@test "lanes goal refuses an unknown argument or a --wait without its value with usage, and types nothing" {
+  goal_setup
+  run as_lead goal alpha "ship B2" --bogus
+  assert_failure 2
+  assert_output --partial "usage"
+  run as_lead goal alpha "ship B2" --wait
+  assert_failure 2
+  assert_output --partial "usage"
+  run grep -c '^BURST' "$FAKE_LOG"
+  assert_output 0
+}
+
+@test "semicolons at the end of a typed chunk reach the input line: tmux never reads them as separators" {
+  goal_setup
+  mkdir -p "$LANES_TEST_TMP/shim"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexec %s "$@"\n' "$LANES_TEST_TMP/tmux.log" "$(command -v tmux)" >"$LANES_TEST_TMP/shim/tmux"
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+  # With 8-character chunks, "/goal " leaves room for two characters of the goal in the first chunk.
+  for g in 'ship A1;' 'ship A1\;' 'ab;' 'a;bcdefgh;ij;;' 'x\\;'; do
+    LANES_SEND_CHUNK=8 PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead goal alpha "$g"
+    assert_success
+    run grep -cxF "SUBMIT /goal $g" "$FAKE_LOG"
+    assert_output 1
+    wait_status idle
+  done
+  # No typed argument ends in ';', so none is a lone ';' either.
+  run bash -c "grep -E -- ' -l -- ' '$LANES_TEST_TMP/tmux.log' | grep -c ';\$'"
+  assert_output 0
+}
+
+# shim_hold_after_chunk [human text]: a tmux shim that, after the first typed chunk, marks it in $LANES_TEST_TMP/typed
+# and holds 2 s, so a test can kill lanes there; given a human text, it types that text into the pane right after the
+# first Backspace burst, as a human typing during the deletion would.
+shim_hold_after_chunk() {
+  mkdir -p "$LANES_TEST_TMP/shim"
+  cat >"$LANES_TEST_TMP/shim/tmux" <<SHIM
+#!/usr/bin/env bash
+"$(command -v tmux)" "\$@"
+rc=\$?
+if [[ " \$* " == *" -l -- "* && ! -f "$LANES_TEST_TMP/typed" ]]; then : >"$LANES_TEST_TMP/typed"; sleep 2; fi
+if [[ -n "${1:-}" && " \$* " == *" BSpace "* && ! -f "$LANES_TEST_TMP/human" ]]; then
+  : >"$LANES_TEST_TMP/human"
+  "$(command -v tmux)" -L "$LANES_TMUX_SOCKET" send-keys -t "$PANE" -l -- "${1:-}"
+  sleep 0.3
+fi
+exit \$rc
+SHIM
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+# kill_goal_after_first_chunk <goal>: start lanes goal through the shim, kill it while the shim holds after the first
+# chunk, and leave its exit code in RC and its output in OUT.
+kill_goal_after_first_chunk() {
+  register_lead
+  TMUX_PANE=%99 PATH="$LANES_TEST_TMP/shim:$PATH" "$LANES" goal alpha "$1" >"$LANES_TEST_TMP/out" 2>&1 &
+  local pid=$!
+  wait_for "first chunk typed" test -f "$LANES_TEST_TMP/typed"
+  kill -TERM "$pid"
+  RC=0
+  wait "$pid" || RC=$?
+  OUT="$(cat "$LANES_TEST_TMP/out")"
+}
+
+# composer_squashed: the input line as the fake draws it, its wrapped lines joined and every space removed (capture-pane
+# drops a wrapped line's trailing space).
+composer_squashed() {
+  local line out="" on=0
+  while IFS= read -r line; do
+    if [[ "$line" == "❯"$'\xc2\xa0'* ]]; then on=1; out="${line#"❯"$'\xc2\xa0'}"; continue; fi
+    ((on)) || continue
+    [[ "$line" == "─"* ]] && break
+    out+="$line"
+  done < <(lanes_tmux capture-pane -p -t "$PANE")
+  printf '%s' "${out// /}"
+}
+
+@test "a lead killed between two typed chunks deletes the chunk it typed and says so" {
+  goal_setup
+  long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
+  long="${long%; }"
+  shim_hold_after_chunk
+  kill_goal_after_first_chunk "$long"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"stopped while typing into $PANE: our typed text was deleted"* ]]
+  wait_for "typed chunk deleted" pane_has 'Try "refactor'
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
+}
+
+@test "text a human types while our text is being deleted is never deleted: the deletion stops and says so" {
+  goal_setup
+  long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
+  long="${long%; }"
+  shim_hold_after_chunk HUMANDRAFT
+  kill_goal_after_first_chunk "$long"
+  assert [ "$RC" -eq 143 ]
+  [[ "$OUT" == *"stopped while typing into $PANE: deleting our typed text stopped"* ]]
+  # The first chunk was 256 characters; one burst of 64 Backspaces went before the human typed.
+  typed="/goal $long"
+  typed="${typed:0:192}"
+  run composer_squashed
+  assert_output "${typed// /}HUMANDRAFT"
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
 }

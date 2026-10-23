@@ -32,8 +32,8 @@ Done when the RESUME block would let a fresh session continue without asking any
 
 The block sits between the `lanes:resume` markers and has six sections: **Goal** (one line), **Now**, **Next step**,
 **Links**, **Running**, **Suggested skills**. The block rules are RULES.md rule 3; `lanes clear-ready` enforces them.
-The sample is `${CLAUDE_PLUGIN_ROOT}/templates/journal/next-lane.md`. Under Running, name every job still going and
-where its result lands.
+The sample is `${CLAUDE_PLUGIN_ROOT}/templates/journal/next-lane.md`. Under Running, name every job still going outside
+this session and where its result lands (a background shell of the session itself stops before clear-ready, §5).
 
 Done when `lanes clear-ready` would accept it (run it to check; it changes nothing when it refuses).
 
@@ -51,9 +51,12 @@ Done when the entry is pushed and the lead has your message.
 When the lead asks (or your own context reaches the threshold and you tell the lead):
 
 1. Finish or commit the change in hand.
-2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request is refused.
-3. Commit and push your branch and the journal.
-4. Stop anything running in the background, or name it under Running if it must outlive the clear.
+2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request, or last committed
+   before it, is refused, in whichever work tree you now work.
+3. Commit and push your branch and your own journal files (`next-<lane>.md`, `done-<lane>.md`).
+4. Stop or finish every background shell of this session first: `lanes clear` refuses a lane with one running, since
+   it would outlive the clear unseen. Jobs that run outside the session (CI, a tmux job) go under Running, with where
+   their results land.
 5. Leave an active `/goal` alone. You cannot clear it; the `/clear` that `lanes clear` types removes it, and
    `lanes clear` then sets your RESUME Goal.
 6. Run `lanes clear-ready` from the work tree you work in. If it refuses, fix the cause it names and run it again.

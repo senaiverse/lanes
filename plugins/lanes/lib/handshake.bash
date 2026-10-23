@@ -18,21 +18,44 @@ git_problem() {
   [[ "$ahead" == 0 ]] || echo "the branch in $dir has $ahead unpushed commit(s): push them"
 }
 
-# journal_problem <lane work tree>: a journal inside a git work tree of its own (another worktree or branch) must be
-# clean and pushed as well; a journal outside any work tree has nothing to push.
+# journal_problem <lane> <lane work tree>: in a journal inside a git work tree of its own (another worktree or branch),
+# the lane's own files (next-<lane>.md, done-<lane>.md) must be committed and pushed; other lanes' files there are
+# theirs. A journal outside any work tree has nothing to push.
 journal_problem() {
-  local jt
-  jt="$(git -C "$(journal_root "$1")" rev-parse --show-toplevel 2>/dev/null)" || return 0
-  [[ "$jt" != "$1" ]] || return 0
-  why_of git_problem "$jt"
-  [[ -z "$WHY" ]] || echo "the journal's work tree $jt: $WHY"
+  local jr jt ahead files=()
+  jr="$(journal_root "$2")"
+  jt="$(git -C "$jr" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [[ "$jt" != "$2" ]] || return 0
+  files=("$jr/next-$1.md" "$jr/done-$1.md")
+  [[ -z "$(git -C "$jt" status --porcelain -- "${files[@]}" 2>/dev/null)" ]] ||
+    { echo "the journal's work tree $jt: next-$1.md or done-$1.md has uncommitted changes: commit them"; return; }
+  git -C "$jt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 ||
+    { echo "the journal's work tree $jt: its branch has no upstream: push it with 'git push -u'"; return; }
+  ahead="$(git -C "$jt" rev-list --count '@{u}..HEAD' -- "${files[@]}")"
+  [[ "$ahead" == 0 ]] || echo "the journal's work tree $jt: $ahead unpushed commit(s) change next-$1.md or done-$1.md: push them"
 }
 
-# tree_problem <work tree>: the work tree and the journal's own work tree are clean and pushed, or why not.
+# tree_problem <lane> <work tree>: the work tree and the lane's files in the journal's own work tree are clean and
+# pushed, or why not.
 tree_problem() {
-  why_of git_problem "$1"
-  [[ -n "$WHY" ]] || why_of journal_problem "$1"
+  why_of git_problem "$2"
+  [[ -n "$WHY" ]] || why_of journal_problem "$1" "$2"
   printf '%s' "$WHY"
+}
+
+# rewritten_problem <file> <block hash> <hash the request saw> <requested at>: why the RESUME block in <file> is not
+# proven rewritten and committed since the lead's request, or nothing. The request saw the block where it last knew
+# the lane (its hash then), and the lane may have moved work tree since, so the proof is the commit time, which needs
+# no path; a journal outside git has one fixed path, where the hash alone proves it.
+rewritten_problem() {
+  local ct
+  [[ "$4" =~ ^[0-9]+$ ]] || return 1
+  [[ "$2" != "$3" ]] ||
+    { echo "the RESUME block is unchanged since the lead's request: rewrite it with your current state, commit and push"; return; }
+  git -C "$(dirname "$1")" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  ct="$(git -C "$(dirname "$1")" log -1 --format=%ct -- "$1" 2>/dev/null)" || return 1
+  [[ "$ct" =~ ^[0-9]+$ ]] && ((ct >= $4)) ||
+    echo "the RESUME in $1 was last committed before the lead's request: rewrite it with your current state, commit and push"
 }
 
 # turn_starts <transcript>: how many turns the transcript shows begun, by the entry each one starts with: a user entry
@@ -48,10 +71,15 @@ turn_starts() {
           and (.attachment.sentinel | not)))] | length'
 }
 
-# self_lane [--lane x]: which lane runs this command (the Bash tool carries TMUX_PANE, not the plugin's variables).
+# self_lane [--lane x]: which lane runs this command (the Bash tool carries TMUX_PANE, not the plugin's variables); a
+# pane registered to a lane speaks only for that lane.
 self_lane() {
+  local caller
   if [[ -n "${1:-}" ]]; then
     valid_lane "$1" || die "invalid lane '$1'" "use the name the session was started with" 2
+    caller="$(caller_lane)"
+    [[ -z "$caller" || "$caller" == "$1" ]] ||
+      die "not clear-ready: pane ${TMUX_PANE:-} is lane $caller, not $1" "a lane reports only its own readiness: run 'lanes clear-ready' in $1's own pane" 2
     echo "$1"
   elif lane_for_pane "${TMUX_PANE:-}"; then
     :
@@ -60,11 +88,20 @@ self_lane() {
   fi
 }
 
+# require_lead <what the lead does>: refuse unless the caller's pane is registered to the lead.
+require_lead() {
+  local caller
+  caller="$(caller_lane)"
+  [[ -n "$caller" && "$(reg_read "$caller" | jq -r .role 2>/dev/null)" == lead ]] ||
+    die "only the lead $1" "run it from the lead's pane (a session started with LANES_ROLE=lead)"
+}
+
 cmd_request() {
   local lane="${1:-}" e file block="" h="" wt
-  valid_lane "$lane" || usage
+  if ! valid_lane "$lane" || (($# != 1)); then usage; fi
+  require_lead "requests a clear"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "check 'lanes status'; the lane must be started as 'claude --name $lane'"
-  # One RESUME location for request and clear-ready: the work tree the last clear-ready proved, else the session's cwd.
+  # The block is hashed where the lane last was: the work tree the last clear-ready proved, else the session's cwd.
   wt="$(state_read "$lane" | jq -r '.handshake.worktree // ""')"
   file="$(resume_path "$lane" "${wt:-$(jq -r .cwd <<<"$e")}")"
   block="$(resume_block "$file" || true)"
@@ -72,23 +109,23 @@ cmd_request() {
   mutex_take 5 || die "registry locked" "retry in a moment"
   [[ "$(state_read "$lane" | jq -r '.handshake.state // ""')" != sending ]] ||
     die "a clear of $lane is in flight (handshake: sending)" "run 'lanes clear $lane' to finish or settle it before a new request"
-  state_update "$lane" '.handshake = {state: "requested", requested_at: $now, request_file: $f, request_resume_hash: $h,
-      worktree: .handshake.worktree}' --argjson now "$(now)" --arg f "$file" --arg h "$h"
+  state_update "$lane" '.handshake = {state: "requested", requested_at: $now, request_resume_hash: $h,
+      worktree: .handshake.worktree}' --argjson now "$(now)" --arg h "$h"
   reg_update "$lane" '.clear_ready = false'
   mutex_drop
-  echo "requested: message $lane: \"Context is at threshold. Finish the change in hand, rewrite your RESUME block in $file, commit and push, run 'lanes clear-ready' from your work tree, tell me 'clear-ready', then stop.\""
+  echo "requested: message $lane: \"Context is at threshold. Finish the change in hand, rewrite your RESUME block (last seen at $file) in the work tree you work in, commit and push, run 'lanes clear-ready' from your work tree, tell me 'clear-ready', then stop.\""
 }
 
 # cmd_clear_ready: the work tree is the one the lane runs this from (its Bash tool's directory), not the directory the
 # session started in. The goal re-sent after /clear is the RESUME Goal, its one source (RULES.md rule 6).
 cmd_clear_ready() {
-  local arg="" lane e st wt file block h goal req tp turns
+  local arg="" lane e st wt file block h goal tp turns
   [[ "${1:-}" == "--lane" ]] && arg="${2:-}"
   lane="$(self_lane "$arg")"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "restart the session as 'claude --name $lane' inside tmux"
   wt="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" ||
     die "not clear-ready" "$PWD is not a git work tree: run 'lanes clear-ready' from the work tree you work in"
-  why_of tree_problem "$wt"
+  why_of tree_problem "$lane" "$wt"
   [[ -z "$WHY" ]] || die "not clear-ready" "$WHY"
   file="$(resume_path "$lane" "$wt")"
   block="$(resume_block "$file")" || die "not clear-ready" "no RESUME block in $file: run 'lanes init $lane' and fill it in"
@@ -97,11 +134,9 @@ cmd_clear_ready() {
   h="$(hash_of "$block")"
   st="$(state_read "$lane")"
   if [[ "$(jq -r '.handshake.state // ""' <<<"$st")" == requested ]]; then
-    req="$(jq -r '.handshake.request_file // ""' <<<"$st")"
-    [[ -z "$req" || "$req" == "$file" ]] ||
-      die "not clear-ready" "the lead's request read RESUME at $req, but this work tree's is $file: run clear-ready where $req lives, or ask the lead to request again"
-    [[ "$(jq -r '.handshake.request_resume_hash // ""' <<<"$st")" != "$h" ]] ||
-      die "not clear-ready" "the RESUME block is unchanged since the lead's request: rewrite it with your current state, commit and push"
+    why_of rewritten_problem "$file" "$h" "$(jq -r '.handshake.request_resume_hash // ""' <<<"$st")" \
+      "$(jq -r '.handshake.requested_at // 0' <<<"$st")"
+    [[ -z "$WHY" ]] || die "not clear-ready" "$WHY"
   fi
   goal="$(trim "$(section_text "$block" Goal)")"
   # The turns begun so far, this one included: one more later means the lane worked on after reporting ready.
@@ -233,10 +268,23 @@ send_guard() {
   [[ -n "$WHY" ]] || why_of composer_problem "$2" "${@:3}"
 }
 
-# send_text <lane> <pane> <text>: one line typed with send-keys -l in chunks of SEND_CHUNK characters (split by jq, so
-# a multibyte character is never cut under any locale), never a paste: Claude Code turns a burst of about 800
-# characters into "[Pasted text]", which does not dispatch a slash command (measured on 2.1.308). Before each chunk
-# after the first, keys_check and moved_problem run again; an objection returns 2 with MOVED, MOVED_FIX and TYPED set.
+# send_literal <pane> <text>: the one place that types text. tmux reads a `;` that ends an argument as a command
+# separator, and turns a trailing `\;` into `;` (tmux(1) PARSING SYNTAX; no other trailing character is special), so
+# trailing semicolons are sent as their key code (send-keys -H 3b) and never end a literal argument.
+send_literal() {
+  local head="$2" codes=()
+  while [[ "$head" == *";" ]]; do
+    head="${head%;}"
+    codes+=(3b)
+  done
+  [[ -z "$head" ]] || tm send-keys -t "$1" -l -- "$head"
+  ((${#codes[@]} == 0)) || tm send-keys -t "$1" -H "${codes[@]}"
+}
+
+# send_text <lane> <pane> <text>: one line typed in chunks of SEND_CHUNK characters (split by jq, so a multibyte
+# character is never cut under any locale), never a paste: Claude Code turns a burst of about 800 characters into
+# "[Pasted text]", which does not dispatch a slash command (measured on 2.1.308). Before each chunk after the first,
+# keys_check and moved_problem run again; an objection returns 2 with MOVED and MOVED_FIX set.
 send_text() {
   local chunk
   TYPED=""
@@ -248,34 +296,72 @@ send_text() {
       MOVED="$WHY" MOVED_FIX="$HOLD_FIX"
       [[ -z "$MOVED" ]] || return 2
     fi
-    tm send-keys -t "$2" -l -- "$chunk"
+    # TYPED takes the chunk before it is sent, so after a kill at any point the input line holds a leading part of it.
     TYPED+="$chunk"
+    send_literal "$2" "$chunk"
     sleep "$SEND_GAP"
   done < <(printf '%s' "$3" | jq -Rrs --argjson n "$SEND_CHUNK" 'explode as $c | range(0; $c | length; $n) | $c[.:. + $n] | implode')
 }
 
-# erase_if_ours <lane> <pane> <text>: delete our typed text only while the input line holds exactly it, in bursts of
-# Backspace, each sent only while keys_check passes. A Backspace count is exact only for a line that is all ours, so
-# text someone added is never deleted. Sets ERASED to what happened, for the message.
+# erase_plan <text> <input line> <left>: for an input line that holds only a leading part of <text> (whitespace
+# ignored, since the screen wraps at spaces), prints "<least> <len> <n> <keys>": that part is at least <least> code
+# points long, <len> is its length capped at <left>, and its last <n> code points take <keys> Backspaces, at most 64
+# (an astral one counts two, as char_count does). Prints nothing when the line holds anything else.
+erase_plan() {
+  jq -rn --arg t "$1" --arg c "$2" --argjson left "$3" '
+    def ws: . == 32 or (. >= 9 and . <= 13);
+    ($t | explode) as $o | [$c | explode[] | select(ws | not)] as $cs | ($cs | length) as $m
+    | [$o | to_entries[] | select(.value | ws | not)] as $nz
+    | if ($nz | length) < $m or [$nz[0:$m][].value] != $cs then empty else
+        (if $m == 0 then 0 else $nz[$m - 1].key + 1 end) as $least
+        | ([(if ($nz | length) > $m then $nz[$m].key else ($o | length) end), $left] | min) as $len
+        | (reduce ($o[0:$len] | reverse[]) as $x ({n: 0, keys: 0, full: false};
+            (if $x > 65535 then 2 else 1 end) as $w
+            | if .full or .keys + $w > 64 then .full = true else .n += 1 | .keys += $w end)) as $b
+        | "\($least) \($len) \($b.n) \($b.keys)"
+      end'
+}
+
+# erase_if_ours <lane> <pane> <text>: delete our typed text from its end, one burst of at most 64 Backspaces at a
+# time. Before each burst the input line is read again and must hold only the part of our text not yet deleted (or
+# less of it), and keys_check must pass, so text someone typed meanwhile is never deleted; a screen that still shows
+# more than that is read again for up to a second. Sets ERASED to what happened, for the message.
 erase_if_ours() {
-  local n i keys=()
-  screen_read "$2"
-  if [[ "$(squash "$COMPOSER")" != "$(squash "$3")" ]]; then
-    ERASED="the input line did not hold only our text, so it was left as it is (it shows '${COMPOSER:0:60}')"
-    return 0
-  fi
-  n="$(char_count "$3")"
-  for ((i = 0; i < n; i++)); do
-    keys+=(BSpace)
-    if ((${#keys[@]} == 64 || i == n - 1)); then
-      keys_check "$1" "$2" "$GUARD_SID"
-      [[ -z "$WHY" ]] || { ERASED="our typed text was left in the input line of $2, because $WHY"; return 0; }
-      tm send-keys -t "$2" "${keys[@]}"
-      keys=()
-      sleep "$SEND_GAP"
+  local left least len n keys plan sent=0 tries=0 burst=()
+  left="$(printf '%s' "$3" | jq -Rs 'explode | length')" ||
+    { ERASED="our typed text was left in the input line of $2, because its length could not be counted"; return 0; }
+  while :; do
+    screen_read "$2"
+    plan=""
+    ((!COMPOSER_FOUND)) || plan="$(erase_plan "$3" "$COMPOSER" "$left")"
+    if [[ -z "$plan" ]] && ((!sent)); then
+      ERASED="the input line did not hold only our text, so it was left as it is (it shows '${COMPOSER:0:60}')"
+      return 0
+    elif [[ -z "$plan" ]]; then
+      ERASED="deleting our typed text stopped, because the input line no longer held only what was left of it (it shows '${COMPOSER:0:60}'); that was left as it is"
+      return 0
     fi
+    read -r least len n keys <<<"$plan"
+    if ((least > left)); then
+      # The screen has not drawn the last burst yet, or someone typed our next characters again.
+      if ((++tries <= 10)); then sleep 0.1; continue; fi
+      ERASED="deleting our typed text stopped, because the input line kept showing more of it than was left (it shows '${COMPOSER:0:60}'); that was left as it is"
+      return 0
+    fi
+    tries=0
+    if ((len == 0)); then
+      ERASED="our typed text was deleted"
+      ((sent)) || ERASED="none of our typed text was in the input line"
+      return 0
+    fi
+    keys_check "$1" "$2" "$GUARD_SID"
+    [[ -z "$WHY" ]] || { ERASED="our typed text was left in the input line of $2, because $WHY"; return 0; }
+    burst=()
+    for ((; keys > 0; keys--)); do burst+=(BSpace); done
+    tm send-keys -t "$2" "${burst[@]}"
+    sent=1 left=$((len - n))
+    sleep "$SEND_GAP"
   done
-  ERASED="our typed text was deleted"
 }
 
 # submit <lane> <pane> <text> <confirm cmd...>: type the line and prove it arrived, then press Enter and confirm the
@@ -284,9 +370,10 @@ erase_if_ours() {
 # and ERASED set.
 submit() {
   local rc=0
-  # A kill (the Bash tool's timeout) deletes our text if the input line still holds it alone, and says so.
-  SUBMIT_ARGS=("$1" "$2" "$3")
-  trap 'erase_if_ours "${SUBMIT_ARGS[@]}"; echo "lanes: stopped while typing into ${SUBMIT_ARGS[1]}: $ERASED" >&2; exit 143' TERM INT
+  # A kill (the Bash tool's timeout) deletes what was typed so far while the input line holds only that, and says so.
+  TYPED="" SUBMIT_PANE="$2" SUBMIT_LANE="$1"
+  trap 'if [[ -n "$TYPED" ]]; then erase_if_ours "$SUBMIT_LANE" "$SUBMIT_PANE" "$TYPED"; else ERASED="nothing was typed"; fi
+    echo "lanes: stopped while typing into $SUBMIT_PANE: $ERASED" >&2; exit 143' TERM INT
   submit_keys "$@" || rc=$?
   trap 'exit 143' TERM INT # bin/lanes' own handler again
   return "$rc"
@@ -491,7 +578,7 @@ changed_since_ready() {
   wt="$(jq -r '.handshake.worktree // ""' <<<"$st")"
   [[ "$(jq -r .session_id <<<"$e")" == "$(jq -r .handshake.session_id <<<"$st")" ]] || { echo "the session changed since clear-ready"; return; }
   [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(jq -r .handshake.head <<<"$st")" ]] || { echo "HEAD moved since clear-ready"; return; }
-  why_of tree_problem "$wt"
+  why_of tree_problem "$1" "$wt"
   [[ -z "$WHY" ]] || { echo "the tree stopped being clean and pushed ($WHY) since clear-ready"; return; }
   block="$(resume_block "$(resume_path "$1" "$wt")" || true)"
   [[ "$(hash_of "$block")" == "$(jq -r .handshake.resume_hash <<<"$st")" ]] || { echo "the RESUME block changed since clear-ready"; return; }
@@ -535,14 +622,36 @@ send_goal() {
   submit "$1" "$2" "/goal $4" wait_goal_seen "$1" "$3" "$4" "$base"
 }
 
+# wait_arg <args...>: sets WAIT_S from an optional `--wait <seconds>` (default 60); anything else is a usage error.
+wait_arg() {
+  WAIT_S=60
+  while (($#)); do
+    if [[ "$1" != --wait ]] || (($# < 2)); then usage; fi
+    WAIT_S="$2"
+    shift 2
+  done
+  [[ "$WAIT_S" =~ ^[0-9]+$ ]] || die "--wait '$WAIT_S' is not a number of seconds" "pass a whole number" 2
+}
+
+# restart_problem <lane> <session id>: why that session of the lane is not the one a /clear created, or nothing.
+# register records each session's SessionStart source as .start_source; the state is read under the mutex, so a
+# register still writing it is waited for.
+restart_problem() {
+  local src
+  mutex_take 5 || return 1
+  src="$(state_read "$1" | jq -r --arg s "$2" 'if .session_id == $s then .start_source // "unknown" else "unknown" end')" ||
+    { mutex_drop; return 1; }
+  mutex_drop
+  [[ "$src" == clear ]] || echo "the lane restarted (source $src) instead of clearing"
+}
+
 cmd_clear() {
-  local lane="${1:-}" wait_s=60 e st hs pane sid goal new_sid rc=0 age
+  local lane="${1:-}" wait_s e st hs pane sid goal new_sid rc=0 age
   valid_lane "$lane" || usage
   shift
-  [[ "${1:-}" == "--wait" ]] && wait_s="${2:-60}"
-  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "--wait '$wait_s' is not a number of seconds" "pass a whole number" 2
-  int_in_range "$SEND_CHUNK" 1 512 ||
-    die "LANES_SEND_CHUNK=$SEND_CHUNK is outside 1-512" "larger key bursts become a paste that does not dispatch /goal; unset it" 2
+  wait_arg "$@"
+  wait_s="$WAIT_S"
+  require_lead "clears a lane"
   clear_lock "$lane"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane' (missing, half-written or corrupt)" "the lane re-registers on its next session start; check 'lanes status'"
   st="$(state_read "$lane")"
@@ -559,6 +668,8 @@ cmd_clear() {
       ((age <= REQUEST_TIMEOUT)) ||
         refuse_clear "$lane" "an earlier clear stopped at sending $age s ago, older than LANES_REQUEST_TIMEOUT ($REQUEST_TIMEOUT s)" "start a new handshake with 'lanes request $lane'"
       if [[ "$sid" != "$(jq -r .handshake.session_id <<<"$st")" ]]; then
+        why_of restart_problem "$lane" "$sid"
+        [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "the goal is not sent into a session no /clear created; start a new handshake with 'lanes request $lane'"
         hs_set "$lane" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' --argjson now "$(now)" --arg sid "$sid"
         st="$(state_read "$lane")"
         hs=cleared
@@ -601,6 +712,10 @@ cmd_clear() {
 
   e="$(reg_read "$lane")" || die "registry entry for '$lane' unreadable after /clear" "check 'lanes status'"
   new_sid="$(jq -r .session_id <<<"$e")"
+  if [[ "$hs" == ready ]]; then
+    why_of restart_problem "$lane" "$new_sid"
+    [[ -z "$WHY" ]] || refuse_clear "$lane" "$WHY" "the goal is not sent into a session no /clear created; look at the pane, then start a new handshake with 'lanes request $lane'"
+  fi
   [[ "$hs" != ready ]] || hs_set "$lane" '.state = "cleared" | .cleared_at = $now | .cleared_session = $sid' --argjson now "$(now)" --arg sid "$new_sid"
   goal="$(state_read "$lane" | jq -r '.handshake.goal // ""')"
   if [[ -n "$goal" ]]; then
@@ -624,19 +739,15 @@ cmd_clear() {
 # code.claude.com/docs/en/goal) through the same checks as lanes clear; the prompt hook's last_command confirms it
 # arrived. A background shell does not stop it, since unlike /clear a new goal leaves the shell's session in place.
 cmd_goal() {
-  local lane="${1:-}" goal wait_s=60 caller e rc=0 sid
+  local lane="${1:-}" goal wait_s e rc=0 sid
   if ! valid_lane "$lane" || (($# < 2)); then usage; fi
   goal="$(trim "$2")"
   shift 2
-  [[ "${1:-}" == "--wait" ]] && wait_s="${2:-60}"
-  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "--wait '$wait_s' is not a number of seconds" "pass a whole number" 2
+  wait_arg "$@"
+  wait_s="$WAIT_S"
   why_of goal_problem "$goal"
   [[ -z "$WHY" ]] || die "goal not sent: the goal $WHY" "pass it as one line of at most $GOAL_CAP characters" 2
-  int_in_range "$SEND_CHUNK" 1 512 ||
-    die "LANES_SEND_CHUNK=$SEND_CHUNK is outside 1-512" "larger key bursts become a paste that does not dispatch /goal; unset it" 2
-  caller="$(caller_lane)"
-  [[ -n "$caller" && "$(reg_read "$caller" | jq -r .role 2>/dev/null)" == lead ]] ||
-    die "only the lead sets a lane's goal" "run it from the lead's pane (a session started with LANES_ROLE=lead)"
+  require_lead "sets a lane's goal"
   REFUSAL="goal not sent"
   clear_lock "$lane"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "check 'lanes status'"

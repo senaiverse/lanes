@@ -10,9 +10,11 @@ job.
 - **Endless and complete:** each pass re-reads the whole set (every open PR, every registered lane), and the loop never
   exits on an event. `gh pr list` returns 30 items by default, so every call passes `--limit 1000`.
 - **Changes only:** the pass pipes `<item><TAB><state>` lines into `lanes monitor-diff <name>`, which prints only the
-  items whose state changed and keeps the last set under the lanes data dir (`monitors/<name>.state`).
-- **One instance per name:** the loop starts with `lanes monitor-lock <name> $$`, which refuses a second start while
-  the first is alive and reclaims the name from a dead one.
+  items whose state changed and keeps the last set under the lanes data dir
+  (`monitors/<project checksum>/<name>.state`).
+- **One instance per name and project:** the loop starts with `lanes monitor-lock <name> $$`, which refuses a second
+  start while the first is alive and reclaims the name from a dead one. The project is the repository the loop runs
+  in (all its worktrees are one), so start each watcher from inside the repository; two projects each run their own.
 - **Back off, never die:** when `gh` fails, skip the diff for that pass (a partial set would report items as gone),
   print one line, double the wait up to 10 minutes, and keep looping.
 - **Start:** at the start of each lead session. The SessionStart context lists every watcher that is down (all four on

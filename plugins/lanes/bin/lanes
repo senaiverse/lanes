@@ -49,6 +49,39 @@ die() {
   exit "${3:-1}"
 }
 
+# ms_of <seconds>: a plain decimal number of seconds, at most three decimals, as whole milliseconds; else exit 1.
+ms_of() {
+  [[ "$1" =~ ^([0-9]{1,6})(\.([0-9]{1,3}))?$ ]] || return 1
+  local frac="${BASH_REMATCH[3]}000"
+  echo $((10#${BASH_REMATCH[1]} * 1000 + 10#${frac:0:3}))
+}
+
+# settings_check: the timing and chunk variables, checked where they enter, before any command reads one or sends a
+# key. A value that is not a plain number in range is refused, never read as zero or as no limit; IDLE_GAP_MS is set here.
+IDLE_GAP_MS=""
+settings_check() {
+  local ms
+  ms="$(ms_of "$IDLE_GAP" || true)"
+  int_in_range "$ms" 100 600000 ||
+    die "LANES_IDLE_GAP=$IDLE_GAP is not a number of seconds from 0.1 to 600" "unset it (default 3) or pass one in that range" 2
+  IDLE_GAP_MS="$ms"
+  ms="$(ms_of "$SEND_GAP" || true)"
+  int_in_range "$ms" 1 5000 ||
+    die "LANES_SEND_GAP=$SEND_GAP is not a number of seconds from 0.001 to 5" "unset it (default 0.03) or pass one in that range" 2
+  int_in_range "$CLEAR_TIMEOUT" 1 3600 ||
+    die "LANES_CLEAR_TIMEOUT=$CLEAR_TIMEOUT is not a whole number of seconds from 1 to 3600" "unset it (default 20) or pass one in that range" 2
+  int_in_range "$REQUEST_TIMEOUT" 0 604800 ||
+    die "LANES_REQUEST_TIMEOUT=$REQUEST_TIMEOUT is not a whole number of seconds from 0 to 604800" "unset it (default 900) or pass one in that range" 2
+  int_in_range "$PCT_STALE" 1 604800 ||
+    die "LANES_PCT_STALE=$PCT_STALE is not a whole number of seconds from 1 to 604800" "unset it (default 900) or pass one in that range" 2
+  # Over 512 characters a key burst becomes a paste, which does not dispatch a slash command (send_text).
+  int_in_range "$SEND_CHUNK" 1 512 ||
+    die "LANES_SEND_CHUNK=$SEND_CHUNK is not a whole number of characters from 1 to 512" "unset it (default 256) or pass one in that range" 2
+  # Leading zeros are dropped, so shell arithmetic never reads a value as octal and jq gets a JSON number.
+  CLEAR_TIMEOUT=$((10#$CLEAR_TIMEOUT)) REQUEST_TIMEOUT=$((10#$REQUEST_TIMEOUT)) PCT_STALE=$((10#$PCT_STALE))
+  SEND_CHUNK=$((10#$SEND_CHUNK))
+}
+
 usage() {
   echo "lanes: usage: lanes init|status|request|clear-ready|clear|goal|away|journal-dir|monitor-lock|monitor-diff|register|hook|statusline (see the header of $0)" >&2
   exit 2
@@ -57,7 +90,7 @@ usage() {
 now() { date +%s; }
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 valid_lane() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
-int_in_range() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= $2 && $1 <= $3)); }
+int_in_range() { [[ "$1" =~ ^[0-9]{1,9}$ ]] && ((10#$1 >= $2 && 10#$1 <= $3)); }
 hash_of() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
 # char_count <text>: characters by code point, an astral one counted twice so the count is never below JavaScript's
@@ -74,6 +107,19 @@ tm() {
   fi
 }
 
+# tmux_check: the commands that type need tmux 3.0 or newer, since send_literal sends `;` with send-keys -H, which 3.0
+# added (tmux CHANGES "FROM 2.9 TO 3.0"). -V prints "tmux <version>", "tmux next-<version>" or "tmux master" (a build
+# from git); anything else is refused, never guessed.
+tmux_check() {
+  local v
+  v="$(tm -V 2>/dev/null || true)"
+  [[ "$v" == "tmux master" ]] && return 0
+  [[ "$v" =~ ^tmux\ ([a-z]+-)?([0-9]+)\.([0-9]+) ]] ||
+    die "tmux -V printed '$v', not a tmux version" "lanes clear and lanes goal need tmux 3.0 or newer on PATH" 2
+  ((BASH_REMATCH[2] >= 3)) ||
+    die "$v is older than 3.0, which lanes clear and lanes goal need (send-keys -H)" "install tmux 3.0 or newer; nothing was typed" 2
+}
+
 # The plugin root, from this script's own path with symlinks followed (CLAUDE_PLUGIN_ROOT is absent in the Bash tool).
 plugin_root() {
   local self="${BASH_SOURCE[0]}" target
@@ -84,21 +130,32 @@ plugin_root() {
   (cd "$(dirname "$self")/.." && pwd)
 }
 
-# ---- locks: a symlink whose target "<pid>.<nonce>" names its holder ----------------------------------------------
+# ---- locks: a symlink whose target "<pid>.<start tag>" names its holder ------------------------------------------
+
+# lock_tag <pid>: the one name of a lock holder, "<pid>.<checksum of its start time (proc_start)>"; fails for a pid
+# that does not run or is a zombie. A reused pid gets another tag.
+lock_tag() {
+  local s
+  s="$(proc_start "$1")" || return 1
+  printf '%s.%s' "$1" "$(hash_of "$s")"
+}
+
+# holder_live <target>: the one liveness rule for every lock: the holder a target names runs, as the same process.
+holder_live() { [[ "${1%%.*}" =~ ^[0-9]+$ && "$1" == "$(lock_tag "${1%%.*}" || true)" ]]; }
 
 # lock_take <path> <wait seconds> [holder pid]: ln -s creates the lock atomically with its holder in it, so it is never
-# seen half-written, and sets LOCK_MINE, the target to release with; a dead holder's lock is broken (lock_break), and
-# one whose pid was reused looks alive, so the lock refuses (fails safe). Every attempt counts, a break included, so
-# the acquire ends after at most <wait> * 10 + 1 attempts.
+# seen half-written, and sets LOCK_MINE, the target to release with; a lock whose holder is not live (holder_live) is
+# broken (lock_break). Every attempt counts, a break included, so the acquire ends after at most <wait> * 10 + 1 attempts.
 LOCK_MINE=""
 lock_take() {
-  local path="$1" tries=0 limit=$(($2 * 10 + 1)) seen
-  LOCK_MINE="${3:-$BASHPID}.$RANDOM$RANDOM"
+  # The holder is read here: inside the $(...) below, BASHPID would be that subshell's.
+  local path="$1" tries=0 limit=$(($2 * 10 + 1)) seen holder="${3:-$BASHPID}"
+  LOCK_MINE="$(lock_tag "$holder")" || { LOCK_MINE=""; return 1; }
   until ln -s "$LOCK_MINE" "$path" 2>/dev/null; do
     tries=$((tries + 1))
     ((tries > limit)) && { LOCK_MINE=""; return 1; }
     seen="$(readlink "$path" 2>/dev/null || true)"
-    if [[ -n "$seen" ]] && ! kill -0 "${seen%%.*}" 2>/dev/null && lock_break "$path" "$seen"; then continue; fi
+    if [[ -n "$seen" ]] && ! holder_live "$seen" && lock_break "$path" "$seen"; then continue; fi
     sleep 0.1
   done
 }
@@ -111,10 +168,11 @@ lock_drop() { [[ "$(readlink "$1" 2>/dev/null || true)" == "$2" ]] && rm -f "$1"
 # lock_break <path> <target seen dead>: one breaker at a time holds <path>.break, and it removes the lock only if the
 # lock still has the target it saw dead, so a lock that a live process took meanwhile is never removed.
 lock_break() {
-  local marker="$1.break" mine="$BASHPID.$RANDOM$RANDOM" cur
+  local marker="$1.break" me="$BASHPID" mine cur
+  mine="$(lock_tag "$me")" || return 1
   if ! ln -s "$mine" "$marker" 2>/dev/null; then
     cur="$(readlink "$marker" 2>/dev/null || true)"
-    [[ -n "$cur" ]] && ! kill -0 "${cur%%.*}" 2>/dev/null && lock_drop "$marker" "$cur"
+    [[ -n "$cur" ]] && ! holder_live "$cur" && lock_drop "$marker" "$cur"
     return 1
   fi
   lock_drop "$1" "$2"
@@ -304,16 +362,8 @@ lane_session() {
 # lane_activity <lane>: the one definition of a lane's activity, from its session file. Sets ACT to idle (status idle
 # for at least LANES_IDLE_GAP), settling (idle for less), busy, waiting (ACT_DETAIL names what for), shell (a
 # background shell runs; it outlives /clear) or unknown (ACT_DETAIL says why).
-IDLE_GAP_MS=""
 lane_activity() {
   ACT="" ACT_DETAIL=""
-  # The gap is how long idle must hold before a key is sent, so a value that disables it or overflows is refused.
-  if [[ -z "$IDLE_GAP_MS" ]]; then
-    [[ "$IDLE_GAP" =~ ^[0-9]{1,3}(\.[0-9]{1,3})?$ ]] && IDLE_GAP_MS="$(jq -n --arg g "$IDLE_GAP" '$g | tonumber * 1000 | floor')"
-    if ! int_in_range "$IDLE_GAP_MS" 100 600000; then
-      die "LANES_IDLE_GAP=$IDLE_GAP is not a number of seconds from 0.1 to 600" "unset it (default 3) or pass one in that range" 2
-    fi
-  fi
   if ! lane_session "$1"; then
     ACT=unknown ACT_DETAIL="$SS_PROBLEM"
     return 0
@@ -335,23 +385,42 @@ goal_state() {
   if [[ "$last" == false ]]; then echo active; else echo none; fi
 }
 
-config_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE/config.json" 2>/dev/null || true; }
+# project_of <dir>: the project a directory belongs to, the physical path of its git common dir, so a repository and
+# all its worktrees are one project; outside git, the directory's own physical path (as given when it is gone). The
+# plain --git-common-dir is relative to <dir> and works on every git, where --path-format=absolute needs git 2.31.
+project_of() {
+  local d="${1:-$PWD}" c
+  if c="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" && c="$(cd "$d" && cd "$c" && pwd -P)"; then
+    echo "$c"
+  else
+    (cd "$d" 2>/dev/null && pwd -P) || echo "$d"
+  fi
+}
 
+# config_get <key> <dir>: a plugin option recorded for the project of <dir> (record_config), or nothing.
+config_get() {
+  jq -r --arg p "$(project_of "$2")" --arg k "$1" '.[$p][$k]? // empty' "$STATE/config.json" 2>/dev/null || true
+}
+
+# lane_cwd <lane>: the directory the lane registered from, whose project its options come from; empty when unknown.
+lane_cwd() { reg_read "$1" 2>/dev/null | jq -r '.cwd // ""' 2>/dev/null || true; }
+
+# threshold <dir>, journal_dir <dir>: the options of the project of <dir>; the LANES_ variables override them.
 threshold() {
-  local t="${LANES_THRESHOLD:-$(config_get threshold)}"
+  local t="${LANES_THRESHOLD:-$(config_get threshold "$1")}"
   int_in_range "$t" 1 100 || t=70
   echo "$t"
 }
 
 journal_dir() {
-  local d="${LANES_JOURNAL_DIR:-$(config_get journal_dir)}"
+  local d="${LANES_JOURNAL_DIR:-$(config_get journal_dir "$1")}"
   echo "${d:-.lanes}"
 }
 
 # journal_root <cwd>: an absolute journal_dir as is, else relative to the git top level of cwd (or cwd itself).
 journal_root() {
   local jd top
-  jd="$(journal_dir)"
+  jd="$(journal_dir "$1")"
   if [[ "$jd" == /* ]]; then
     echo "$jd"
     return
@@ -505,6 +574,8 @@ refresh_statusline_link() {
   ln -sf "$root/bin/lanes-statusline" "$tmp" && mv -f "$tmp" "$DATA/lanes-statusline"
 }
 
+# record_config <cwd>: the plugin options this session started with, kept for the project of its cwd, since options
+# can differ per project (a project's own settings) and bin/ commands run without them.
 record_config() {
   local t="${CLAUDE_PLUGIN_OPTION_THRESHOLD:-}" j="${CLAUDE_PLUGIN_OPTION_JOURNAL_DIR:-}" cur
   [[ -z "$t" && -z "$j" ]] && return 0
@@ -513,8 +584,9 @@ record_config() {
     t=70
   fi
   cur="$(jq -ce 'select(type == "object")' "$STATE/config.json" 2>/dev/null || echo '{}')"
-  write_atomic "$STATE/config.json" "$(jq -c --arg t "$t" --arg j "$j" \
-    '(if $t != "" then .threshold = ($t | tonumber) else . end) | (if $j != "" then .journal_dir = $j else . end)' <<<"$cur")"
+  write_atomic "$STATE/config.json" "$(jq -c --arg p "$(project_of "$1")" --arg t "$t" --arg j "$j" '
+    .[$p] = ((.[$p] | objects) // {} | (if $t != "" then .threshold = ($t | tonumber) else . end)
+      | (if $j != "" then .journal_dir = $j else . end))' <<<"$cur")"
 }
 
 # who <lane> <role>: how SessionStart names the session to the model, since the model cannot see LANES_ROLE.
@@ -588,7 +660,7 @@ name_holder() {
   # A failed identity check proves nothing, so only a reason it found frees the name.
   why_of identity_problem "$1" "$3" "$4"
   if check_failed; then echo identity_problem; return 1; fi
-  [[ -n "$WHY" ]] || echo "lane name '$1' is already in use by pane $3: this session was not registered; restart it with another --name"
+  [[ -n "$WHY" ]] || echo "lane name '$1' is already in use by pane $3 (a lane name is unique on this machine, across projects): this session was not registered; restart it with another --name"
   return 0
 }
 
@@ -613,7 +685,7 @@ cmd_register() {
   fi
   [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]] && refresh_statusline_link "$CLAUDE_PLUGIN_ROOT"
   mutex_take 5 || { notice "registry is locked by another lanes process: not registered this time"; hook_emit; return 0; }
-  record_config
+  record_config "$cwd"
   if [[ -z "$lane" ]]; then
     notice "no session_title in the hook input: start every session as 'claude --name <lane>' so it can be a lane"
     hook_emit
@@ -636,7 +708,9 @@ cmd_register() {
   if [[ -n "$existing" ]]; then
     mapfile -t f < <(jq -r '(.tmux_pane // ""), (.session_id // ""), (.role // "lane")' <<<"$existing")
     old_pane="${f[0]}" old_sid="${f[1]}" role="${f[2]}"
-    if [[ "$old_sid" != "$sid" && -n "$old_pane" && "$old_pane" != "$pane" ]] && pane_exists "$old_pane"; then
+    # A fork can start while its source still runs in the same pane (the /fork background copy), so its own pane does
+    # not free the name either.
+    if [[ "$old_sid" != "$sid" && -n "$old_pane" && ("$old_pane" != "$pane" || "$src" == fork) ]] && pane_exists "$old_pane"; then
       held="$(name_holder "$lane" "$existing" "$old_pane" "$old_sid")" ||
         held="lane name '$lane' could not be checked against pane $old_pane (check failed: ${held:-name_holder}): this session was not registered; run 'lanes status', then restart this session"
       if [[ -n "$held" ]]; then
@@ -666,11 +740,13 @@ cmd_register() {
   gc_sessions
   if ((fresh)); then
     state_update "$lane" '
-      (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid
+      (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid and $src == "clear"
        then .handshake.state = "cleared" | .handshake.cleared_at = $now | .handshake.cleared_session = $sid else . end)
-      | .session_id = $sid | .prompts = 0 | .last_command = null | .pct_at = null' --arg sid "$sid" --argjson now "$(now)"
+      | .session_id = $sid | .prompts = 0 | .last_command = null | .pct_at = null' --arg sid "$sid" --arg src "$src" \
+      --argjson now "$(now)"
   fi
-  state_update "$lane" '.transcript = (if $tp == "" then null else $tp end)' --arg tp "$tp"
+  # How this session began (startup, resume, clear, compact, fork), so lanes clear tells a /clear from a restart.
+  state_update "$lane" '.transcript = (if $tp == "" then null else $tp end) | .start_source = $src' --arg tp "$tp" --arg src "$src"
   # RESUME is read from the work tree clear-ready proved, which can differ from the session's start directory.
   wt="$(state_read "$lane" | jq -r '.handshake.worktree // ""')"
   mutex_drop
@@ -681,7 +757,7 @@ cmd_register() {
   fi
   # The lead re-arms every watcher that is down; the model reads this, not the systemMessage.
   if [[ "$role" == lead ]]; then
-    down="$(monitors_down)"
+    down="$(monitors_down "$cwd")"
     [[ -z "$down" ]] || ctx+="${ctx:+$'\n\n'}lanes: watchers not running: $down. Start each from skills/lead/MONITORS.md (a running one refuses a second start)."
   fi
   hook_emit "$ctx"
@@ -744,7 +820,7 @@ cmd_statusline() {
     ) 2>/dev/null || true
   fi
   line="lanes ${lane:-?} ctx ${pct/null/?}%"
-  [[ "$pct" != null ]] && ((pct >= $(threshold))) && line+=" at threshold"
+  [[ "$pct" != null ]] && ((pct >= $(threshold "$(valid_lane "$lane" && lane_cwd "$lane")"))) && line+=" at threshold"
   printf '%s\n' "$line"
   return 0
 }
@@ -753,7 +829,7 @@ cmd_statusline() {
 
 # lane_view <lane>: one JSON object with everything status reports, the three-state context % included.
 lane_view() {
-  local lane="$1" e st pane alive=false n
+  local lane="$1" e st pane alive=false n thr
   n="$(now)"
   if ! e="$(reg_read "$lane")"; then
     jq -nc --arg l "$lane" '{lane: $l, error: "corrupt registry entry"}'
@@ -763,11 +839,12 @@ lane_view() {
   pane="$(jq -r '.tmux_pane // ""' <<<"$e")"
   pane_exists "$pane" && alive=true
   lane_activity "$lane"
-  jq -nc --argjson e "$e" --argjson s "$st" --argjson now "$n" --argjson thr "$(threshold)" --argjson alive "$alive" \
+  thr="$(threshold "$(jq -r '.cwd // ""' <<<"$e")")"
+  jq -nc --argjson e "$e" --argjson s "$st" --argjson now "$n" --argjson thr "$thr" --argjson alive "$alive" \
     --arg act "$ACT" --arg detail "$ACT_DETAIL" --arg goal "$(goal_state "$(jq -r '.transcript // ""' <<<"$st")")" \
     --argjson stale "$PCT_STALE" --argjson rto "$REQUEST_TIMEOUT" '
     ($s.handshake // {}) as $h
-    | {lane: $e.lane, role: $e.role, pane: $e.tmux_pane, pane_alive: $alive, used_pct: $e.used_pct,
+    | {lane: $e.lane, role: $e.role, pane: $e.tmux_pane, pane_alive: $alive, used_pct: $e.used_pct, threshold: $thr,
        ctx: (if $e.used_pct == null then "unknown"
              elif ($s.pct_at // 0) < $now - $stale then "stale"
              else "fresh" end),
@@ -779,19 +856,19 @@ lane_view() {
 }
 
 cmd_status() {
-  local json=0 lane rows=() thr
+  local json=0 lane rows=()
   [[ "${1:-}" == "--json" ]] && json=1
   while IFS= read -r lane; do rows+=("$(lane_view "$lane")"); done < <(each_lane)
   if ((json)); then
     printf '%s\n' "${rows[@]+"${rows[@]}"}" | jq -s .
     return 0
   fi
-  thr="$(threshold)"
   if ((${#rows[@]} == 0)); then
     echo "lanes: no lanes registered in $REG (start each session as 'claude --name <lane>' inside tmux)"
     return 0
   fi
-  printf 'threshold %s%%\n' "$thr"
+  # Each lane's threshold is its own project's option, so it is not one header line: AT-THRESHOLD marks the row, and
+  # --json gives the number.
   printf '%s\n' "${rows[@]}" | jq -r '
     if .error then "\(.lane)\tERROR: \(.error)"
     else [.lane, .role, (.pane // "no-pane") + (if .pane_alive then "" else "(gone)" end),
@@ -828,7 +905,7 @@ cmd_init() {
   local claude_md="" root tpl dest f lane jd import created=() kept=() block cmd
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --claude-md) claude_md="${2:-}"; shift 2 ;;
+      --claude-md) (($# >= 2)) || usage; claude_md="$2"; shift 2 ;;
       -*) usage ;;
       *) break ;;
     esac
@@ -862,7 +939,7 @@ cmd_init() {
   echo "status line: a plugin cannot set it, so add this to your settings.json (it records each lane's context %):"
   echo "$block"
 
-  jd="$(journal_dir)"
+  jd="$(journal_dir "$PWD")"
   import="@$jd/RULES.md"
   local top
   top="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
@@ -894,6 +971,9 @@ source "$(plugin_root)/lib/monitor.bash"
 # Sourced (tests feed real captures to screen_read, session_read and goal_state): define everything, run nothing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
+case "${1:-}" in status | request | clear-ready | clear | goal) settings_check ;; esac
+# The two commands that type into a pane (submit); nothing else sends a key.
+case "${1:-}" in clear | goal) tmux_check ;; esac
 case "${1:-}" in
   init) shift; cmd_init "$@" ;;
   register) cmd_register ;;

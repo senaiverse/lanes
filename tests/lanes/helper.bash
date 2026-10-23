@@ -5,6 +5,7 @@ load ../helpers/common
 
 # shellcheck disable=SC2034 # used by the suites that load this helper
 LANES="$LANES_REPO_ROOT/plugins/lanes/bin/lanes"
+# shellcheck disable=SC2034 # used by the suites that load this helper
 STATUSLINE="$LANES_REPO_ROOT/plugins/lanes/bin/lanes-statusline"
 FAKE="$BATS_TEST_DIRNAME/fake-claude"
 
@@ -96,6 +97,7 @@ register_lane() {
 start_fake() {
   local lane="$1"
   shift
+  # shellcheck disable=SC2016 # "$0" expands in the inner bash, not here
   lanes_tmux new-session -d -s "$lane" -x 160 -y 40 -c "$WORK" \
     env LANES_DATA_DIR="$LANES_DATA_DIR" LANES_TMUX_SOCKET="$LANES_TMUX_SOCKET" LANES_BIN="$LANES" \
     CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
@@ -109,6 +111,7 @@ start_fake() {
 # shell_pane: the pane runs an interactive bash with job control, as a human's terminal does, and a launcher at
 # $LANES_TEST_TMP/run-fake <lane> starts the fake from it. Sets PANE.
 shell_pane() {
+  # shellcheck disable=SC2016 # "$1" expands in the launcher script, not here
   printf '#!/usr/bin/env bash\nexport LANES_DATA_DIR=%q LANES_TMUX_SOCKET=%q LANES_BIN=%q CLAUDE_CONFIG_DIR=%q FAKE_LOG=%q FAKE_LANE="$1"\nexec -a claude bash %q\n' \
     "$LANES_DATA_DIR" "$LANES_TMUX_SOCKET" "$LANES" "$CLAUDE_CONFIG_DIR" "$FAKE_LOG" "$FAKE" >"$LANES_TEST_TMP/run-fake"
   lanes_tmux new-session -d -s shell -x 160 -y 40 -c "$WORK" "bash --norc --noprofile -i"
@@ -153,14 +156,32 @@ EOF
 
 # wait_for <what> <cmd...>: poll up to 5 s.
 wait_for() {
-  local what="$1" i
+  local what="$1" _
   shift
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     "$@" && return 0
     sleep 0.1
   done
   echo "timed out waiting for $what" >&2
   return 1
+}
+
+# lock_tag_of <pid>: the lock target that names <pid> as a live holder, built by the lanes function itself.
+lock_tag_of() { bash -c 'source "$1"; lock_tag "$2"' _ "$LANES" "$1"; }
+
+# zombie_child: a child that has exited but is never reaped (its parent became a sleep, which never waits; the child is
+# killed only after that exec, since bash itself would reap it). Sets ZPID, ZTAG (its lock tag while it ran) and
+# ZPARENT; the test kills ZPARENT.
+zombie_child() {
+  bash -c 'sleep 30 & echo "$!" >"$1"; exec sleep 30' _ "$LANES_TEST_TMP/zpid" &
+  ZPARENT=$!
+  wait_for "child pid" test -s "$LANES_TEST_TMP/zpid"
+  ZPID="$(<"$LANES_TEST_TMP/zpid")"
+  wait_for "parent exec" bash -c "[ \"\$(ps -o args= -p $ZPARENT)\" = 'sleep 30' ]"
+  # shellcheck disable=SC2034 # read by the test that calls it
+  ZTAG="$(lock_tag_of "$ZPID")"
+  kill -9 "$ZPID"
+  wait_for "zombie" bash -c "ps -o stat= -p $ZPID | grep -q '^Z'"
 }
 
 pane_has() { lanes_tmux capture-pane -p -t "$PANE" | grep -qF -- "$1"; }

@@ -4,6 +4,7 @@
 # synchronize-panes, the identity proof) is checked before every key, each typed chunk and each Backspace burst too.
 
 load helper
+load lead
 
 submitted() { grep -c "^SUBMIT $1" "$FAKE_LOG" || true; }
 # keys_sent: key bursts the fake received (it logs each one); none means nothing was typed.
@@ -17,7 +18,7 @@ release_background() { edit_session '.status = "idle" | .statusUpdatedAt = (now 
 # run the change, release the shell, and leave the clear's exit code in RC and its output in OUT.
 clear_during_wait() {
   hold_background
-  "$LANES" clear alpha --wait 20 >"$LANES_TEST_TMP/out" 2>&1 &
+  as_lead clear alpha --wait 20 >"$LANES_TEST_TMP/out" 2>&1 &
   local pid=$!
   sleep 1
   "$@"
@@ -61,7 +62,7 @@ register_beta_on_pane() { register_lane beta sb "$PANE" >/dev/null 2>&1; }
   ready_lane alpha
   edit_session '.sessionId = "restarted"'
   hook_json SessionStart restarted alpha startup | CLAUDE_PID="$FAKE_PID" TMUX_PANE="$PANE" "$LANES" register >/dev/null 2>&1
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "the session changed since clear-ready"
   run keys_sent
@@ -71,7 +72,7 @@ register_beta_on_pane() { register_lane beta sb "$PANE" >/dev/null 2>&1; }
 @test "a human prompt while /clear is typed stops the clear before Enter, and the typed /clear is deleted" {
   ready_lane alpha
   shim_on_keys "-l -- /clear" "jq -nc --arg s '$(reg alpha .session_id)' '{session_id:\$s,session_title:\"alpha\",prompt:\"a human message\"}' | '$LANES' hook prompt"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the lane received a new prompt"
   assert_output --partial "our typed text was deleted"
@@ -116,7 +117,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 @test "a prompt arriving after the wait for idle is refused before any key" {
   ready_lane alpha
   flip_after_screen_reads 1 prompt
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the lane received a new prompt since clear-ready"
   run keys_sent
@@ -126,7 +127,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 @test "nothing is typed once a turn started with no prompt after the idle check (the signature moved)" {
   ready_lane alpha
   flip_after_screen_reads 1 busy
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the lane's state moved after the idle check"
   assert_output --partial "before /clear was sent: nothing was submitted (nothing was typed)"
@@ -140,7 +141,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
   ready_lane alpha
   mkdir -p "$LANES_TEST_TMP/shim"
   shim_on_capture "f='$(session_file)'; jq -c '.statusUpdatedAt += 1' \"\$f\" >\"\$f.x\" && mv \"\$f.x\" \"\$f\""
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the lane's state moved after the idle check (now idle"
   run keys_sent
@@ -150,7 +151,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 @test "a draft typed after the wait for idle is caught by the check before typing: the draft left as typed" {
   ready_lane alpha
   shim_on_capture "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' send-keys -t '$PANE' -l -- 'late'; sleep 0.3"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "holds text ('late')"
   assert_output --partial "before /clear was sent"
@@ -172,7 +173,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 @test "a second lane registered on alpha's pane: lanes clear alpha refuses and types nothing" {
   ready_lane alpha
   register_beta_on_pane
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   run keys_sent
   assert_output 0
@@ -184,7 +185,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
   ready_lane alpha
   jq -nc --arg p "$PANE" '{lane:"beta",session_id:"sb",role:"lane",tmux_pane:$p,cwd:"/",used_pct:null,clear_ready:false}' \
     >"$LANES_DATA_DIR/lanes/beta.json"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "is also registered to lane beta"
   run keys_sent
@@ -204,7 +205,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 @test "a draft typed during the idle gap is caught by the final screen check: nothing is typed into it" {
   ready_lane alpha
   export LANES_IDLE_GAP=2
-  "$LANES" clear alpha >"$LANES_TEST_TMP/out" 2>&1 &
+  as_lead clear alpha >"$LANES_TEST_TMP/out" 2>&1 &
   pid=$!
   sleep 1
   lanes_tmux send-keys -t "$PANE" -l -- "draft"
@@ -231,7 +232,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
   printf '\n' >>"$LANES_JOURNAL_DIR/next-alpha.md"
   sed 's/run the tests for A1/a newer next step/' "$LANES_JOURNAL_DIR/next-alpha.md" >"$LANES_TEST_TMP/n" &&
     mv "$LANES_TEST_TMP/n" "$LANES_JOURNAL_DIR/next-alpha.md"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "the RESUME block changed since clear-ready"
   run keys_sent
@@ -240,7 +241,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 
 @test "under LC_ALL=C a clear still reads the input line and lands" {
   ready_lane alpha
-  LC_ALL=C run "$LANES" clear alpha
+  LC_ALL=C run as_lead clear alpha
   assert_success
   run submitted /clear
   assert_output 1
@@ -248,7 +249,7 @@ shim_on_capture() { shim_on_keys " capture-pane " "$1"; }
 
 @test "a human draft that lands just before our first key: nothing is deleted, since a Backspace count could eat it" {
   ready_lane alpha FAKE_DRAFT_AT_FIRST_KEY=1
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "ahead of ours"
   assert_output --partial "nothing was submitted or deleted"
@@ -280,7 +281,7 @@ still_ready() {
   [[ "$OUT" == *"is in copy mode"* ]]
   still_ready "leave copy mode in pane $PANE"
   lanes_tmux send-keys -t "$PANE" -X cancel
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -292,7 +293,7 @@ still_ready() {
   [[ "$OUT" == *"has synchronize-panes on"* ]]
   still_ready "turn synchronize-panes off"
   lanes_tmux set-window-option -t "$PANE" synchronize-panes off
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -311,7 +312,7 @@ still_ready() {
   lanes_tmux send-keys -t "$PANE" -l -- fg
   lanes_tmux send-keys -t "$PANE" Enter
   wait_for "the fake took the terminal back" grep -qx CONT "$FAKE_LOG"
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_success
 }
 
@@ -338,7 +339,7 @@ still_ready() {
     bash -c 'exec -a claude bash "$0"' "$FAKE"
   wait_for "foreign prompt" pane_has '❯'
   [ "$(lanes_tmux display -p '#{pane_id}')" = "$(reg alpha .tmux_pane)" ]
-  run "$LANES" clear alpha
+  run as_lead clear alpha
   assert_failure
   assert_output --partial "no Claude Code session file"
   run keys_sent
@@ -368,7 +369,7 @@ shim_on_keys() {
 @test "a turn that starts between two typed chunks stops the typing, and the chunk already typed is deleted" {
   ready_lane alpha
   shim_on_keys "-l -- /cl" "f='$(session_file)'; jq -c '.statusUpdatedAt += 1' \"\$f\" >\"\$f.x\" && mv \"\$f.x\" \"\$f\""
-  LANES_SEND_CHUNK=3 PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  LANES_SEND_CHUNK=3 PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the lane's state moved after the idle check"
   assert_output --partial "our typed text was deleted"
@@ -384,7 +385,7 @@ BURST 3"
 @test "our typed text is never erased into a pane that entered copy mode: it is left and reported" {
   ready_lane alpha
   shim_on_keys "-l -- /clear" "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' copy-mode -t '$PANE'"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "our typed text was left in the input line of $PANE, because pane $PANE is in copy mode"
   assert_output --partial "leave copy mode in pane $PANE"
@@ -402,7 +403,7 @@ BURST 3"
 @test "a tree edit while /clear is typed stops it before Enter, and the typed /clear is deleted" {
   ready_lane alpha
   shim_on_keys "-l -- /clear" "printf 'z\\\\n' >>'$WORK/file'"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "uncommitted changes"
   run submitted /clear
@@ -415,7 +416,7 @@ BURST 3"
 @test "the Enter retry checks again too: a tree edit after a lost Enter means no second Enter, and the message says it may land late" {
   ready_lane alpha FAKE_SWALLOW_ENTERS=1
   shim_on_keys " Enter" "printf 'z\\\\n' >>'$WORK/file'"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "/clear was sent to $PANE once, then the tree stopped being clean"
   assert_output --partial "it may have been taken late"
@@ -451,7 +452,7 @@ SHIM
 @test "a human key added after the arrival check stops Enter, and the human's text is never erased" {
   ready_lane alpha
   shim_key_after_verify "x"
-  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "the input line changed"
   run submitted /clear

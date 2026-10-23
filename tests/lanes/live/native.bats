@@ -220,16 +220,18 @@ keep_goal_lines() {
 # goal_agrees <when>: goal_state of transcript $tp matches the last goal_status verdict read here from the whole file
 # (met true: none; met false: active), and the report records which verdict it was.
 goal_agrees() {
-  local met want
+  local met want snap="$LIVE_OUT/transcript-snapshot.jsonl"
+  # Both readers see one copy: the live transcript can gain a verdict between the two reads.
+  cp "$tp" "$snap"
   met="$(jq -Rrn '[inputs | fromjson? | select(.type == "attachment" and .attachment.type == "goal_status")
-    | .attachment.met] | last | tostring' "$tp")"
+    | .attachment.met] | last | tostring' "$snap")"
   case "$met" in
     true) want=none ;;
     false) want=active ;;
     *) keep_goal_lines; echo "no goal_status verdict in $tp $1 (last met: '$met')" >&2; return 1 ;;
   esac
   note "goal verdict $1: met=$met, so goal_state must be $want"
-  run bash -c 'source "$1"; goal_state "$2"' _ "$LANES" "$tp"
+  run bash -c 'source "$1"; goal_state "$2"' _ "$LANES" "$snap"
   [[ "$output" == "$want" ]] || { keep_goal_lines; echo "goal_state $1 is '$output', the transcript's last verdict met=$met" >&2; return 1; }
 }
 
@@ -357,7 +359,7 @@ SessionStart clear"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>%q\nexec %q "$@"\n' "$LIVE_ROOT/tmux-calls" "$(command -v tmux)" >"$LIVE_ROOT/shim/tmux"
   chmod +x "$LIVE_ROOT/shim/tmux"
   : >"$LIVE_ROOT/tmux-calls"
-  PATH="$LIVE_ROOT/shim:$PATH" run "$LANES" clear lanes-live --wait 60
+  PATH="$LIVE_ROOT/shim:$PATH" TMUX_PANE=%99 run "$LANES" clear lanes-live --wait 60
   note "lanes clear: status $status: $output"
   assert_success
   assert_output --partial "cleared: lanes-live"

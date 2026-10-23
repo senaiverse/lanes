@@ -20,8 +20,9 @@ not here. The lead and lane skills say how to follow these rules; this file says
    answers "clear-ready", since any later turn cancels the readiness. The lead then runs `lanes clear <lane>`.
    `/clear` removes an active goal, so `lanes clear` types `/clear`, then the RESUME Goal, the one source of the goal
    after a clear: keep it equal to the goal you work toward.
-7. **A refusal is an answer.** `lanes clear-ready` and `lanes clear` refuse unless the tree is clean, the head is
-   pushed, RESUME is valid and rewritten since the request, and the lane is idle, began no turn and is unchanged since
+7. **A refusal is an answer.** `lanes clear-ready` and `lanes clear` refuse unless the tree and the lane's own journal
+   files are clean and pushed, RESUME is valid and rewritten and committed since the request, the lane runs no
+   background shell (on `lanes clear`), and the lane is idle, began no turn and is unchanged since
    clear-ready. Fix the named cause; never retry blindly and never send `/clear` by hand around a refusal.
 8. **Idle comes from Claude Code.** Busy, idle, waiting and a running background shell come from the session's own
    state file, never from screen text or a hook count; a lane is idle only once it stayed idle for a short gap. The

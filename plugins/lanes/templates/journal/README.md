@@ -12,4 +12,5 @@ write these files; a cleared lane resumes from its RESUME block. The rules are i
 | `morning.md` | lead | Questions queued for the human while away mode is on |
 
 Create a lane's files with `lanes init <lane>`; it never overwrites a file that exists. Commit the journal like code:
-`lanes clear-ready` refuses a lane whose tree is dirty or whose head is not pushed.
+`lanes clear-ready` refuses a lane whose tree is dirty or whose head is not pushed. A journal in a work tree of its
+own is shared: there only the lane's own `next-<lane>.md` and `done-<lane>.md` must be committed and pushed.
