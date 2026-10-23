@@ -6,6 +6,11 @@
   },
   "plugins": [
     {
+      "name": "lanes",
+      "source": "./plugins/lanes",
+      "description": "Lead and lane skills: lanes on a /goal in tmux, cleared at a context threshold, resumed from a RESUME block."
+    },
+    {
       "name": "lanes-jobs",
       "source": "./plugins/lanes-jobs",
       "description": "Tmux pane pool with STATUS files and slot locks (lanes-job)."
