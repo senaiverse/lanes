@@ -30,21 +30,23 @@ Then set its goal (section 3).
 
 ## 2. Read a lane's state
 
-Claude Code writes `~/.claude/sessions/<pid>.json` (or under `$CLAUDE_CONFIG_DIR`) for each running session. The file
-is not documented, so treat any field you do not find as "unknown" and ask the human. Find the lane's Claude Code pid
-among the pane's process and its children (an npm install runs Claude Code under a node wrapper), then read the status:
+Claude Code writes `<config dir>/sessions/<pid>.json` for each running session; the config dir is the lane's
+`$CLAUDE_CONFIG_DIR`, else `~/.claude`. The file is not documented, so treat any field you do not find as "unknown" and
+ask the human. Find the lane's Claude Code pid among the pane's process and its children (an npm install runs Claude
+Code under a node wrapper), then read the status:
 
 ```bash
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"   # the lane's value, if you started it with another one
 pp=$(tmux display -p -t <pane> '#{pane_pid}')
-for p in "$pp" $(pgrep -P "$pp"); do [ -f ~/.claude/sessions/"$p".json ] && pid=$p; done
-jq -r '"\(.status) \(.waitingFor // "") \(.sessionId)"' ~/.claude/sessions/"$pid".json
+for p in "$pp" $(pgrep -P "$pp"); do [ -f "$cfg/sessions/$p.json" ] && pid=$p; done
+jq -r '"\(.status) \(.waitingFor // "") \(.sessionId)"' "$cfg/sessions/$pid.json"
 ```
 
 `status` is `idle`, `busy`, `waiting` (a permission prompt or a dialog; `waitingFor` says which) or `shell` (a
 background shell or Monitor runs). No file means the session is gone: ask the human.
 
 Context used: the lane's last assistant entry in its transcript
-(`~/.claude/projects/<cwd with / as ->/<sessionId>.jsonl`) carries `message.usage`; input tokens plus cache reads plus
+(`$cfg/projects/<cwd with / as ->/<sessionId>.jsonl`) carries `message.usage`; input tokens plus cache reads plus
 cache writes, over the model's context window (200,000 tokens unless the model runs with a 1M window), is the share
 used.
 
@@ -77,7 +79,9 @@ When a lane passes the context threshold (the human's number; 70% if none):
    turns.
 4. Run "Before any key", then type `/clear` and Enter as in section 3. `/clear` also removes the lane's goal.
 5. Wait for a fresh session in that pane (the sessions file shows a new `sessionId` for the same pid), then set the
-   goal from the RESUME block's Goal line (section 3).
+   goal (section 3) as `/goal You are lane <lane>. Read the RESUME block in <its exact file path> first and continue
+   from its Next step: <the block's Goal line>`. The fresh session remembers nothing, so the goal itself carries the
+   lane's name and where its state is.
 
 ## Before any key
 
