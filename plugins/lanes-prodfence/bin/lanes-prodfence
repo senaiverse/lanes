@@ -78,7 +78,11 @@ to_posix() {
   esac
 }
 
-INPUT="$(</dev/stdin)"
+# The read builtin reads file descriptor 0 itself: opening the path /dev/stdin fails with ENXIO when stdin is a socket,
+# and cat would add a dependency beyond Bash. NUL bytes are dropped; a failed read leaves input that the checks refuse.
+INPUT=
+while IFS= read -r -d '' part; do INPUT+="$part"; done
+INPUT+="$part"
 CWD="$PWD"
 if [ "$HAVE_JQ" -eq 1 ]; then
   in_cwd="$(jq_text -r 'if type == "object" and (.cwd | type) == "string" then .cwd else empty end' <<<"$INPUT" 2>/dev/null || true)"
