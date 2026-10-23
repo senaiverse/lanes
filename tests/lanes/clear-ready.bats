@@ -56,12 +56,26 @@ setup_lane() {
   assert_output --partial "no upstream"
 }
 
-@test "empty journal: no RESUME file means not clear-ready, with the init command" {
+@test "empty journal: no RESUME file means not clear-ready, with the setup step that writes it" {
   make_repo
   register_lane alpha s1 %7 >/dev/null
   run "$LANES" clear-ready --lane alpha
   assert_failure
-  assert_output --partial "lanes init alpha"
+  assert_output --partial "run /lanes:setup for lane alpha"
+}
+
+@test "the shipped next-lane.md, with the lane name filled in as setup does, has every section but is not yet clear-ready" {
+  make_repo
+  mkdir -p "$WORK/.lanes"
+  sed 's/<lane>/alpha/g' "$LANES_REPO_ROOT/plugins/lanes/templates/journal/next-lane.md" >"$WORK/.lanes/next-alpha.md"
+  run grep -c '<lane>' "$WORK/.lanes/next-alpha.md"
+  assert_output 0
+  git -C "$WORK" add .lanes && git -C "$WORK" commit -qm journal && git -C "$WORK" push -q
+  register_lane alpha s1 %7 >/dev/null
+  run "$LANES" clear-ready --lane alpha
+  assert_failure
+  refute_output --partial "section"
+  assert_output --partial "is empty"
 }
 
 @test "clear_ready_refused_missing_sections" {

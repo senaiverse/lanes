@@ -10,6 +10,7 @@ write these files; a cleared lane resumes from its RESUME block. The rules are i
 | `next-<lane>.md` | that lane | Open work and ONE RESUME block |
 | `done-<lane>.md` | that lane | Finished units in the done-report form |
 | `morning.md` | lead | Questions queued for the human while away mode is on |
+| `adapters.md` | `/lanes:setup` | This project's CI, review gate and tests; `lanes check-adapters` checks it |
 
-Create a lane's files with `lanes init <lane>`; it never overwrites a file that exists. Commit the journal like code:
-`lanes clear-ready` refuses a lane whose tree is dirty or whose head is not pushed.
+`/lanes:setup` creates these files and a new lane's files; it never overwrites a file that exists. Commit the journal
+like code: `lanes clear-ready` refuses a lane whose tree is dirty or whose head is not pushed.

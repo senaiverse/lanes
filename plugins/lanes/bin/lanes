@@ -3,7 +3,6 @@
 # shellcheck disable=SC2016
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "${0##*/}: requires Bash 4 or newer: on macOS run 'brew install bash'" >&2; exit 2; }
 # lanes: the session registry, the journal and the clear handshake for one lead session and its lane sessions in tmux.
-#   lanes init [--claude-md yes|no] [lane...]   write the journal template into the journal dir (never overwrites)
 #   lanes status [--json]                        every lane: pane, context %, busy/idle, clear-ready, handshake
 #   lanes request <lane>                         lead: open a clear handshake (the lane must rewrite RESUME after it)
 #   lanes clear-ready [--lane <lane>]            lane, from its work tree: refuse unless clean, pushed, RESUME valid
@@ -11,6 +10,7 @@
 #   lanes goal <lane> <text> [--wait <seconds>]  lead: set or replace a lane's /goal through the same checks
 #   lanes away on|off|status                     away mode: the ask tool is refused, questions go to morning.md
 #   lanes journal-dir                            the journal folder for this work tree (absolute path)
+#   lanes check-adapters [file]                  the contract test of <journal>/adapters.md (/lanes:setup)
 #   lanes monitor-lock <name> <pid>            a watcher loop claims its name (skills/lead/MONITORS.md)
 #   lanes monitor-diff <name>                    print the items of stdin whose state changed since the last pass
 #   lanes register | hook prompt|stop|ask        hook entry points (SessionStart, UserPromptSubmit, Stop, PreToolUse)
@@ -57,7 +57,7 @@ die() {
 }
 
 usage() {
-  echo "lanes: usage: lanes init|status|request|clear-ready|clear|goal|away|journal-dir|monitor-lock|monitor-diff|register|hook|statusline (see the header of $0)" >&2
+  echo "lanes: usage: lanes status|request|clear-ready|clear|goal|away|journal-dir|check-adapters|monitor-lock|monitor-diff|register|hook|statusline (see the header of $0)" >&2
   exit 2
 }
 
@@ -636,7 +636,7 @@ cmd_status() {
           .activity, (if .clear_ready then "clear-ready" else "-" end), "handshake " + .handshake] | join("\t") end'
 }
 
-# ---- away mode, init ---------------------------------------------------------------------------------------------
+# ---- away mode ---------------------------------------------------------------------------------------------------
 
 # cmd_away: the record names who set it (the caller's lane, from its pane) and when; only the human lifts it.
 cmd_away() {
@@ -659,75 +659,14 @@ cmd_away() {
   esac
 }
 
-cmd_init() {
-  local claude_md="" root tpl dest f lane jd import created=() kept=() block cmd
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --claude-md) claude_md="${2:-}"; shift 2 ;;
-      -*) usage ;;
-      *) break ;;
-    esac
-  done
-  root="$(plugin_root)"
-  tpl="$root/templates/journal"
-  [[ -d "$tpl" ]] || die "template folder $tpl is missing" "reinstall the lanes plugin"
-  dest="$(journal_root "$PWD")"
-  mkdir -p "$dest"
-  for f in README.md RULES.md tracker.md morning.md; do
-    if [[ -e "$dest/$f" ]]; then kept+=("$f"); else cp "$tpl/$f" "$dest/$f"; created+=("$f"); fi
-  done
-  for lane in "$@"; do
-    valid_lane "$lane" || die "invalid lane '$lane'" "use letters, digits, dot, dash and underscore" 2
-    for f in next "done"; do
-      if [[ -e "$dest/$f-$lane.md" ]]; then kept+=("$f-$lane.md"); else
-        sed "s/<lane>/$lane/g" "$tpl/$f-lane.md" >"$dest/$f-$lane.md"
-        created+=("$f-$lane.md")
-      fi
-    done
-  done
-  echo "journal: $dest"
-  ((${#created[@]})) && echo "  wrote: ${created[*]}"
-  ((${#kept[@]})) && echo "  kept (already there): ${kept[*]}"
-
-  refresh_statusline_link "$root"
-  cmd="\"$DATA/lanes-statusline\""
-  [[ -n "${LANES_DATA_DIR:-}" ]] && cmd="LANES_DATA_DIR=\"$LANES_DATA_DIR\" $cmd"
-  block="$(jq -n --arg c "$cmd" '{statusLine: {type: "command", command: $c, refreshInterval: 30}}')"
-  echo
-  echo "status line: a plugin cannot set it, so add this to your settings.json (it records each lane's context %):"
-  echo "$block"
-
-  jd="$(journal_dir)"
-  import="@$jd/RULES.md"
-  local top
-  top="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
-  echo
-  if [[ -f "$top/CLAUDE.md" ]] && grep -qxF "$import" "$top/CLAUDE.md"; then
-    echo "CLAUDE.md already imports $import"
-    return 0
-  fi
-  if [[ -z "$claude_md" && -t 0 ]]; then
-    printf 'Add the line %s to %s/CLAUDE.md so every session loads the lanes rules? [y/N] ' "$import" "$top"
-    read -r claude_md || claude_md=""
-  fi
-  case "$claude_md" in
-    y | Y | yes)
-      printf '\n%s\n' "$import" >>"$top/CLAUDE.md"
-      echo "added $import to $top/CLAUDE.md"
-      ;;
-    n | N | no) echo "CLAUDE.md not changed" ;;
-    "") echo "CLAUDE.md not changed: a plugin's own CLAUDE.md is not loaded, so the rules need '$import' in $top/CLAUDE.md; run 'lanes init --claude-md yes' to add it, or '--claude-md no' to skip" ;;
-    *) die "--claude-md '$claude_md'" "answer yes or no" 2 ;;
-  esac
-}
-
 # shellcheck source-path=SCRIPTDIR source=../lib/handshake.bash
 source "$(plugin_root)/lib/handshake.bash"
 # shellcheck source-path=SCRIPTDIR source=../lib/monitor.bash
 source "$(plugin_root)/lib/monitor.bash"
+# shellcheck source-path=SCRIPTDIR source=../lib/adapters.bash
+source "$(plugin_root)/lib/adapters.bash"
 
 case "${1:-}" in
-  init) shift; cmd_init "$@" ;;
   register) cmd_register ;;
   hook) shift; cmd_hook "$@" ;;
   statusline) cmd_statusline ;;
@@ -738,6 +677,7 @@ case "${1:-}" in
   goal) shift; cmd_goal "$@" ;;
   away) shift; cmd_away "$@" ;;
   journal-dir) journal_root "$PWD" ;;
+  check-adapters) shift; cmd_check_adapters "$@" ;;
   monitor-lock) shift; cmd_monitor_lock "$@" ;;
   monitor-diff) shift; cmd_monitor_diff "$@" ;;
   *) usage ;;

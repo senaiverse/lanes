@@ -60,7 +60,7 @@ cmd_clear_ready() {
   prob="$(git_problem "$wt")"
   [[ -z "$prob" ]] || die "not clear-ready" "$prob"
   file="$(resume_path "$lane" "$wt")"
-  block="$(resume_block "$file")" || die "not clear-ready" "no RESUME block in $file: run 'lanes init $lane' and fill it in"
+  block="$(resume_block "$file")" || die "not clear-ready" "no RESUME block in $file: ask the lead to run /lanes:setup for lane $lane, then fill the block in"
   problems="$(resume_problems "$block")"
   [[ -z "$problems" ]] || die "not clear-ready" "$(tr '\n' ';' <<<"$problems")"
   h="$(hash_of "$block")"

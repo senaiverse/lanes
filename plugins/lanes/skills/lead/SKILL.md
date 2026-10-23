@@ -10,15 +10,15 @@ You plan, the lanes build, and the journal carries the state. The rules are in t
 
 ## 1. Set up once per project
 
-1. Run `lanes init <lane>...` from the repository, one name per lane. It writes the journal and never overwrites.
-2. Ask the human (step 6) whether to add `@.lanes/RULES.md` to the project's `CLAUDE.md`, then run
-   `lanes init --claude-md yes` or `--claude-md no`.
-3. Show the human the `statusLine` block that `lanes init` printed and ask them to add it to their settings. Without it,
-   context percentages stay `unknown`.
-4. Ask the human to start each lane in its own tmux pane as `claude --name <lane>`, and yourself as
+1. Run `lanes check-adapters`. When it refuses, tell the human to run `/lanes:setup`, giving the lane names you plan
+   to use. Setup writes the journal and its lane files, the adapter file, the `## Lanes` block in CLAUDE.md and the
+   `statusLine` block; you cannot start it, since only the human can.
+2. Read `<journal>/adapters.md`: it names this project's CI and status commands, review gate and test command.
+3. Ask the human to start each lane in its own tmux pane as `claude --name <lane>`, and yourself as
    `LANES_ROLE=lead claude --name <lead>`.
 
-Done when `lanes status` lists every lane with a live pane, and the journal is committed.
+Done when `lanes check-adapters` passes, `lanes status` lists every lane with a live pane, and the journal is
+committed.
 
 ## 2. Hand out work
 

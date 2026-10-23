@@ -37,6 +37,21 @@ skill_files() { printf '%s\n' "$P"/skills/*/*.md; }
   [ "$code" = "$skill" ] || { echo "code: $(echo $code) / skill: $(echo $skill)" >&2; false; }
 }
 
+@test "lanes init is gone: /lanes:setup does its work, so the command is a usage error and no shipped file names it" {
+  run "$LANES" init
+  assert_failure 2
+  assert_output --partial "usage"
+  run grep -rlF 'lanes init' "$P"
+  assert_output ""
+}
+
+@test "the setup skill is user-invoked with a one-line human description" {
+  run grep -cxF 'disable-model-invocation: true' "$P/skills/setup/SKILL.md"
+  assert_output 1
+  run grep -xE 'description: [^.]+\.' "$P/skills/setup/SKILL.md"
+  assert_success
+}
+
 @test "lanes journal-dir: relative to the work tree's top level, an absolute override as is" {
   make_repo
   mkdir -p "$WORK/sub"
