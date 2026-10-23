@@ -17,4 +17,4 @@ graders:
   - name: ran-plancheck
     type: tool_used
     tool: Bash
-    input_match: 'lanes-plancheck\s+(\./)?plan\.md'
+    input_match: '"command"\s*:\s*"(?:[^"]*?(?:&&|;)\s*)?(?:\S*/)?lanes-plancheck\s+(\./)?plan\.md'

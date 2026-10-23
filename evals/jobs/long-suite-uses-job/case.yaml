@@ -17,4 +17,4 @@ graders:
   - name: used-lanes-job
     type: tool_used
     tool: Bash
-    input_match: 'lanes-job\s+run\s'
+    input_match: '"command"\s*:\s*"(?:[^"]*?(?:&&|;)\s*)?(?:\S*/)?lanes-job\s+run\s[^"]*--\s+(?:env\s+\S+\s+)*npm\s+test'
