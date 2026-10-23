@@ -1,0 +1,10 @@
+{
+  "name": "lanes",
+  "version": "0.1.0",
+  "description": "Skills for a lead session that runs several Claude Code lane sessions in tmux, each on a /goal, and clears a lane at a context threshold so it resumes from its RESUME block.",
+  "author": { "name": "senaiverse" },
+  "homepage": "https://github.com/senaiverse/lanes",
+  "repository": "https://github.com/senaiverse/lanes",
+  "license": "MIT",
+  "keywords": ["tmux", "sessions", "goal", "workflow"]
+}
