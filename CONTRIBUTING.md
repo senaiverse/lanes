@@ -8,6 +8,7 @@ Read [`SCOPE.md`](SCOPE.md) first: it says what lanes takes. The rules below are
 Run `scripts/install-hooks.sh` once per clone. It points git at `.githooks`, whose pre-push hook runs the private word
 check (`scripts/deny-gate.sh`). CI does not run that check, so the hook is the only gate. Never commit private names:
 no product names, hosts, IDs, emails or journal content, in files, authors or commit messages.
+The hook also refuses a push whose tip commit holds an unresolved conflict marker (`scripts/marker-gate.sh`).
 
 ## Test
 

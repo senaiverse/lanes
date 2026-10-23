@@ -8,6 +8,9 @@
 set -euo pipefail
 
 die() { echo "lanes-deny-gate: $1: $2" >&2; exit 2; }
+# Pins the git config keys that reshape output parsed here and that no flag below already fixes (-z, --format),
+# so user config cannot change what is parsed. Same text in marker-gate.sh; deny-gate.bats keeps the copies equal.
+git_plain() { git -c color.grep=never -c grep.column=false -c submodule.recurse=false -c log.showSignature=false -c i18n.logOutputEncoding=UTF-8 "$@"; }
 
 ROOT=""
 if [ "$#" -gt 0 ] && [ "$1" != "--commits" ]; then ROOT="$1"; shift; fi
@@ -18,7 +21,7 @@ if [ "${1:-}" = "--commits" ]; then
   [ "$#" -gt 0 ] || die "--commits needs a revision range" "pass rev-list arguments after --commits"
   REV_ARGS=("$@")
 fi
-git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $ROOT" "pass the repo dir as the first argument"
+git_plain -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $ROOT" "pass the repo dir as the first argument"
 
 LOCAL_REL="docs/PORT-SOURCES.local.md"
 LOCAL="$ROOT/$LOCAL_REL"
@@ -86,13 +89,13 @@ if [ "$COMMITS" -eq 1 ]; then
       if [ "$rc" -eq 0 ]; then printf '%s %s\n' "$2" "$3" >> "$CHIT"; return 0; fi
     done
   }
-  revs="$(git -C "$ROOT" rev-list "${REV_ARGS[@]}")" || die "git rev-list failed for: ${REV_ARGS[*]}" "check the pushed refs exist locally"
+  revs="$(git_plain -C "$ROOT" rev-list "${REV_ARGS[@]}")" || die "git rev-list failed for: ${REV_ARGS[*]}" "check the pushed refs exist locally"
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
-    short="$(git -C "$ROOT" rev-parse --short "$sha")"
-    field_hit "$(git -C "$ROOT" log -1 --format='%an%n%ae' "$sha")" "$short" author
-    field_hit "$(git -C "$ROOT" log -1 --format='%cn%n%ce' "$sha")" "$short" committer
-    field_hit "$(git -C "$ROOT" log -1 --format='%B' "$sha")" "$short" message
+    short="$(git_plain -C "$ROOT" rev-parse --short "$sha")"
+    field_hit "$(git_plain -C "$ROOT" log -1 --format='%an%n%ae' "$sha")" "$short" author
+    field_hit "$(git_plain -C "$ROOT" log -1 --format='%cn%n%ce' "$sha")" "$short" committer
+    field_hit "$(git_plain -C "$ROOT" log -1 --format='%B' "$sha")" "$short" message
   done <<< "$revs"
   if [ -s "$CHIT" ]; then
     echo "lanes-deny-gate: deny-listed word found in a commit (short sha, field): rewrite the commit before pushing:" >&2
@@ -107,7 +110,7 @@ fi
 LIST="$TMP/list"; : > "$LIST"
 while IFS= read -r f; do
   if [ -f "$ROOT/$f" ] && [ "$f" != "$LOCAL_REL" ]; then printf '%s\n' "$f" >> "$LIST"; fi
-done < <({ git -C "$ROOT" ls-files -z; git -C "$ROOT" ls-files -z --others --exclude-standard; } | tr '\0' '\n' | sort -u)
+done < <({ git_plain -C "$ROOT" ls-files -z; git_plain -C "$ROOT" ls-files -z --others --exclude-standard; } | tr '\0' '\n' | sort -u)
 
 # Scans every listed file's path and contents. grep exits 0 on a match, 1 on none and 2+ on an error, so an
 # error is told apart from "no hit" and fails the gate instead of passing it.
