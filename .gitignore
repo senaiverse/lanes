@@ -1,7 +1,3 @@
 *.local.md
-<<<<<<< HEAD
-evals/results/
-.tools/
-=======
 .tools
->>>>>>> origin/main
+evals/results/
