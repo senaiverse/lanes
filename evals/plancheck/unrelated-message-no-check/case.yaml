@@ -1,0 +1,26 @@
+schema_version: "1.1"
+name: plancheck-unrelated-message-no-check
+description: A plain status message to a lane is not a plan, so the checker is not run.
+tags: [plancheck, negative]
+plugins: ["../../../plugins/lanes-plancheck"]
+runs: 1
+execution:
+  max_turns: 5
+  allowed_tools: [Skill, Read]
+  prompt: |
+    Write one line telling lane s3 that my rebase is done. Just give me the line.
+graders:
+  - name: no-plancheck
+    type: tool_used
+    tool: Bash
+    input_match: 'lanes-plancheck'
+    min: 0
+    max: 0
+    arm: both
+  - name: no-plancheck-skill
+    type: tool_used
+    tool: Skill
+    input_match: 'plancheck'
+    min: 0
+    max: 0
+    arm: both
