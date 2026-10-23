@@ -300,20 +300,45 @@ printer() {
   esac
 }
 
+# command_head: drops from W every word before the name of the command it runs, and sets HEAD_ASSIGNS to the
+# assignments among them. Those words are the reserved words bash reads before a command (bash(1) "RESERVED WORDS",
+# "Pipelines": `[time [-p]] [!] command`, and `for|select <name> do`), assignments, and the builtin, command and exec
+# wrappers with their options (`exec -a <name>`). A head that runs no command (`case`, `for x in`, `coproc`) stays.
+command_head() {
+  local wrapper=""
+  HEAD_ASSIGNS=()
+  while [ "${#W[@]}" -gt 0 ]; do
+    case "${W[0]}" in
+      '!'|'{'|if|then|elif|else|while|until|do) drop 1 ;;
+      time)
+        drop 1
+        if [ "${W[0]:-}" = -p ]; then drop 1; fi
+        if [ "${W[0]:-}" = -- ]; then drop 1; fi ;;
+      for|select) [ "${W[2]:-}" = 'do' ] || return 0; drop 3 ;;
+      builtin|command|exec) wrapper="${W[0]}"; drop 1 ;;
+      -*)
+        [ -n "$wrapper" ] || return 0
+        if [ "$wrapper" = exec ] && [[ "${W[0]}" =~ ^-[^a-]*a$ ]]; then drop 2; else drop 1; fi ;;
+      *)
+        is_assignment "${W[0]}" || return 0
+        HEAD_ASSIGNS+=("${W[0]}"); drop 1 ;;
+    esac
+  done
+}
+
 # note_changes <index>: for command idx, sets DIR_UNSURE when it may change the checkout or config later pushes read
 # (cd, pushd, popd, eval, source, a $ command word, a GIT_DIR assignment, an export of git config), GIT_ENV_CONFIG for
 # a git config assignment, FUNC_DEF for a function, and HAS_COPROC for a coprocess, whose pipe takes later output.
 note_changes() {
-  local -a W
+  local -a W HEAD_ASSIGNS
   local d
   split_words "${CMDS[$1]}"
-  while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
-    if [[ "${W[0]}" =~ ^$GIT_CONFIG_ENV= ]]; then GIT_ENV_CONFIG=1; fi
-    if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then DIR_UNSURE=1; fi
-    drop 1
+  command_head
+  for d in "${HEAD_ASSIGNS[@]}"; do
+    if [[ "$d" =~ ^$GIT_CONFIG_ENV= ]]; then GIT_ENV_CONFIG=1; fi
+    if [[ "$d" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then DIR_UNSURE=1; fi
   done
   [ "${#W[@]}" -gt 0 ] || return 0
-  while [[ "${W[0]}" =~ ^(builtin|command|exec|-.*)$ ]] && [ "${#W[@]}" -gt 1 ]; do drop 1; done
   if [[ "${W[0]}" == *'$'* ]]; then DIR_UNSURE=1; fi
   case "${W[0]##*/}" in
     cd|pushd|popd|eval|source|.) DIR_UNSURE=1 ;;
@@ -351,12 +376,12 @@ may_exempt() {
 # data: the arguments of git commit and gh pr|issue create|comment|edit, grep's and rg's operands, and a printer's
 # words and stdin. Push words: an allowed push, which only the git push @default pattern discounts.
 classify() {
-  local -a W
+  local -a W HEAD_ASSIGNS
   local w stdin="${CMD_STDIN[$1]:-}" i
   split_words "${CMDS[$1]}"
   for w in "${W[@]}"; do count_tokens parsed "$w"; done
   if [ -n "$stdin" ]; then count_tokens parsed "$stdin"; fi
-  while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do drop 1; done
+  command_head
   [ "${#W[@]}" -gt 0 ] || return 0
   case "${W[0]##*/}" in
     git)

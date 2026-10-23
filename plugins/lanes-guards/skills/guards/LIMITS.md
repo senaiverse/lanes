@@ -11,8 +11,11 @@
   only when its output reaches no other command: no pipe after it, no output redirection, process substitution or
   coprocess beside it, and any substitution it runs in is itself such an argument. And none counts for a command a
   configured pattern names (`git commit` under `git commit --amend`). The one allowed push form lifts only
-  `git push @default`; a pattern such as plain `git push` refuses every push. A data command behind a wrapper
-  (`timeout 60 git push ...`, `sudo git commit ...`) is not data. Nothing is proven when the parse fails, when a
+  `git push @default`; a pattern such as plain `git push` refuses every push. Each command is read behind what bash
+  reads before a command name: reserved words (`{`, `if`, `then`, `!`, `time -p`, `do` ...), assignments, and the
+  `builtin`, `command` and `exec` builtins with their options, so `{ git commit -m ...; }` is data and a `cd` inside
+  `if ...; then` is seen. A data command behind any other wrapper (`timeout 60 git push ...`, `sudo git commit ...`) is
+  not data. A quoted reserved word is read as the reserved word. Nothing is proven when the parse fails, when a
   pattern word sits somewhere the parser does not read (a comment, a redirection target, a heredoc delimiter), or when
   the line defines a function.
 - So some normal commands are refused because they name all of a pattern's words: `gh pr view 5 && git merge x`,

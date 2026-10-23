@@ -388,6 +388,52 @@ other_checkout() {
   done
 }
 
+# Bash reads a command name behind the reserved words that open a command list (bash(1) "RESERVED WORDS", "Pipelines":
+# `[time [-p]] [!] command`), so the guard reads the same command there.
+@test "a coprocess behind a reserved word still takes every data exemption off the line" {
+  bash_denied sid-lane1 'echo "$({ coproc { true; echo gh pr merge 12; }; bash <&"${COPROC[0]}"; })"'
+  for open in '{' 'if true; then' '!' 'time' 'time -p' 'until false; do' 'for x in 1; do' 'set -- 1; for x do'; do
+    case "$open" in '{') close='; }' ;; if*) close='; fi' ;; *do) close='; break; done' ;; *) close='' ;; esac
+    bash_denied sid-lane1 "$open coproc { true; echo gh pr merge 12; }$close; sh <&\"\${COPROC[0]}\"" || return 1
+  done
+}
+
+@test "a function defined behind a reserved word still takes every exemption off the line" {
+  for def in 'function echo { eval "$*"; }' 'echo() { eval "$*"; }'; do
+    for cmd in "{ $def; }" "if true; then $def; fi" "until false; do $def; break; done" "! $def" "time $def"; do
+      bash_denied sid-lane1 "$cmd; echo gh pr merge 12" || return 1
+    done
+  done
+}
+
+@test "a directory or config change behind a reserved word refuses the push after it" {
+  make_repo
+  other_checkout
+  # Run from WT, where lane1 is not the default: each line changes to OTHER, where it is, before the push runs.
+  for change in "cd $OTHER" "pushd $OTHER" "eval 'cd $OTHER'" "source /dev/null" "\$CD $OTHER" \
+    "export GIT_DIR=$OTHER/.git" "GIT_DIR=$OTHER/.git" "command cd $OTHER"; do
+    for cmd in "{ $change; }" "if true; then $change; fi" "if false; then :; elif $change; then :; fi" \
+      "if false; then :; else $change; fi" "! $change" "time $change" "time -p -- $change" \
+      "until $change; do :; done" "until false; do $change; break; done" "for x in 1; do $change; done" \
+      "set -- 1; for x do $change; done" "case x in x) $change;; esac" "case x in (x) $change;; esac"; do
+      bash_denied sid-lane1 "$cmd; git push origin lane1:lane1" "$WT" || return 1
+    done
+  done
+  # An assignment to an exported HOME moves the global config, so the plain form is refused behind a group too.
+  bash_denied sid-lane1 '{ HOME=/tmp/h; }; git push origin lane1' "$WT"
+  bash_denied sid-lane1 '{ HOME=/tmp/h git push origin lane1; }' "$WT"
+}
+
+@test "a data command or a lane push behind a reserved word is read as itself" {
+  make_repo
+  for cmd in '{ git commit -m "gh pr merge is lead-only"; }' 'if true; then echo gh pr merge 12; fi' \
+    'time git commit -qm "explain gh pr merge"' '! grep -q "gh pr merge" notes.txt' 'command echo gh pr merge 12' \
+    '{ git push origin lane1; }' 'time git push origin lane1:lane1' 'command git push origin lane1' \
+    'if git fetch -q origin; then git push origin lane1; fi'; do
+    bash_untouched sid-lane1 "$cmd" "$WT" || return 1
+  done
+}
+
 # Every way a review round found to hide a lead-only command, one per line. A new one is a one-line addition.
 HIDING_FORMS=(
   # separators and grouping
@@ -444,6 +490,11 @@ HIDING_FORMS=(
   "x=\$(grep -h 'gh pr merge' f); \$x" "\$(grep -h 'gh pr merge' f)" "sh -c \"\$(grep -h 'gh pr merge' f)\""
   '{ true; echo gh pr merge 12; } > out.sh' 'exec >out.sh; echo gh pr merge 12' 'coproc { true; echo gh pr merge 12; }; sh <&"${COPROC[0]}"'
   "printf \$V c 'gh pr merge 12'; \$c" "printf \"\$V\" c 'gh pr merge 12'; \$c" "printf {-v,} c 'gh pr merge 12'; \$c"
+  'if true; then echo gh pr merge 12; fi | sh' 'until false; do echo gh pr merge 12; break; done | bash'
+  '! echo gh pr merge 12 | sh' 'time echo gh pr merge 12 | sh' '{ git commit -m "gh pr merge 12"; } > out.sh'
+  'echo "$(if true; then echo gh pr merge 12; fi)" | sh' 'eval "$({ echo gh pr merge 12; })"'
+  # wrapper options that take the command's place
+  'exec -a echo gh pr merge 12' 'exec -cla echo gh pr merge 12' 'command -p exec -a cat gh pr merge 12'
 )
 
 # Hiding forms under a project's own lead_only_commands, one "<lead_only_commands>|<command>" per line, run in a lane

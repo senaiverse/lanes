@@ -3,7 +3,8 @@
 # ($'...' decoded), backslashes and line continuations are removed as the shell removes them. Beside CMDS it fills
 # CMD_STDIN[i] (the heredoc body or here-string word fed to command i), CMD_SUB[i] (the serial of the innermost
 # substitution command i runs in, or empty) and CMD_OUT[i] (set when command i's output may reach another command or a
-# file, see tokenize). A substitution leaves SUBMARK serial SUBMARK in its word. `name ()` sets FUNC_DEF. Text it
+# file, see tokenize). A substitution leaves SUBMARK serial SUBMARK in its word. `()` after a word sets FUNC_DEF:
+# `name ()`, also behind a reserved word (`{ name () ...`), and otherwise only a syntax error. Text it
 # cannot parse (an unterminated quote, too much nesting) sets LOOSE.
 # Limit: words are joined with SEP (0x1f) and split on it again, so a literal 0x1f byte in a command forges a word
 # boundary. The guard only exempts from a parse, so a forged boundary can cause a refusal, not a bypass.
@@ -196,7 +197,7 @@ tokenize() {
         fi ;;
       "(")
         _flush
-        if [ "${#words[@]}" -eq 1 ] && [[ "${s:i+1}" =~ ^[[:space:]]*\) ]]; then FUNC_DEF=1; fi
+        if [ "${#words[@]}" -ge 1 ] && [[ "${s:i+1}" =~ ^[[:space:]]*\) ]]; then FUNC_DEF=1; fi
         _endcmd; i=$((i + 1)) ;;
       ";"|"&"|")") _endcmd; i=$((i + 1)) ;;
       "#")
