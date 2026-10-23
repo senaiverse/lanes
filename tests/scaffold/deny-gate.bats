@@ -156,6 +156,51 @@ write_list() {
   refute_output --partial "notes-L-10.txt"
 }
 
+# User git config that reshapes git ls-files and git log output must not change what the gate parses.
+reshape_git_output() {
+  local kv
+  for kv in grep.column=true color.grep=always color.ui=always grep.lineNumber=true grep.fullName=true \
+    core.quotePath=true submodule.recurse=true log.showSignature=true i18n.logOutputEncoding=ISO-8859-1; do
+    git -C "$REPO" config "${kv%%=*}" "${kv#*=}"
+  done
+}
+
+@test "with output-reshaping git config a word in a non-ASCII path and in contents is found, and clean passes" {
+  reshape_git_output
+  echo "clean" > "$REPO/acme-é.txt"
+  printf 'one\nuse Acme\n' > "$REPO/notes-é.txt"
+  git -C "$REPO" add .
+  LANES_DENY_LIST="acme" run "$GATE" "$REPO"
+  assert_failure 1
+  assert_output --partial "  acme-é.txt:(path)"
+  assert_output --partial "  notes-é.txt:2"
+  LANES_DENY_LIST="globex" run "$GATE" "$REPO"
+  assert_success
+}
+
+@test "--commits: a listed non-ASCII author is found even when git log would re-encode it" {
+  reshape_git_output
+  git -C "$REPO" -c user.name="Zoë Smith" commit -q --allow-empty -m one
+  LANES_DENY_LIST="zoë" run "$GATE" "$REPO" --commits HEAD
+  assert_failure 1
+  assert_output --partial "author"
+}
+
+@test "deny-gate.sh and marker-gate.sh pin the same git config keys" {
+  run grep -h '^git_plain() ' "$GATE" "$BATS_TEST_DIRNAME/../../scripts/marker-gate.sh"
+  assert_success
+  [ "${#lines[@]}" -eq 2 ]
+  [ "${lines[0]}" = "${lines[1]}" ]
+}
+
+@test "--commits: a clean signed commit passes with log.showSignature set" {
+  ssh-keygen -q -t ed25519 -N '' -f "$LANES_TEST_TMP/key" >/dev/null
+  reshape_git_output
+  git -C "$REPO" -c gpg.format=ssh -c user.signingkey="$LANES_TEST_TMP/key.pub" commit -q -S --allow-empty -m one
+  LANES_DENY_LIST="signature" run "$GATE" "$REPO" --commits HEAD
+  assert_success
+}
+
 @test "an unreadable file fails with exit 2 and names the file" {
   [ "$(id -u)" -ne 0 ] || skip "root reads any file"
   echo "acme" > "$REPO/secret.txt"

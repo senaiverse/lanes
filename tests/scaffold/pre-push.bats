@@ -215,6 +215,55 @@ conflict_text() { printf 'keep\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> ori
   assert_success
 }
 
+# User git config that reshapes git grep and git log output must not change what the gates parse.
+reshape_git_output() { # $1 repo
+  local kv
+  for kv in grep.column=true color.grep=always color.ui=always grep.lineNumber=true grep.fullName=true \
+    core.quotePath=true submodule.recurse=true log.showSignature=true i18n.logOutputEncoding=ISO-8859-1; do
+    git -C "$1" config "${kv%%=*}" "${kv#*=}"
+  done
+}
+
+@test "with output-reshaping git config a push with markers is refused and names each file:line" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  reshape_git_output "$REPO"
+  conflict_text > "$REPO/notes-é.txt"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_failure
+  assert_output --partial "  notes-é.txt:2"
+  assert_output --partial "  notes-é.txt:4"
+  assert_output --partial "  notes-é.txt:6"
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_failure
+}
+
+@test "with output-reshaping git config a clean push passes" {
+  "$REPO/scripts/install-hooks.sh" >/dev/null
+  reshape_git_output "$REPO"
+  printf 'Title\n=======\n' > "$REPO/README-é.md"
+  git -C "$REPO" add .
+  git -C "$REPO" commit -qm one
+  LANES_DENY_LIST="zqxv" run git -C "$REPO" push origin main
+  assert_success
+  run git -C "$REMOTE" rev-parse --verify main
+  assert_success
+}
+
+@test "a marker inside a submodule is not the pushed tree's, even with submodule.recurse set" {
+  SUB="$LANES_TEST_TMP/sub"
+  git init -q -b main "$SUB"
+  conflict_text > "$SUB/m.txt"
+  git -C "$SUB" add .
+  git -C "$SUB" -c user.email=t@example.invalid -c user.name=t commit -qm sub
+  git -C "$REPO" -c protocol.file.allow=always submodule add -q "$SUB" sub
+  git -C "$REPO" commit -qm "add sub"
+  reshape_git_output "$REPO"
+  run "$REPO/scripts/marker-gate.sh" "$REPO" HEAD
+  assert_success
+}
+
 @test "deleting a branch passes" {
   "$REPO/scripts/install-hooks.sh" >/dev/null
   commit_file a.txt first

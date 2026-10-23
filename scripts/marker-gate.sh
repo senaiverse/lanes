@@ -8,16 +8,19 @@
 set -euo pipefail
 
 die() { echo "lanes-marker-gate: $1: $2" >&2; exit 2; }
+# Pins the git config keys that reshape output parsed here and that no flag below already fixes (-n, -z, -E),
+# so user config cannot change what is parsed. Same text in deny-gate.sh; deny-gate.bats keeps the copies equal.
+git_plain() { git -c color.grep=never -c grep.column=false -c submodule.recurse=false -c log.showSignature=false -c i18n.logOutputEncoding=UTF-8 "$@"; }
 
 [ "$#" -eq 2 ] || die "usage: marker-gate.sh <repo-dir> <commit>" "pass the repo dir and the commit to check"
 ROOT="$1"; REV="$2"
-sha="$(git -C "$ROOT" rev-parse --verify --quiet "$REV^{commit}")" || die "not a commit: $REV" "pass a commit that exists locally"
+sha="$(git_plain -C "$ROOT" rev-parse --verify --quiet "$REV^{commit}")" || die "not a commit: $REV" "pass a commit that exists locally"
 
 # Records are "<sha>:<path>\0<line>\0<text>\n"; -z keeps the path verbatim. -I skips binary files.
 out="$(mktemp "${TMPDIR:-/tmp}/lanes-markers.XXXXXX")"
 trap 'rm -f "$out"' EXIT
 rc=0
-git -C "$ROOT" grep -n -z -I -E -e '^<<<<<<< .' -e '^=======$' -e '^>>>>>>> .' "$sha" -- > "$out" || rc=$?
+git_plain -C "$ROOT" grep -n -z -I -E -e '^<<<<<<< .' -e '^=======$' -e '^>>>>>>> .' "$sha" -- > "$out" || rc=$?
 [ "$rc" -le 1 ] || die "git grep failed on $sha (exit $rc)" "check the repository"
 [ "$rc" -eq 0 ] || exit 0
 
@@ -35,6 +38,6 @@ for i in "${!paths[@]}"; do
 done
 [ "${#hits[@]}" -gt 0 ] || exit 0
 
-echo "lanes-marker-gate: unresolved conflict markers in commit $(git -C "$ROOT" rev-parse --short "$sha"): resolve them and commit before pushing:" >&2
+echo "lanes-marker-gate: unresolved conflict markers in commit $(git_plain -C "$ROOT" rev-parse --short "$sha"): resolve them and commit before pushing:" >&2
 printf '  %s\n' "${hits[@]}" >&2
 exit 1
