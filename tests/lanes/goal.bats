@@ -18,7 +18,7 @@ goal_lane() {
   assert_success
 }
 
-@test "a lane with an active goal is cleared: /goal clear, then /clear, then the lane's current goal again" {
+@test "a lane with an active goal is cleared: /goal clear, then /clear, then the RESUME Goal, never the live one" {
   goal_lane
   run "$LANES" clear alpha
   assert_success
@@ -26,9 +26,29 @@ goal_lane() {
   run submits
   assert_output "/goal clear
 /clear
-/goal ship A1"
+/goal finish item A1 and report done"
   run state alpha .handshake.state
   assert_output done
+}
+
+@test "a goal the human cleared never comes back: /goal clear fires no hook, and only the RESUME Goal is re-sent" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_GOAL="an old goal"
+  wait_for "goal turn ended" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = false ]"
+  lanes_tmux send-keys -t "$PANE" -l -- "/goal clear"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_for "goal footer gone" bash -c "! tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q '◎ /goal active'"
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  run state alpha .handshake.goal
+  assert_output "finish item A1 and report done"
+  run "$LANES" clear alpha
+  assert_success
+  run grep -c '^SUBMIT /goal an old goal' "$FAKE_LOG"
+  assert_output 0
+  run grep -c '^SUBMIT /goal finish item A1 and report done$' "$FAKE_LOG"
+  assert_output 1
 }
 
 @test "a /goal clear that fires UserPromptSubmit neither counts as a prompt nor sets busy" {
@@ -69,8 +89,8 @@ goal_lane() {
   run state alpha '[.busy, .prompts] | @json'
   assert_output '[false,0]'
   jq -nc '{session_id:"s1",session_title:"alpha",prompt:"/goal ship it"}' | "$LANES" hook prompt
-  run state alpha '[.busy, .prompts, .last_command] | @json'
-  assert_output '[true,1,"/goal ship it"]'
+  run state alpha '[.busy, .prompts, .last_command, has("goal")] | @json'
+  assert_output '[true,1,"/goal ship it",false]'
 }
 
 @test "the request message does not ask the lane to clear its own goal, which only typed input can do" {
@@ -100,8 +120,8 @@ goal_setup() {
   assert_output --partial "goal set: alpha"
   run grep -c '^SUBMIT /goal ship B2 and its tests$' "$FAKE_LOG"
   assert_output 1
-  run state alpha .goal
-  assert_output "ship B2 and its tests"
+  run state alpha .last_command
+  assert_output "/goal ship B2 and its tests"
 }
 
 @test "lanes goal refuses a busy lane and types nothing" {
@@ -152,11 +172,12 @@ goal_setup() {
   assert_output 0
 }
 
-@test "a goal replaced with lanes goal is the one re-sent after a clear" {
+@test "a goal replaced with lanes goal is re-sent after a clear once the lane copied it into its RESUME Goal" {
   goal_setup
   run as_lead goal alpha "ship B2 instead"
   assert_success
   wait_for "goal turn ended" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = false ]"
+  write_resume alpha "ship B2 instead"
   run "$LANES" clear-ready --lane alpha
   assert_success
   run "$LANES" clear alpha
@@ -208,4 +229,16 @@ shim_on_goal_clear() {
   assert_output --partial "no longer holds pane"
   run grep -c '^BURST' "$FAKE_LOG"
   assert_output 0
+}
+
+@test "a draft that lands ahead of a long goal wrapped over several lines: only our characters are erased" {
+  goal_setup FAKE_ON_ESC=draft-next
+  long="$(printf 'finish item B2 and its tests%.0s; ' $(seq 1 10))"
+  long="${long%; }"
+  run as_lead goal alpha "$long"
+  assert_failure
+  assert_output --partial "our typed text was deleted"
+  run grep -c '^SUBMIT' "$FAKE_LOG"
+  assert_output 0
+  wait_for "draft left alone" bash -c "tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -q $'^❯ human draft\$'"
 }

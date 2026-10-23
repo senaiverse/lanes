@@ -218,12 +218,27 @@ reg_update() {
   write_atomic "$(reg_file "$lane")" "$out"
 }
 
-# The activity of a lane from its state record, one definition for status and for clear: busy, busy-expired (no Stop
-# within LANES_BUSY_TTL, as after an interrupt), background, idle, or unknown (no hook seen yet).
-ACTIVITY_JQ='def activity($now; $ttl): if has("busy") | not then "unknown"
-  elif .busy and (.busy_since // 0) < $now - $ttl then "busy-expired"
-  elif .busy then "busy" elif (.background // 0) > 0 then "background" else "idle" end;'
-activity_of() { jq -r --argjson now "$(now)" --argjson ttl "$BUSY_TTL" "$ACTIVITY_JQ"' activity($now; $ttl)' <<<"$1"; }
+# lane_activity <state>: the one definition of a lane's activity, for status and for clear: busy, interrupted, busy-expired
+# (no Stop within LANES_BUSY_TTL), background, idle, or unknown (no hook seen yet). Stop does not run after an Esc
+# interrupt (hooks docs), so a busy turn ends early only on evidence of the interrupt itself: the transcript's last
+# entry is the user's "[Request interrupted by user…]", written no earlier than the turn began (2.1.309 transcripts).
+lane_activity() {
+  local act tp
+  act="$(jq -r --argjson now "$(now)" --argjson ttl "$BUSY_TTL" '
+    if has("busy") | not then "unknown"
+    elif .busy and (.busy_since // 0) < $now - $ttl then "busy-expired"
+    elif .busy then "busy" elif (.background // 0) > 0 then "background" else "idle" end' <<<"$1")"
+  [[ "$act" == busy ]] || { echo "$act"; return 0; }
+  tp="$(jq -r '.transcript // ""' <<<"$1")"
+  if [[ -n "$tp" && -r "$tp" ]] && tail -n 50 "$tp" | jq -se --argjson since "$(jq -r '.busy_since // 0' <<<"$1")" '
+      [.[] | select(.type == "user" or .type == "assistant")] | last
+      | .type == "user" and ((.message.content | tostring) | test("\\[Request interrupted by user"))
+        and ((.timestamp // "" | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch 0) >= $since)' >/dev/null 2>&1; then
+    echo interrupted
+  else
+    echo busy
+  fi
+}
 
 config_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE/config.json" 2>/dev/null || true; }
 
@@ -494,12 +509,11 @@ cmd_register() {
   valid_sid "$sid" && write_atomic "$DATA/sessions/$sid" "$lane"
   gc_sessions
   if ((fresh)); then
-    # A new session has no /goal: startup has none, and /clear removes one (code.claude.com/docs/en/goal).
     state_update "$lane" '
       (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid
        then .handshake.state = "cleared" | .handshake.cleared_at = $now | .handshake.cleared_session = $sid else . end)
       | .session_id = $sid | .busy = false | .background = 0 | .prompts = 0 | .stops = 0
-      | .last_command = null | .goal = null | .pct_at = null' --arg sid "$sid" --argjson now "$(now)"
+      | .last_command = null | .transcript = null | .pct_at = null' --arg sid "$sid" --argjson now "$(now)"
   fi
   # RESUME is read from the work tree clear-ready proved, which can differ from the session's start directory.
   wt="$(state_read "$lane" | jq -r '.handshake.worktree // ""')"
@@ -524,16 +538,15 @@ cmd_hook() {
   local kind="${1:-}" lane f=()
   case "$kind" in ask | prompt | stop) ;; *) usage ;; esac
   mapfile -t f < <(jq -r '
-    def clears: test("^/goal +(clear|stop|off|reset|none|cancel) *$");
     if type == "object" then (.session_id // ""), (.session_title // ""), (.cwd // ""),
       ((.prompt // "") as $p | {
         cmd: (if $p | startswith("/") then $p[0:200] else null end),
-        no_turn: (($p | test("^/goal *$")) or ($p | clears)), clears: ($p | clears),
-        goal: (if ($p | startswith("/goal ")) and (($p | clears) | not) and ($p | length) <= 6 + $cap then $p[6:] else null end)
+        no_turn: ($p | test("^/goal( +(clear|stop|off|reset|none|cancel))? *$"))
       } | tojson),
-      ((.background_tasks // []) | if type == "array" then length else 0 end)
-    else empty end' --argjson cap "$GOAL_CAP" 2>/dev/null)
-  ((${#f[@]} == 5)) || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
+      ((.background_tasks // []) | if type == "array" then length else 0 end),
+      (.transcript_path // "" | tostring)
+    else empty end' 2>/dev/null)
+  ((${#f[@]} == 6)) || { echo "lanes: hook input is not a JSON object" >&2; return 0; }
   if [[ "$kind" == ask ]]; then
     [[ -f "$STATE/away.json" ]] || return 0
     jq -nc --arg m "$(journal_root "${f[2]:-$PWD}")/morning.md" '{hookSpecificOutput: {hookEventName: "PreToolUse",
@@ -549,11 +562,12 @@ cmd_hook() {
   [[ "$(lane_for_session "${f[0]}" "${f[1]}")" == "$lane" ]] || { mutex_drop; return 0; }
   if [[ "$kind" == prompt ]]; then
     # `/goal` alone and `/goal clear` (with its aliases) start no turn, so no Stop would ever end a busy flag set here.
+    # The goal text is not recorded: `/goal clear` fires no hook, so a recorded goal would outlive its clearing, and
+    # the RESUME Goal is the one source of the goal re-sent after /clear.
     state_update "$lane" '.session_id = $sid | .last_command = $p.cmd | .activity_at = $now
-      | if $p.no_turn then (if $p.clears then .goal = null else . end)
-        else .busy = true | .busy_since = $now | .prompts = ((.prompts // 0) + 1)
-          | (if $p.goal != null then .goal = $p.goal else . end) end' \
-      --arg sid "${f[0]}" --argjson p "${f[3]}" --argjson now "$(now)"
+      | (if $tp != "" then .transcript = $tp else . end)
+      | if $p.no_turn then . else .busy = true | .busy_since = $now | .prompts = ((.prompts // 0) + 1) end' \
+      --arg sid "${f[0]}" --argjson p "${f[3]}" --arg tp "${f[5]}" --argjson now "$(now)"
   else
     state_update "$lane" '.busy = false | .stops = ((.stops // 0) + 1) | .activity_at = $now | .background = $bg' \
       --argjson bg "${f[4]}" --argjson now "$(now)"
@@ -604,14 +618,14 @@ lane_view() {
   pane="$(jq -r '.tmux_pane // ""' <<<"$e")"
   pane_exists "$pane" && alive=true
   jq -nc --argjson e "$e" --argjson s "$st" --argjson now "$n" --argjson thr "$(threshold)" --argjson alive "$alive" \
-    --argjson ttl "$BUSY_TTL" --argjson stale "$PCT_STALE" --argjson rto "$REQUEST_TIMEOUT" "$ACTIVITY_JQ"'
+    --arg act "$(lane_activity "$st")" --argjson stale "$PCT_STALE" --argjson rto "$REQUEST_TIMEOUT" '
     ($s.handshake // {}) as $h
     | {lane: $e.lane, role: $e.role, pane: $e.tmux_pane, pane_alive: $alive, used_pct: $e.used_pct,
        ctx: (if $e.used_pct == null then "unknown"
              elif ($s.pct_at // 0) < $now - $stale then "stale"
              else "fresh" end),
        at_threshold: ($e.used_pct != null and $e.used_pct >= $thr),
-       activity: ($s | activity($now; $ttl)),
+       activity: $act,
        clear_ready: $e.clear_ready,
        handshake: (if $h.state == "requested" and ($h.requested_at // 0) < $now - $rto then "request-timed-out"
                    else ($h.state // "none") end)}'
@@ -728,6 +742,9 @@ cmd_init() {
 source "$(plugin_root)/lib/handshake.bash"
 # shellcheck source-path=SCRIPTDIR source=../lib/monitor.bash
 source "$(plugin_root)/lib/monitor.bash"
+
+# Sourced (tests feed real screen captures to screen_read): define everything, run nothing.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
   init) shift; cmd_init "$@" ;;

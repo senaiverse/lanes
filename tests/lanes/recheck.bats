@@ -220,7 +220,7 @@ EOF
 @test "under LC_ALL=C a multibyte spinner glyph above the input box still vetoes" {
   make_repo
   write_resume alpha
-  start_fake alpha FAKE_TRANSCRIPT=$'● reply\n✶ Perusing… (3s · ↓ 175 tokens)'
+  start_fake alpha FAKE_SPINNER='✶ Perusing… (3s · ↓ 175 tokens)'
   "$LANES" clear-ready --lane alpha >/dev/null
   LC_ALL=C run "$LANES" clear alpha
   assert_failure

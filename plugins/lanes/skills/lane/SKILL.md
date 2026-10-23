@@ -22,6 +22,8 @@ Done when you are working on the Next step and your tracker row says so.
 1. Build the item from its plan. A gap or a design question goes to the lead as a message, with file:line evidence.
 2. Questions for the human go to the lead (RULES.md rule 10), and so do CI, merges and plans (rule 13).
 3. Rewrite your RESUME block in place at each real step: Now, Next step and Running change; it stays one block.
+   When the lead sets a new goal (`lanes goal`), copy it into the Goal section: that section is the only goal set again
+   after a clear (RULES.md rule 6).
 4. Keep your tracker row current: branch, PR, CI and next step.
 
 Done when the RESUME block would let a fresh session continue without asking anything.
@@ -52,7 +54,7 @@ When the lead asks (or your own context reaches the threshold and you tell the l
 2. Rewrite your RESUME block with your current state. A block unchanged since the lead's request is refused.
 3. Commit and push your branch and the journal.
 4. Stop anything running in the background, or name it under Running if it must outlive the clear.
-5. Leave an active `/goal` alone. You cannot clear it; `lanes clear` clears it and sets it again after the clear.
+5. Leave an active `/goal` alone. You cannot clear it; `lanes clear` clears it and sets your RESUME Goal after the clear.
 6. Run `lanes clear-ready` from the work tree you work in. If it refuses, fix the cause it names and run it again.
 7. Send the lead "clear-ready", then stop and wait. A new prompt, a commit or an edit after this cancels the
    readiness. When your goal starts another turn, answer only "waiting for clear" and call no tool: after a few such

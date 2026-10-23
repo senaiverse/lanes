@@ -41,7 +41,8 @@ alpha	lane	%3	ctx 72% AT-THRESHOLD	idle	clear-ready	handshake ready
 
 - **ctx**: a number, `unknown` or `stale`. Treat `unknown` and `stale` as "ask the lane", never as safe.
 - **AT-THRESHOLD**: start the handshake (step 4).
-- **activity**: `idle`, `busy`, `busy-expired` (no Stop after an interrupt), `background` or `unknown`.
+- **activity**: `idle`, `busy`, `interrupted` (Esc ended the turn), `busy-expired` (no Stop for a long time),
+  `background` or `unknown`.
 - **handshake**: `none`, `requested`, `request-timed-out`, `ready`, `sending`, `cleared`, `stale`, `failed`, `done`.
 
 `sending` and `cleared` are a clear in flight: run `lanes clear <lane>` again to finish it. `stale` and `failed` need a
@@ -57,8 +58,8 @@ The handshake is RULES.md rule 6; these are its commands.
 2. Send that message to the lane.
 3. Wait for the lane's "clear-ready". Use `lanes status`: the row shows `clear-ready`.
 4. Run `lanes clear <lane>`. It re-checks everything at the moment of sending. When a `/goal` is active it types
-   `/goal clear` first, since the lane cannot. Then it sends one Esc and `/clear`, then the lane's current goal (else
-   the RESUME Goal), and confirms each by its effect.
+   `/goal clear` first, since the lane cannot. Then it sends one Esc and `/clear`, then the RESUME Goal recorded at
+   clear-ready, and confirms each by its effect.
 5. Read its last line. `cleared: <lane> ...` means the lane has a new session, its RESUME block, and its goal.
 
 Done when `lanes status` shows the lane with handshake `done` and the lane has answered its first message.
@@ -72,8 +73,8 @@ When `lanes clear` refuses, its message names the cause and the fix; act on that
 Run `lanes goal <lane> "<one line>"` when a lane should work toward a new end state without losing its context: a new
 item, a narrower target, or a goal that ended early. It refuses unless you are the lead, the goal is one line of at
 most 4,000 characters, and the lane is idle. It types the goal through the same checks as `lanes clear` and confirms
-it by the lane's own prompt hook. A later `lanes clear` sets that same goal again. To give a lane a plain instruction,
-message it instead.
+it by the lane's own prompt hook. It sets the live goal only: ask the lane to copy it into its RESUME Goal, the goal a
+later `lanes clear` sets again. To give a lane a plain instruction, message it instead.
 
 ## 5. Accept a done report
 

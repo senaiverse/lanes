@@ -1,0 +1,40 @@
+
+
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;246m[48;5;237m❯ [38;5;231msay hi[39m
+
+[38;5;231m[49m●[39m Hi
+
+[38;5;246m✻[39m [38;5;246mChurned for 23s · done 3:44 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mRun the shell command: touch x[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m✻[39m [38;5;246mCooked for 2s · done 3:45 AM[39m
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/goal a file named y exists in the current directory[39m
+[38;5;246m[49m  ⎿  [39mGoal set: a file named y exists in the current directory
+
+[38;5;231m●[39m Goal set: create a file named [38;5;153my[39m in the current directory. Creating it now.
+
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m✻[39m [38;5;246mCogitated for 2s · done 3:45 AM[39m
+
+[38;5;246m[48;5;237m❯[39m [38;5;231m/goal clear[39m [49m
+[38;5;246m  ⎿  [39mGoal cleared: a file named y exists in the current directory
+
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────── w1 ─
+[39m❯ [38;5;153m/goal[39m word001 word002 word003 word004 word005 word006 word007 word008 word009 word010 word011 word012 word013
+  word014 word015 word016 word017 word018 word019 word020 word021 word022 word023 word024 word025 word026 word027
+  word028 word029 word030 word031 word032 word033 word034 word035 word036 word037 word038 word039 word040 word041
+  word042 word043 word044 word045 word046 word047 word048 word049 word050 word051 word052 word053 word054 word055
+  word056 word057 word058 word059 word060 word061 word062 word063 word064 word065 word066 word067 word068 word069
+  word070 word071 word072 word073 word074 word075 END
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [36mHaiku 5.5[38;5;246m | [32m6% ctx[38;5;246m | /tmp/lanes-probe/proj[39m
+  [38;5;246m⏸ manual mode on[39m

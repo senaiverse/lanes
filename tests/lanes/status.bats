@@ -283,3 +283,39 @@ old_writer_after_new_session() {
   run reg alpha .used_pct
   assert_output 5
 }
+
+activity() { "$LANES" status --json | jq -r '.[0].activity'; }
+
+@test "Esc interrupts a turn and no Stop runs: the transcript's interrupt entry ends the busy flag, the screen alone never does" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_TURN_MS=60000
+  lanes_tmux send-keys -t "$PANE" -l -- "a long task"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_for "busy flag" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = true ]"
+  sleep 1.2
+  run activity
+  assert_output busy
+  lanes_tmux send-keys -t "$PANE" Escape
+  wait_for "interrupt logged" grep -q '^INTERRUPT$' "$FAKE_LOG"
+  run state alpha .busy
+  assert_output true
+  run activity
+  assert_output interrupted
+}
+
+@test "an interrupt older than the current turn does not end it" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_TURN_MS=60000
+  lanes_tmux send-keys -t "$PANE" -l -- "first"
+  lanes_tmux send-keys -t "$PANE" Enter
+  wait_for "busy flag" bash -c "[ \"\$(jq -r .busy '$LANES_DATA_DIR/lanes/state/alpha.json')\" = true ]"
+  lanes_tmux send-keys -t "$PANE" Escape
+  wait_for "interrupt logged" grep -q '^INTERRUPT$' "$FAKE_LOG"
+  sleep 1.2
+  jq -nc --arg s "$(reg alpha .session_id)" --arg tp "$FAKE_LOG.transcript.jsonl" \
+    '{session_id:$s,session_title:"alpha",prompt:"second",transcript_path:$tp}' | "$LANES" hook prompt
+  run activity
+  assert_output busy
+}

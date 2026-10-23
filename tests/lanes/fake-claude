@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fake Claude Code pane for the lanes tests. It draws the 2.1.308 prompt box (a `❯` + NBSP input line between rules,
-# a dim placeholder when empty), reads keys in raw mode, and fires the lanes hooks the way Claude Code does.
+# Fake Claude Code pane for the lanes tests. It draws the screen of Claude Code 2.1.309 as captured in captures/ (see
+# draw), reads keys in raw mode, and fires the lanes hooks the way Claude Code does.
 # Launch it with argv[0] "claude" so tmux reports pane_current_command=claude. Behaviour knobs are FAKE_* env vars.
 set -u
 
@@ -29,6 +29,15 @@ log() { printf '%s\n' "$*" >>"$LOG"; }
 
 now_ms() { local t="${EPOCHREALTIME/./}"; printf '%s' "${t:0:13}"; }
 
+# The session transcript (hook input transcript_path): one JSON entry per line, as Claude Code writes it. An Esc
+# interrupt adds the user entry "[Request interrupted by user for tool use]" (seen in 2.1.309 transcripts).
+TRANSCRIPT_FILE="$LOG.transcript.jsonl"
+export TZ=UTC0
+tlog() { # tlog <user|assistant> <text>
+  jq -nc --arg t "$1" --arg x "$2" --arg ts "$(printf '%(%Y-%m-%dT%H:%M:%S)T' -1).000Z" \
+    '{type: $t, timestamp: $ts, message: {role: $t, content: [{type: "text", text: $x}]}}' >>"$TRANSCRIPT_FILE"
+}
+
 # fire <register|prompt|stop> [extra jq args]: one hook call with Claude Code's input shape.
 fire() {
   local kind="$1" json
@@ -36,35 +45,43 @@ fire() {
     start) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg src "$2" \
       '{hook_event_name:"SessionStart",source:$src,session_id:$s,session_title:$t,cwd:$c}')"
       printf '%s' "$json" | "$LANES" register >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
-    prompt) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg p "$2" \
-      '{hook_event_name:"UserPromptSubmit",session_id:$s,session_title:$t,cwd:$c,prompt:$p}')"
-      printf '%s' "$json" | "$LANES" hook prompt >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
-    stop) json="$(jq -nc --arg s "$SID" --arg c "$CWD" \
-      '{hook_event_name:"Stop",session_id:$s,cwd:$c,stop_hook_active:false,background_tasks:[]}')"
+    prompt) json="$(jq -nc --arg s "$SID" --arg t "$LANE" --arg c "$CWD" --arg p "$2" --arg tp "$TRANSCRIPT_FILE" \
+      '{hook_event_name:"UserPromptSubmit",session_id:$s,session_title:$t,cwd:$c,prompt:$p,transcript_path:$tp}')"
+      printf '%s' "$json" | "$LANES" hook prompt >>"$LOG.hookout" 2>>"$LOG.hookerr"
+      tlog user "$2" ;;
+    stop) tlog assistant "done"
+      json="$(jq -nc --arg s "$SID" --arg c "$CWD" --arg tp "$TRANSCRIPT_FILE" \
+      '{hook_event_name:"Stop",session_id:$s,cwd:$c,stop_hook_active:false,background_tasks:[],transcript_path:$tp}')"
       printf '%s' "$json" | "$LANES" hook stop >>"$LOG.hookout" 2>>"$LOG.hookerr" ;;
   esac
 }
 
+# draw: the 2.1.309 screen as captured in captures/: transcript; a spinner line and a blank line (or two blank lines);
+# the notice row, with `◎ /goal active (1m)` right-aligned while a goal is set; the top rule with the session name;
+# `❯`+NBSP and the input wrapped onto lines indented two spaces; the bottom rule; the status line; the mode line. A
+# permission dialog replaces everything below the transcript and has no `❯`+NBSP line.
+WIDTH=116
 draw() {
-  local start=0 n="${#transcript[@]}"
-  ((n > 30)) && start=$((n - 30))
+  local start=0 n="${#transcript[@]}" i spin="${FAKE_SPINNER:-}" rest
+  ((n > 24)) && start=$((n - 24))
   printf '\033[H\033[2J'
-  local i
   for ((i = start; i < n; i++)); do printf '%s\r\n' "${transcript[i]}"; done
   if [[ -n "${FAKE_DIALOG:-}" ]]; then
-    printf ' Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n Enter to confirm · Esc to cancel\r\n'
+    printf ' Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n'
     return
   fi
-  ((busy)) && printf '✻ Working… (1s · esc to interrupt)\r\n'
-  printf '──────────────────────────────── %s ─\r\n' "$LANE"
-  if [[ -n "$composer" ]]; then
-    printf '❯\302\240%s\r\n' "$composer"
+  ((busy)) && spin='✻ Churning… (1s · ↓ 10 tokens)'
+  printf '%s\r\n\r\n' "$spin"
+  if [[ -n "$goal" ]]; then printf '%98s◎ /goal active (1m)\r\n' ''; else printf '\r\n'; fi
+  printf '%s %s ─\r\n' '────────────────────────────────────────────────────────────────────────────────────────────' "$LANE"
+  if [[ -z "$composer" ]]; then
+    printf '❯\302\240\033[2mTry "refactor <filepath>"\033[0m\r\n'
   else
-    printf '❯\302\240\033[2mTry "edit <filepath> to..."\033[0m\r\n'
+    printf '❯\302\240%s\r\n' "${composer:0:WIDTH}"
+    rest="${composer:WIDTH}"
+    while [[ -n "$rest" ]]; do printf '  %s\r\n' "${rest:0:WIDTH}"; rest="${rest:WIDTH}"; done
   fi
-  printf '────────────────────────────────────────\r\n  fake-claude %s\r\n' "$SID"
-  [[ -n "$goal" ]] && printf '  ◎ /goal active (1m)\r\n'
-  return 0
+  printf '%s\r\n  Haiku 5.5 | fake-claude %s\r\n  ⏸ manual mode on\r\n' '──────────────────────────────────────────────────────────────────────────────────────────────────' "$SID"
 }
 
 start_turn() {
@@ -149,6 +166,14 @@ while :; do
           $'\r' | $'\n') enter ;;
           $'\e')
             log "ESC"
+            if ((busy)); then
+              # Esc interrupts the turn: Claude Code writes the interrupt to the transcript and runs no Stop hook.
+              busy=0
+              turn_end=0
+              log "INTERRUPT"
+              transcript+=("  ⎿  Interrupted · What should Claude do instead?")
+              tlog user "[Request interrupted by user for tool use]"
+            fi
             if [[ "$on_esc" == prompt ]]; then
               # A human submits a message right after the lead's Escape: a new turn starts.
               on_esc=""

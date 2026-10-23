@@ -18,7 +18,7 @@ not here. The lead and lane skills say how to follow these rules; this file says
    hand, rewrites its RESUME block, commits and pushes, runs `lanes clear-ready` from its work tree, tells the lead
    "clear-ready", and stops; a turn its `/goal` starts after that only waits, with no tool call. The lead then runs
    `lanes clear <lane>`. A model cannot clear its own goal, so `lanes clear` types `/goal clear` itself, then `/clear`,
-   then the lane's current goal (else its RESUME Goal).
+   then the RESUME Goal, the one source of the goal after a clear: keep it equal to the goal you work toward.
 7. **A refusal is an answer.** `lanes clear-ready` and `lanes clear` refuse unless the tree is clean, the head is
    pushed, RESUME is valid and rewritten since the request, and the lane is idle and unchanged since clear-ready. Fix
    the named cause; never retry blindly and never send `/clear` by hand around a refusal.
