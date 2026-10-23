@@ -13,6 +13,8 @@ export LC_ALL=C
 
 DATA="${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}"
 DEFAULT_PATTERNS='gh workflow run; gh pr merge; git push @default'
+# Environment variables that change which git config a push reads (HOME and XDG_CONFIG_HOME move the global file).
+GIT_CONFIG_ENV='(GIT_CONFIG_[A-Z0-9_]+|HOME|XDG_CONFIG_HOME)'
 
 # shellcheck source-path=SCRIPTDIR source=../lib/tokenize.bash
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/tokenize.bash"
@@ -119,16 +121,17 @@ branch_name() {
 
 # push_allowed: true for `git [-C <dir>] push [-u|--set-upstream] [--force-with-lease[=...]] <remote> <branch>` with a
 # configured <remote> whose default is known and a non-default <branch> or <branch>:<same branch>. Any other push depends
-# on the checkout, git config or a pattern, so it is the lead's. The checkout is the one cd and -C lead to (CMD_DIR).
+# on the checkout, git config or a pattern, so it is the lead's. The checkout is RUN_DIR (the session directory
+# or a leading cd), then -C.
 # A plain <branch> is mapped by remote.<r>.push, push.default=upstream and symrefs (git builtin/push.c
-# refspec_append_mapped), so it passes only when none of them, nor a GIT_CONFIG_* prefix, is set in the target checkout.
+# refspec_append_mapped), so it passes only when none of them is set in the target checkout and
+# no GIT_CONFIG_ENV assignment is on the line.
 push_allowed() {
-  local a x dir="$CMD_DIR" seen=0 src dst target defaults
+  local a x dir="$RUN_DIR" seen=0 src dst target defaults
   local -a pos=()
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
-  [ "$VIA_XARGS" -eq 0 ] || return 1
-  if [ -z "$dir" ]; then
-    PUSH_HINT="the guard cannot tell which checkout this push runs in; push without cd, GIT_DIR or env -C: git -C <your-worktree> push <remote> <your-branch>"
+  if [ "$DIR_UNSURE" -eq 1 ]; then
+    PUSH_HINT="the guard cannot tell which checkout this push runs in; change directory only with one leading \`cd <absolute path> &&\`, or push with git -C <your-worktree> push <remote> <your-branch>"
     return 1
   fi
   for ((a = 1; a < ${#W[@]}; a++)); do
@@ -204,7 +207,12 @@ match_command() {
       MATCHED="$pat"; return 0
     fi
     for ((k = 0; k < need; k++)); do [ "${pos[k]}" = "${pw[k + 1]}" ] || continue 2; done
-    if [ "${pw[${#pw[@]} - 1]}" = "@default" ] && push_allowed; then continue; fi
+    # A push is judged once the whole line is read (check_pushes), since a later or nested command may change its checkout.
+    if [ "${pw[${#pw[@]} - 1]}" = "@default" ] && [ "$VIA_XARGS" -eq 0 ]; then
+      printf -v x '%s'"$SEP" "${W[@]}"
+      PUSHES+=("${x%"$SEP"}"); PUSH_PATS+=("$pat")
+      continue
+    fi
     MATCHED="$pat"; return 0
   done
   return 1
@@ -212,6 +220,13 @@ match_command() {
 
 # drop <n>: removes the first n words of W.
 drop() { if [ "${#W[@]}" -le "$1" ]; then W=(); else W=("${W[@]:$1}"); fi; }
+
+# split_words <SEP-joined command>: sets W to its words, keeping empty ones.
+split_words() {
+  local rest="$1$SEP"
+  W=()
+  while [ -n "$rest" ]; do W+=("${rest%%"$SEP"*}"); rest="${rest#*"$SEP"}"; done
+}
 
 # is_assignment <word>
 is_assignment() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*\+?= ]]; }
@@ -250,35 +265,30 @@ shell_stdin() {
 # is_stdin_path <word>: a script path that is the shell's stdin.
 is_stdin_path() { [[ "$1" =~ ^(/dev/stdin|/dev/fd/0|/proc/self/fd/0)$ ]]; }
 
-# track_dir <command words...>: keeps RUN_DIR, the checkout later commands run in, through cd and pushd to a literal
-# target. An unresolvable target (none, -, ~, +N, a $ word), popd, or an export of GIT_DIR, GIT_COMMON_DIR or
-# GIT_CONFIG_* empties RUN_DIR, which refuses a later lane push.
-track_dir() {
+# note_dir_change <command words...>: sets DIR_UNSURE for a command that may change the checkout later commands use:
+# cd, pushd, popd, a command word the guard cannot resolve, or an export of GIT_DIR, GIT_COMMON_DIR or GIT_CONFIG_ENV.
+# Nesting, subshells and pipelines decide whether such a change reaches a push, so every lane push on the line is refused.
+note_dir_change() {
   local d
+  [[ "$1" != *'$'* ]] || DIR_UNSURE=1
   case "${1##*/}" in
-    cd|pushd)
-      shift
-      while [[ "${1:-}" =~ ^-[LPe@]+$ ]]; do shift; done
-      [ "${1:-}" != -- ] || shift
-      d="${1:-}"
-      if [ -z "$d" ] || [ -z "$RUN_DIR" ] || [[ "$d" == [-~+]* || "$d" == *'$'* ]]; then RUN_DIR=""; return 0; fi
-      case "$d" in /*) RUN_DIR="$d" ;; *) RUN_DIR="$RUN_DIR/$d" ;; esac ;;
-    popd) RUN_DIR="" ;;
-    export|declare|typeset|readonly)
-      for d in "${@:2}"; do [[ ! "$d" =~ ^GIT_(DIR|COMMON_DIR|CONFIG_[A-Z0-9_]+)= ]] || RUN_DIR=""; done ;;
+    cd|pushd|popd) DIR_UNSURE=1 ;;
+    export|declare|typeset|readonly|local)
+      for d in "${@:2}"; do [[ ! "$d" =~ ^(GIT_DIR|GIT_COMMON_DIR|$GIT_CONFIG_ENV)= ]] || DIR_UNSURE=1; done ;;
   esac
 }
 
 # check_command <index in CMDS>: strips wrappers, follows shells and eval into CMDS, and matches the real command.
+# A git environment assignment or a wrapper's chdir anywhere on the line sets GIT_ENV_CONFIG or DIR_UNSURE for all of it.
 check_command() {
-  local idx="$1" rest="${CMDS[$1]}$SEP" base a k mode script GIT_ENV_CONFIG=0 CMD_DIR="$RUN_DIR"
+  local idx="$1" base a k mode script
   local -a W=()
   VIA_XARGS=0
-  while [ -n "$rest" ]; do W+=("${rest%%"$SEP"*}"); rest="${rest#*"$SEP"}"; done
+  split_words "${CMDS[$1]}"
   while :; do
     while [ "${#W[@]}" -gt 0 ] && is_assignment "${W[0]}"; do
-      if [[ "${W[0]}" =~ ^GIT_CONFIG_(COUNT|KEY_[0-9]+|PARAMETERS|GLOBAL|SYSTEM)= ]]; then GIT_ENV_CONFIG=1; fi
-      if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then CMD_DIR=""; fi
+      if [[ "${W[0]}" =~ ^$GIT_CONFIG_ENV= ]]; then GIT_ENV_CONFIG=1; fi
+      if [[ "${W[0]}" =~ ^GIT_(DIR|COMMON_DIR)= ]]; then DIR_UNSURE=1; fi
       drop 1
     done
     [ "${#W[@]}" -gt 0 ] || return 0
@@ -289,8 +299,12 @@ check_command() {
         if [ "${W[0]}" = "--" ]; then drop 1; break; fi
         if [ "$base" = command ] && [[ "${W[0]}" =~ ^-[a-zA-Z]*[vV] ]]; then return 0; fi
         if [ "$base" = env ] && [[ "${W[0]}" =~ ^(-S|--split-string)$ ]]; then tokenize "${W[1]:-}"; return 0; fi
-        if [[ "$base:${W[0]}" =~ ^(env:-C|env:--chdir|sudo:-D|sudo:--chdir)(=.*)?$ ]]; then CMD_DIR=""; fi
-        if [[ "${WRAPPERS[$base]}" == *" ${W[0]} "* ]]; then drop 2; else drop 1; fi
+        if [[ "$base:${W[0]}" =~ ^(env:-C|env:--chdir|sudo:-D|sudo:--chdir)$ ]]; then DIR_UNSURE=1; fi
+        if [[ "${WRAPPERS[$base]}" == *" ${W[0]} "* ]]; then drop 2; continue; fi
+        # Any other form but a lone letter or a number (a cluster, an attached value, a long option) may take the next
+        # word or carry a command or a directory (env -S'...', -iu NAME, -D/x), so the rest is matched loosely too.
+        if [[ ! "${W[0]}" =~ ^-([A-Za-z]|[0-9]+)$ ]]; then LOOSE=1; LOOSE_TEXT+="${W[*]}"$'\n'; fi
+        drop 1
       done
       if [ "$base" = timeout ]; then drop 1; fi
       if [ "$base" = xargs ]; then VIA_XARGS=1; fi
@@ -318,7 +332,7 @@ check_command() {
         return 0 ;;
       eval) drop 1; tokenize "${W[*]:-}"; return 0 ;;
       source|.) if is_stdin_path "${W[1]:-}"; then shell_stdin "$idx"; fi; return 0 ;;
-      *) track_dir "${W[@]}"; match_command || true; return 0 ;;
+      *) note_dir_change "${W[@]}"; match_command || true; return 0 ;;
     esac
   done
 }
@@ -355,9 +369,20 @@ load_patterns() {
 
 # ---- guards ------------------------------------------------------------------------------------------------------
 
+# check_pushes: after the whole line is read, sets MATCHED for the first recorded push push_allowed refuses.
+check_pushes() {
+  local i
+  local -a W
+  for ((i = 0; i < ${#PUSHES[@]}; i++)); do
+    split_words "${PUSHES[i]}"
+    push_allowed || { MATCHED="${PUSH_PATS[i]}"; return 0; }
+  done
+}
+
 guard_lead_only() {
-  local cmd idx
+  local cmd idx lead_cd='^[[:space:]]*cd[[:space:]]+(-[LP][[:space:]]+)?(/[A-Za-z0-9._/@+-]*)[[:space:]]*&&(.*)$'
   CMDS=(); CMD_STDIN=(); CMD_PIPE=(); CMD_RAW=(); LOOSE=0; LOOSE_TEXT=""; TOKENIZE_CALLS=0; MATCHED=""; VIA_XARGS=0
+  PUSHES=(); PUSH_PATS=(); DIR_UNSURE=0; GIT_ENV_CONFIG=0
   RUN_DIR="$SESSION_DIR"
   PUSH_HINT="push explicitly: git push <remote> <your-branch>"
   load_patterns
@@ -373,11 +398,17 @@ guard_lead_only() {
   [ "$(jstr tool_name)" = Bash ] || exit 0
   cmd="$(jstr tool_input.command)"
   [ -n "$cmd" ] || exit 0
+  # `cd <absolute path> && rest` runs all of rest there when the cd succeeds. ".." is refused: the shell resolves it
+  # against the path as written, git -C against the symlink target.
+  if [[ "$cmd" =~ $lead_cd ]] && [[ "/${BASH_REMATCH[2]}/" != */../* ]]; then
+    RUN_DIR="${BASH_REMATCH[2]}"; cmd="${BASH_REMATCH[3]}"
+  fi
   tokenize "$cmd"
   for ((idx = 0; idx < ${#CMDS[@]}; idx++)); do
     check_command "$idx"
     [ -z "$MATCHED" ] || break
   done
+  if [ -z "$MATCHED" ]; then check_pushes; fi
   if [ -z "$MATCHED" ] && [ "$LOOSE" -eq 1 ]; then loose_match "$LOOSE_TEXT" || true; fi
   [ -n "$MATCHED" ] || exit 0
   lookup_caller

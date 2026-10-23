@@ -210,11 +210,28 @@ load helper
   make_repo
   for cmd in 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream git push origin lane1' \
     'env GIT_CONFIG_PARAMETERS="x" git push origin lane1' 'GIT_CONFIG_GLOBAL=/tmp/g git push origin lane1' \
-    'GIT_CONFIG_SYSTEM=/tmp/s git push -u origin lane1' 'GIT_CONFIG_KEY_3=x git push origin lane1'; do
+    'GIT_CONFIG_SYSTEM=/tmp/s git push -u origin lane1' 'GIT_CONFIG_KEY_3=x git push origin lane1' \
+    'HOME=/tmp/h git push origin lane1' 'XDG_CONFIG_HOME=/tmp/x git push origin lane1'; do
     bash_denied sid-lane1 "$cmd" "$WT" || return 1
   done
   bash_untouched sid-lane1 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream git push origin lane1:lane1' "$WT"
   bash_untouched sid-lane1 'FOO=1 git push origin lane1' "$WT"
+  bash_untouched sid-lane1 'HOME=/tmp/h git push origin lane1:lane1' "$WT"
+  bash_denied sid-lane1 'export HOME=/tmp/h; git push origin lane1:lane1' "$WT"
+}
+
+@test "a global config under another HOME maps a plain-name push, which is why a HOME prefix refuses it" {
+  make_repo
+  bare="$LANES_TEST_TMP/origin.git"
+  git init -q --bare "$bare"
+  git -C "$REPO" push -q origin main
+  git -C "$WT" fetch -q origin
+  git -C "$WT" branch -q --set-upstream-to=origin/main lane1
+  git -C "$WT" commit -q --allow-empty -m one
+  mkdir "$LANES_TEST_TMP/h"
+  git config --file "$LANES_TEST_TMP/h/.gitconfig" push.default upstream
+  HOME="$LANES_TEST_TMP/h" git -C "$WT" push -q origin lane1
+  [ "$(git -C "$bare" rev-parse main)" = "$(git -C "$WT" rev-parse lane1)" ]
 }
 
 @test "a push with no refspec is refused whatever remote.<r>.push or push.default says" {
@@ -319,6 +336,59 @@ load helper
   bash_untouched sid-lane1 'GIT_TERMINAL_PROMPT=0 git push origin lane1:lane1' "$WT"
 }
 
+# other_checkout: a second repository at $LANES_TEST_TMP/other whose origin head is lane1, so lane1 is its default.
+other_checkout() {
+  OTHER="$LANES_TEST_TMP/other"
+  git init -q -b lane1 "$OTHER"
+  git -C "$OTHER" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m x
+  add_remote origin lane1 "$OTHER"
+}
+
+@test "a directory change the guard cannot order before a push refuses the push, wherever it sits on the line" {
+  make_repo
+  other_checkout
+  # Run from WT, where lane1 is not the default: each line changes to OTHER, where it is, before the push runs.
+  for cmd in "eval 'cd $OTHER' && git push origin lane1:lane1" "eval \"cd $OTHER\"; git push origin lane1:lane1" \
+    "env -C $OTHER bash -c 'git push origin lane1:lane1'" "env --chdir $OTHER sh -c 'git push origin lane1:lane1'" \
+    "sudo -D$OTHER git push origin lane1:lane1" "GIT_DIR=$OTHER/.git bash -c 'git push origin lane1:lane1'" \
+    "true && cd $OTHER && git push origin lane1:lane1" "builtin cd $OTHER; git push origin lane1:lane1" \
+    "\$CD $OTHER; git push origin lane1:lane1"; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  # Run from OTHER: the directory change happens in a child shell, a subshell, a pipeline or after the push.
+  for cmd in "bash -c 'git push origin lane1:lane1'; cd $WT" "eval 'git push origin lane1:lane1'; cd $WT" \
+    "(cd $WT); git push origin lane1:lane1" "cd $WT | cat; git push origin lane1:lane1" \
+    "cd $WT & git push origin lane1:lane1" "bash -c 'cd $WT'; git push origin lane1:lane1"; do
+    bash_denied sid-lane1 "$cmd" "$OTHER" || return 1
+  done
+  run_guard lead-only "$(bash_input sid-lane1 "eval 'cd $OTHER' && git push origin lane1:lane1" "$WT")"
+  assert_denied "git -C <your-worktree> push"
+}
+
+@test "a leading cd to a literal absolute path joined by && sets the checkout for the whole line" {
+  make_repo
+  other_checkout
+  bash_untouched sid-lane1 "cd $WT && git push origin lane1:lane1" "$OTHER"
+  bash_untouched sid-lane1 "cd -P $WT && bash -c 'git push origin lane1:lane1'" "$OTHER"
+  bash_denied sid-lane1 "cd $OTHER && git push origin lane1:lane1" "$WT"
+  # A failed cd before ";" leaves the push in the session directory; a relative path may resolve through CDPATH.
+  bash_denied sid-lane1 "cd $WT; git push origin lane1:lane1" "$OTHER"
+  bash_denied sid-lane1 "cd wt-lane1 && git push origin lane1:lane1" "$LANES_TEST_TMP"
+  # The shell resolves ".." against the link's own path, git -C against its target: here OTHER for the shell, WT for git.
+  mkdir "$WT/sub"
+  ln -s "$WT/sub" "$OTHER/lnk"
+  bash_denied sid-lane1 "cd $OTHER/lnk/.. && git push origin lane1:lane1" "$WT"
+}
+
+@test "a git config prefix on a wrapper or shell still refuses the plain form inside it" {
+  make_repo
+  for cmd in "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream bash -c 'git push origin lane1'" \
+    "GIT_CONFIG_GLOBAL=/tmp/g eval 'git push origin lane1'" "GIT_CONFIG_PARAMETERS=x env -S 'git push origin lane1'"; do
+    bash_denied sid-lane1 "$cmd" "$WT" || return 1
+  done
+  bash_untouched sid-lane1 "GIT_CONFIG_GLOBAL=/tmp/g bash -c 'git push origin lane1:lane1'" "$WT"
+}
+
 @test "a separator form cannot hide a matching command" {
   for cmd in 'echo ok && gh pr merge 12' 'echo ok; gh pr merge 12' 'false || gh pr merge 12' 'echo ok | gh pr merge 12' \
     'sleep 1 & gh pr merge 12' $'echo ok\ngh pr merge 12' '(gh pr merge 12)' '{ gh pr merge 12; }' \
@@ -336,6 +406,17 @@ load helper
     'echo 12 | xargs gh pr merge' 'echo 12 | xargs -n1 gh pr merge' 'echo "pr merge 12" | xargs gh' '/usr/bin/gh pr merge 12' \
     'nice -n 5 gh pr merge 12'; do
     bash_denied sid-lane1 "$cmd" || return 1
+  done
+}
+
+@test "a wrapper option in a form the guard does not parse exactly cannot hide a matching command" {
+  for cmd in "env -S'gh pr merge 12'" "env --split-string='gh pr merge 12'" "env -iS 'gh pr merge 12'" \
+    "env --split 'gh pr merge 12'" 'env -iu HOME gh pr merge 12' 'sudo -Eu root gh pr merge 12' \
+    'xargs -0n1 gh pr merge </dev/null' "env -vS'bash -c \"gh pr merge 12\"'"; do
+    bash_denied sid-lane1 "$cmd" || return 1
+  done
+  for cmd in "env -S'echo ok'" 'env -iu HOME ls' 'timeout --preserve-status 5 ls'; do
+    bash_untouched sid-lane1 "$cmd" || return 1
   done
 }
 

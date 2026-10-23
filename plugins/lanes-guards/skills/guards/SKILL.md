@@ -10,7 +10,7 @@ rephrase the command to get past the guard.
 
 - `lead-only`: from a lane, a Bash command matching `lead_only_commands` (default `gh workflow run`, `gh pr merge`, and
   every `git push` but `git [-C <dir>] push [-u] [--force-with-lease[=...]] <remote> <branch>` with one non-default
-  branch, plain or as `<name>:<name>`).
+  branch, plain or as `<name>:<name>`, after at most one leading `cd <absolute path> &&`).
 - `plan-message`: from a lane, a `SendMessage` that starts with the plan marker (default `PLAN:`).
 - `main-edit`: Edit, Write or NotebookEdit on a path in the main checkout while lanes work in linked worktrees.
 
