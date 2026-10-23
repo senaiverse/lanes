@@ -12,9 +12,9 @@ wiped, and carries on from that note.
 lanes is a plugin marketplace for [Claude Code](https://code.claude.com/docs), Anthropic's coding assistant for the
 terminal. It runs several Claude sessions side by side in tmux and keeps their work on track.
 
-> **Status: v0.1 in progress.** Today you can install `lanes-plancheck`. The core plugin and the other pieces are
-> built and under review, and they are marked "coming in v0.1" below. This README says "v0.1 preview" wherever a
-> description depends on a piece that is not released yet.
+> **Status: v0.1 in progress.** Today you can install `lanes-plancheck`, `lanes-jobs`, `lanes-review` and
+> `lanes-prodfence`. The core plugin (`lanes`), `lanes-guards` and `lanes-waves` are marked "coming in v0.1" below.
+> This README says "v0.1 preview" wherever a description depends on a piece that is not released yet.
 
 ## Contents
 
@@ -111,7 +111,7 @@ lanes gives AI sessions that same routine.
 - **tmux only.** lanes sends `/clear` and the goal to a session by typing into its tmux pane.
 - **Linux, macOS and WSL.** On native Windows, only `lanes-plancheck` is supported, through Git Bash (Git for
   Windows), which is what Claude Code uses to run hooks there. CI runs its suite on Windows. Everything that needs tmux
-  needs WSL on Windows.
+  needs WSL on Windows, and so does `lanes-prodfence`, whose hooks run a Bash script.
 - **Bash 4+ and jq.** Every script runs on Bash and jq only. macOS ships Bash 3.2, so run `brew install bash` first.
 - **The guards are mistake guards, not a sandbox.** They refuse a lane that runs a lead-only command, and they say
   why. A determined session can still reach around them. The reviewer agent is instructed not to edit, and it is not
@@ -163,8 +163,9 @@ core reads `lanes@lanes`. Requirements: tmux, jq and Bash 4+.
 # Optional, pick what you need
 /plugin install lanes-guards@lanes      # lead-only commands and plans; needs the core (coming in v0.1)
 /plugin install lanes-waves@lanes       # release waves; needs the core (coming in v0.1)
-/plugin install lanes-jobs@lanes        # long commands in a tmux job pool; works alone (coming in v0.1)
-/plugin install lanes-review@lanes      # adversarial reviewer agent; works alone (coming in v0.1)
+/plugin install lanes-jobs@lanes        # long commands in a tmux job pool; works alone (available now)
+/plugin install lanes-review@lanes      # adversarial reviewer agent; works alone (available now)
+/plugin install lanes-prodfence@lanes   # production fence; works alone (available now)
 /plugin install lanes-plancheck@lanes   # plan field checker; works alone (available now)
 ```
 
@@ -173,21 +174,25 @@ core reads `lanes@lanes`. Requirements: tmux, jq and Bash 4+.
 | `lanes` | The core. The journal template, the clear handshake, the lead and lane skills, session registry, `lanes-statusline`. | Required for the lead and lane workflow | Coming in v0.1 |
 | `lanes-guards` | Three guards: only the lead dispatches CI, merges and pushes to the default branch; only the lead sends plan messages; no edits in the main checkout. | Optional, needs `lanes` | Coming in v0.1 |
 | `lanes-waves` | Release waves: theme branches, one integration branch, review PRs by area, one merge. | Optional, needs `lanes` | Coming in v0.1 |
-| `lanes-jobs` | `lanes-job`: run a long command in a pooled tmux window and read the result from a STATUS file. | Optional, works alone | Coming in v0.1 |
-| `lanes-review` | An adversarial reviewer agent for a branch range or a pull request. Instructed not to edit; not sandboxed. | Optional, works alone | Coming in v0.1 |
+| `lanes-jobs` | `lanes-job`: run a long command in a pooled tmux window and read the result from a STATUS file. | Optional, works alone | Available |
+| `lanes-review` | An adversarial reviewer agent for a branch range or a pull request. Instructed not to edit; not sandboxed. | Optional, works alone | Available |
+| `lanes-prodfence` | The production fence: refuses any session's tool call that mentions a configured production marker or protected path, so only the human acts on production. A mistake fence, not a sandbox. | Optional, works alone | Available |
 | `lanes-plancheck` | `lanes-plancheck`: checks that a plan file carries its required fields before a lane builds it. | Optional, works alone | Available |
-| `lanes-ci` | A CI watcher and the journal drift check. | Optional | Planned for v0.1 |
 
 A plugin marked "coming" is not in the marketplace yet, and its install command fails until it lands.
 
+There is no CI-watcher plugin. Watching CI runs, review scores, lane fill levels and journal drift is a set of
+instructions in the core's lead skill (`MONITORS.md`, coming with the core). Code stays only where something is
+enforced, holds state or acts on a session.
+
 <details>
-<summary>Setup the core needs (v0.1 preview: coming with the <code>lanes</code> plugin)</summary>
+<summary>Setup the core needs (v0.1 preview: the <code>/lanes:setup</code> skill, coming with the <code>lanes</code> plugin)</summary>
 
 A plugin cannot set your status line (checked in `docs/M0-FINDINGS.md`, question 1). The core therefore asks you to
 wire two things yourself.
 
 1. **The status line.** The lead reads each lane's fill level from the status line data
-   (`context_window.used_percentage`). `lanes init` prints the exact `statusLine` block to add to your Claude Code
+   (`context_window.used_percentage`). The `/lanes:setup` skill prints the exact `statusLine` block to add to your Claude Code
    settings. It points at `lanes-statusline`, which records the fill level and prints a status line.
 2. **Named sessions.** Start every session with a name:
 
@@ -198,7 +203,7 @@ wire two things yourself.
    The name is how lanes and Claude Code's own messaging address a session. It survives `/clear`. A session started
    without `--name` gets a generated name that lanes cannot rely on.
 
-`lanes init` also writes the journal template into `.lanes/` and offers to add `@.lanes/RULES.md` to your
+`/lanes:setup` also writes the journal template into `.lanes/` and offers to add `@.lanes/RULES.md` to your
 `CLAUDE.md`. It asks first, and it never overwrites a file.
 
 </details>
@@ -210,7 +215,7 @@ wire two things yourself.
 - **jq.**
 - **Bash 4 or later.** macOS ships Bash 3.2. Install a newer one with `brew install bash`. Each lanes script checks the
   version first and stops with a one-line message if it is too old.
-- **git**, and `gh` if you use `lanes-waves`, `lanes-ci` or `lanes-review` with pull requests.
+- **git**, and `gh` if you use `lanes-waves` or `lanes-review` with pull requests.
 - **Claude Code 2.1.224 or later.**
 - Linux, macOS, or WSL. On native Windows, only `lanes-plancheck`, through Git for Windows (its Git Bash ships Bash
   5 and jq).
@@ -329,8 +334,8 @@ release.
 
 ## Contributing
 
-Run `scripts/test.sh` before a push. Run `scripts/install-hooks.sh` once per clone: it installs a pre-push hook that
-runs the private word check (`scripts/deny-gate.sh`; CI does not run it).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and [`SCOPE.md`](SCOPE.md) for what lanes takes and what it
+does not. Run `scripts/test.sh` before a push.
 
 Decisions live in [`docs/DECISIONS.md`](docs/DECISIONS.md), the build order in
 [`docs/PLAN-v0.1.md`](docs/PLAN-v0.1.md), and the shared conventions in
