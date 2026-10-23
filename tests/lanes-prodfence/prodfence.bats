@@ -343,6 +343,31 @@ refute_leaks() {
   done
 }
 
+# guard_on_socket <stdin>: runs the guard with stdin connected to a UNIX socket, as some sandboxes pass the hook input.
+guard_on_socket() {
+  command -v python3 >/dev/null 2>&1 || skip "python3 is absent, so this test cannot connect stdin to a socket"
+  run --separate-stderr python3 -I -c '
+import socket, subprocess, sys
+ours, theirs = socket.socketpair()
+ours.sendall(sys.argv[2].encode())
+ours.shutdown(socket.SHUT_WR)
+p = subprocess.run([sys.argv[1], "guard"], stdin=theirs, capture_output=True)
+sys.stdout.buffer.write(p.stdout)
+sys.stderr.buffer.write(p.stderr)
+sys.exit(p.returncode)
+' "$BIN" "$1"
+}
+
+@test "hook input on a socket gets the same verdict as on a pipe" {
+  default_config
+  guard_on_socket "$(bash_input "ls")"
+  assert_allowed
+  guard_on_socket "$(bash_input "psql -h $MARKER")"
+  assert_denied
+  guard_on_socket "not json"
+  assert_failure 2
+}
+
 @test "a file tool input without a path is refused with exit 2" {
   default_config
   guard "$(hook_input Write '{"content":"x"}')"
