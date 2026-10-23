@@ -8,7 +8,7 @@ job.
 
 - **One watcher per signal:** CI, review score, lane context, journal drift. Never chain two waits in one script.
 - **Endless and complete:** each pass re-reads the whole set (every open PR, every registered lane), and the loop never
-  exits on an event.
+  exits on an event. `gh pr list` returns 30 items by default, so every call passes `--limit 1000`.
 - **Changes only:** the pass pipes `<item><TAB><state>` lines into `lanes monitor-diff <name>`, which prints only the
   items whose state changed and keeps the last set under the lanes data dir (`monitors/<name>.state`).
 - **One instance per name:** the loop starts with `lanes monitor-lock <name> $$`, which refuses a second start while
@@ -48,7 +48,7 @@ Define `pass` above the loop, as a function, from one of the four sections that 
 ## 1. CI runs (name `ci`, every 60 s)
 
 ```bash
-pass() { gh pr list --state open --json number,headRefOid,statusCheckRollup --jq '.[] | "#\(.number)\t\(.headRefOid[0:7]) \(
+pass() { gh pr list --state open --limit 1000 --json number,headRefOid,statusCheckRollup --jq '.[] | "#\(.number)\t\(.headRefOid[0:7]) \(
   [.statusCheckRollup[] | (.conclusion // .state // .status // "") | ascii_downcase] |
   if length == 0 then "no checks" elif any(. == "failure" or . == "error" or . == "timed_out" or . == "cancelled")
   then "failing" elif all(. == "success" or . == "skipped" or . == "neutral") then "passed" else "running" end)"'; }
@@ -64,7 +64,7 @@ A bot such as Greptile edits its summary comment in place, so a new comment's `c
 `submittedAt` does; watch that. Replace `greptile` with your bot's login.
 
 ```bash
-pass() { gh pr list --state open --json number,reviews --jq '.[] | "#\(.number)\t\(
+pass() { gh pr list --state open --limit 1000 --json number,reviews --jq '.[] | "#\(.number)\t\(
   [.reviews[] | select(.author.login | test("greptile"; "i"))] | last |
   if . == null then "no review" else "\(.state) at \(.submittedAt)" end)"'; }
 ```

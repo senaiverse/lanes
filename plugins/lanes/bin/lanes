@@ -94,9 +94,9 @@ plugin_root() {
 # ---- locks: a symlink whose target "<pid>.<nonce>" names its holder ----------------------------------------------
 
 # lock_take <path> <wait seconds> [holder pid]: ln -s creates the lock atomically with its holder in it, so it is never
-# seen half-written; a dead holder's lock is broken (lock_break). Sets LOCK_MINE, the target to release with.
-# A dead holder whose pid was reused looks alive, so the lock then refuses (fails safe) until its link is removed.
-# Every attempt counts, a break included, so the acquire ends after at most <wait> * 10 + 1 attempts.
+# seen half-written, and sets LOCK_MINE, the target to release with; a dead holder's lock is broken (lock_break), and
+# one whose pid was reused looks alive, so the lock refuses (fails safe). Every attempt counts, a break included, so
+# the acquire ends after at most <wait> * 10 + 1 attempts.
 LOCK_MINE=""
 lock_take() {
   local path="$1" tries=0 limit=$(($2 * 10 + 1)) seen

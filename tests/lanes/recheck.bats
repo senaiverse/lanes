@@ -335,3 +335,35 @@ shim_on_keys() {
   run submitted /clear
   assert_output 0
 }
+
+# shim_key_after_verify <keys>: a tmux shim that, once /clear has been typed, waits for the next screen read (the
+# arrival check) and then types <keys> into the pane, as a human would, before the last check and Enter.
+shim_key_after_verify() {
+  local typed="$LANES_TEST_TMP/typed" done="$LANES_TEST_TMP/human-typed"
+  mkdir -p "$LANES_TEST_TMP/shim"
+  cat >"$LANES_TEST_TMP/shim/tmux" <<SHIM
+#!/usr/bin/env bash
+"$(command -v tmux)" "\$@"
+rc=\$?
+[[ " \$* " == *"-l -- /clear"* ]] && : >"$typed"
+if [[ " \$* " == *" capture-pane "* && -f "$typed" && ! -f "$done" ]]; then
+  : >"$done"
+  "$(command -v tmux)" -L "$LANES_TMUX_SOCKET" send-keys -t "$PANE" -l -- "$1"
+  sleep 0.3
+fi
+exit \$rc
+SHIM
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+@test "a human key added after the arrival check stops Enter, and the human's text is never erased" {
+  ready_lane alpha
+  shim_key_after_verify "x"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run "$LANES" clear alpha
+  assert_failure
+  assert_output --partial "the input line changed"
+  run submitted /clear
+  assert_output 0
+  run bash -c "tmux -L '$LANES_TMUX_SOCKET' capture-pane -p -t '$PANE' | grep -c $'^❯ /clearx\$'"
+  assert_output 1
+}

@@ -196,9 +196,10 @@ activity_moved() {
     else empty end'
 }
 
-# send_guard <lane> <pane>: why nothing may be typed or submitted now, or nothing. The caller sets GUARD_SID (the
-# session the pane must still belong to), GUARD_SIG (the activity snapshot) and GUARD_READY (1: the clear-ready proof
-# must still hold). It runs before typing, before Enter and before a retried Enter.
+# send_guard <lane> <pane> [input]: why nothing may be typed or submitted now, or nothing. The caller sets GUARD_SID
+# (the session the pane must still belong to), GUARD_SIG (the activity snapshot) and GUARD_READY (1: the clear-ready
+# proof must still hold); before an Enter, <input> is the text the input line must hold exactly, so a human's added
+# keys are never submitted.
 GUARD_SID="" GUARD_SIG="" GUARD_READY=0
 send_guard() {
   local why
@@ -208,15 +209,29 @@ send_guard() {
     [[ -z "$why" ]] || why="$why since clear-ready"
   fi
   [[ -n "$why" ]] || why="$(activity_moved "$1" "$GUARD_SIG")"
-  [[ -n "$why" ]] || { screen_read "$2"; why="$VETO"; }
+  if [[ -z "$why" ]]; then
+    screen_read "$2"
+    why="$VETO"
+    if [[ -z "$why" && $# -ge 3 && "$(squash "$COMPOSER")" != "$(squash "$3")" ]]; then
+      why="the input line changed after it was checked (it now shows '${COMPOSER:0:60}')"
+    fi
+  fi
   printf '%s' "$why"
+}
+
+# erase_if_ours <pane> <text>: delete our typed text only while the input line holds exactly it; text someone added
+# is never deleted, so the line is then left as it is.
+erase_if_ours() {
+  screen_read "$1"
+  [[ "$(squash "$COMPOSER")" == "$(squash "$2")" ]] && erase_typed "$1" "$2"
+  return 0
 }
 
 squash() { printf '%s' "${1//[[:space:]]/}"; }
 
 # submit <lane> <pane> <text> <confirm cmd...>: type the line and prove it arrived, then press Enter and confirm the
 # effect; a lost Enter (text still in the input line) gets one more press, then 1. send_guard runs before typing and
-# before every Enter; when it objects, the typed text is deleted and 2 is returned with MOVED set.
+# before every Enter; when it objects, 2 is returned with MOVED set, and our typed text is deleted if it is still alone.
 submit() {
   local lane="$1" pane="$2" text="$3"
   shift 3
@@ -237,18 +252,18 @@ submit() {
     fi
     die "typed text did not arrive intact (input line shows '${COMPOSER:0:60}')" "look at pane $pane; nothing was submitted and the input line was left as it is"
   fi
-  MOVED="$(send_guard "$lane" "$pane")"
+  MOVED="$(send_guard "$lane" "$pane" "$text")"
   if [[ -n "$MOVED" ]]; then
-    erase_typed "$pane" "$text"
+    erase_if_ours "$pane" "$text"
     return 2
   fi
   tm send-keys -t "$pane" Enter
   "$@" && return 0
   screen_read "$pane"
   if [[ "$(squash "$COMPOSER")" == "$(squash "$text")" ]]; then
-    MOVED="$(send_guard "$lane" "$pane")"
+    MOVED="$(send_guard "$lane" "$pane" "$text")"
     if [[ -n "$MOVED" ]]; then
-      erase_typed "$pane" "$text"
+      erase_if_ours "$pane" "$text"
       return 2
     fi
     echo "lanes: Enter was not taken for '${text:0:20}'; pressing it once more" >&2

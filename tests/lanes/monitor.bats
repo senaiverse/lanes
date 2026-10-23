@@ -77,3 +77,10 @@ MD="$BATS_TEST_DIRNAME/../../plugins/lanes/skills/lead"
   grep -q 'lanes monitor-lock "$name" \$\$' "$MD/MONITORS.md"
   for w in ci reviews context drift; do grep -q "(name \`$w\`" "$MD/MONITORS.md"; done
 }
+
+@test "MONITORS.md: every gh pr list call fetches the whole set, not the default 30" {
+  run bash -c "grep -o 'gh pr list[^|]*' '$MD/MONITORS.md' | grep -vc -- '--limit 1000'"
+  assert_output 0
+  run bash -c "grep -c 'gh pr list' '$MD/MONITORS.md'"
+  refute_output 0
+}
