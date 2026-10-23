@@ -41,24 +41,46 @@ setup_lane() {
   assert_output false
 }
 
-@test "clear-ready records the transcript and the turns it shows begun: prompts and goal verdicts, not tool results" {
+@test "clear-ready records the transcript and the tool calls it shows: assistant tool_use blocks by id, nothing else" {
   make_repo
   write_resume alpha
   t="$LANES_TEST_TMP/transcript.jsonl"
   {
     echo '{"type":"user","message":{"role":"user","content":"a prompt"}}'
-    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}'
-    echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"done"}]}}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}'
+    echo '{"type":"api-request-blob","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_use","id":"blob"}]}}'
+    echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}'
     echo '{"type":"attachment","attachment":{"type":"goal_status","met":false,"sentinel":true,"condition":"c"}}'
-    echo '{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"c","reason":"not yet"}}'
-    echo '{"type":"attachment","attachment":{"type":"goal_status","met":true,"condition":"c","reason":"done"}}'
-    printf '{"type":"user","message":'
+    printf '{"type":"assistant","message":'
   } >"$t"
   hook_json SessionStart s1 alpha startup | jq -c --arg t "$t" '.transcript_path = $t' | TMUX_PANE=%7 "$LANES" register >/dev/null
   run "$LANES" clear-ready --lane alpha
   assert_success
-  run state alpha '.handshake | [.transcript, .turns] | join("|")'
+  run state alpha '.handshake | [.transcript, .tools] | join("|")'
   assert_output "$t|2"
+}
+
+@test "clear-ready refuses a lane whose transcript is unset or unreadable, since lanes clear could never prove it unchanged" {
+  make_repo
+  write_resume alpha
+  hook_json SessionStart s1 alpha startup | jq -c 'del(.transcript_path)' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  run "$LANES" clear-ready --lane alpha
+  assert_failure
+  assert_output --partial "not clear-ready: lane alpha has no transcript recorded"
+  run reg alpha .clear_ready
+  assert_output false
+  t="$LANES_TEST_TMP/locked.jsonl"
+  echo '{}' >"$t"
+  chmod 000 "$t"
+  hook_json SessionStart s1 alpha startup | jq -c --arg t "$t" '.transcript_path = $t' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  run "$LANES" clear-ready --lane alpha
+  chmod 600 "$t"
+  assert_failure
+  assert_output --partial "the transcript '$t' of lane alpha cannot be read"
+  run bash -c "jq -r '.handshake.state // \"none\"' '$LANES_DATA_DIR/lanes/state/alpha.json'"
+  assert_output none
 }
 
 @test "a RESUME check that crashes (its character count killed) is a refusal, never ready" {
@@ -185,7 +207,7 @@ second line"
   make_repo
   write_resume alpha
   mkdir -p "$LANES_TEST_TMP/start"
-  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  hook_json SessionStart s1 alpha startup | jq -c --arg c "$LANES_TEST_TMP/start" '.cwd = $c' | TMUX_PANE=%7 "$LANES" register >/dev/null
   run bash -c "cd '$WORK/.lanes' && '$LANES' clear-ready --lane alpha"
   assert_success
   run state alpha .handshake.worktree
@@ -204,7 +226,7 @@ second line"
 # HEAD), so its registry cwd has a different journal.
 register_in_start() {
   git -C "$WORK" worktree add -q --detach "$LANES_TEST_TMP/start" "${1:-HEAD}"
-  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  hook_json SessionStart s1 alpha startup | jq -c --arg c "$LANES_TEST_TMP/start" '.cwd = $c' | TMUX_PANE=%7 "$LANES" register >/dev/null
 }
 
 start_elsewhere() {
@@ -267,7 +289,7 @@ start_elsewhere() {
 #!/usr/bin/env bash
 if [[ " \$* " == *" status --porcelain"* && ! -f "$LANES_TEST_TMP/took" ]]; then
   : >"$LANES_TEST_TMP/took"
-  jq -nc --arg c "$WORK" '{session_id:"s2",session_title:"alpha",cwd:\$c,source:"startup"}' | TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
+  jq -nc --arg c "$WORK" --arg tp "$LANES_TEST_TMP/transcripts/s2.jsonl" '{session_id:"s2",session_title:"alpha",cwd:\$c,source:"startup",transcript_path:\$tp}' | TMUX_PANE=%7 "$LANES" register >/dev/null 2>&1
 fi
 exec "$(command -v git)" "\$@"
 EOS

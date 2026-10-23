@@ -16,19 +16,21 @@ not here. The lead and lane skills say how to follow these rules; this file says
    percentage is not "safe": ask the lane.
 6. **Clear handshake.** The lead runs `lanes request <lane>` and messages the lane. The lane finishes the change in
    hand, rewrites its RESUME block, commits and pushes, runs `lanes clear-ready` from its work tree, tells the lead
-   "clear-ready", and stops; in a turn its `/goal` starts after that, it only runs `lanes clear-ready` again and
-   answers "clear-ready", since any later turn cancels the readiness. The lead then runs `lanes clear <lane>`.
+   "clear-ready", and stops; every later turn (its `/goal` going on, a notification) it answers "clear-ready" with no
+   tool call at all, never `lanes clear-ready` again, since any tool call cancels the readiness. The lead then runs
+   `lanes clear <lane>`, which refuses until a lane that worked again reports clear-ready again.
    `/clear` removes an active goal, so `lanes clear` types `/clear`, then the RESUME Goal, the one source of the goal
    after a clear: keep it equal to the goal you work toward. The goal is typed only while nobody has used the new
    session. A lead runs request, clear and goal only on the lanes of its own project, never on a lead.
 7. **A refusal is an answer.** `lanes clear-ready` and `lanes clear` refuse unless the tree and the lane's own journal
    files are clean and pushed, the RESUME block is valid and the block itself was rewritten and committed since the
-   request, the lane runs no background shell, Monitor or subagent (on `lanes clear`), and the lane is idle, began no
-   turn and is unchanged since clear-ready. Fix the named cause; never retry blindly and never send `/clear` by hand
+   request, the lane runs no background shell, Monitor or subagent (on `lanes clear`), and the lane is idle, called no
+   tool and is unchanged since clear-ready. Fix the named cause; never retry blindly and never send `/clear` by hand
    around a refusal.
 8. **Idle comes from Claude Code.** Busy, idle, waiting and a running background shell come from the session's own
    state file, never from screen text or a hook count; a lane is idle only once it stayed idle for a short gap. The
-   screen is read for one fact only: a human's draft in the input line, which is never typed over.
+   screen is read only for the input line (a human's draft, never typed over, and whether lanes' own typed text
+   arrived) and, in vim mode, the `-- INSERT --` footer.
 9. **Done report.** A finished unit moves from `next-<lane>.md` to `done-<lane>.md` in the done-report form. The lead
    accepts it only after reading the full diff.
 10. **Asking the human.** Only the lead asks the human, through the ask tool: one question, its facts and costs, the

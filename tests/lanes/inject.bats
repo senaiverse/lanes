@@ -76,8 +76,8 @@ clear_context() { clear_output | jq -r .hookSpecificOutput.additionalContext; }
 
 @test "max block plus max goal: the Goal is not repeated and the context stays under 10,000 characters" {
   make_repo
-  goal="$(printf 'g%.0s' $(seq 1 4000))"
-  write_resume alpha "$goal" "$(printf 'y%.0s' $(seq 1 3700))"
+  goal="$(printf 'g%.0s' $(seq 1 1400))"
+  write_resume alpha "$goal" "$(printf 'y%.0s' $(seq 1 6300))"
   register_lane alpha s1 %7 >/dev/null
   ctx="$(clear_context)"
   [[ "$ctx" == *"### Next step"* ]]
@@ -112,4 +112,78 @@ clear_context() { clear_output | jq -r .hookSpecificOutput.additionalContext; }
   ctx="$(clear_context)"
   [ "$(jq -Rs length <<<"$ctx")" -le 10000 ]
   [[ "$ctx" == *"Read that file now"* ]]
+}
+
+# moved_lane <state>: alpha's session started in $LANES_TEST_TMP/start (a worktree whose RESUME Goal is "start goal"),
+# while its handshake record, in <state> for session s1, names $WORK (Goal "work goal") as the work tree it proved.
+moved_lane() {
+  make_repo
+  write_resume alpha "work goal"
+  git -C "$WORK" worktree add -q -b start "$LANES_TEST_TMP/start"
+  (WORK="$LANES_TEST_TMP/start" && git -C "$WORK" push -q -u origin start && write_resume alpha "start goal")
+  jq -nc --arg c "$LANES_TEST_TMP/start" --arg tp "$LANES_TEST_TMP/t.jsonl" \
+    '{session_id:"s1",session_title:"alpha",cwd:$c,source:"startup",transcript_path:$tp}' | TMUX_PANE=%7 "$LANES" register >/dev/null
+  local f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq -c --arg w "$WORK" --arg st "$1" '.handshake = {state: $st, session_id: "s1", worktree: $w}' "$f" >"$f.x" && mv "$f.x" "$f"
+}
+clear_from_start() {
+  jq -nc --arg c "$LANES_TEST_TMP/start" '{session_id:"s2",session_title:"alpha",cwd:$c,source:"clear"}' |
+    TMUX_PANE=%7 "$LANES" register 2>/dev/null | jq -r .hookSpecificOutput.additionalContext
+}
+
+@test "the /clear lanes typed (record sending) injects the RESUME of the work tree clear-ready proved" {
+  moved_lane sending
+  run clear_from_start
+  assert_output --partial "$WORK/.lanes/next-alpha.md"
+  assert_output --partial $'### Goal\nwork goal'
+}
+
+@test "a human /clear after a done handshake injects the RESUME of the session's own cwd, not the handshake's work tree" {
+  moved_lane done
+  run clear_from_start
+  assert_output --partial "$LANES_TEST_TMP/start/.lanes/next-alpha.md"
+  assert_output --partial $'### Goal\nstart goal'
+  refute_output --partial "work goal"
+}
+
+@test "a lane name that moved to another project never injects the old project's RESUME: the new cwd's is read" {
+  local a="$LANES_TEST_TMP/A" b="$LANES_TEST_TMP/B" p
+  for p in "$a" "$b"; do git init -q -b main "$p" && mkdir -p "$p/.lanes"; done
+  printf '<!-- lanes:resume:start -->\n### Goal\nPROJECT A GOAL\n### Now\nA\n### Next step\nforce-push A\n### Links\nx\n### Running\nx\n### Suggested skills\nx\n<!-- lanes:resume:end -->\n' >"$a/.lanes/next-alpha.md"
+  start() { jq -nc --arg s "$1" --arg c "$2" --arg src "$3" '{session_id:$s,session_title:"alpha",cwd:$c,source:$src,transcript_path:"/nonexistent"}' | "$LANES" register; }
+  start sA "$a" startup >/dev/null
+  # The record a finished handshake in project A leaves behind.
+  jq -nc --arg w "$a" '{session_id:"sA",prompts:0,handshake:{state:"done",worktree:$w}}' >"$LANES_DATA_DIR/lanes/state/alpha.json"
+  start sB "$b" startup >/dev/null
+  run reg alpha .cwd
+  assert_output "$b"
+  ctx="$(start sB2 "$b" clear | jq -r .hookSpecificOutput.additionalContext)"
+  run echo "$ctx"
+  assert_output --partial "No RESUME block was found at $b/.lanes/next-alpha.md"
+  refute_output --partial "PROJECT A GOAL"
+}
+
+@test "a sending record whose work tree is in another project than the lane's is not read: the session's cwd is" {
+  moved_lane sending
+  local other="$LANES_TEST_TMP/other"
+  git init -q -b main "$other"
+  local f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq -c --arg w "$other" '.handshake.worktree = $w' "$f" >"$f.x" && mv "$f.x" "$f"
+  run clear_from_start
+  assert_output --partial "$LANES_TEST_TMP/start/.lanes/next-alpha.md"
+}
+
+@test "a session that takes the name from one proven gone starts a fresh handshake record" {
+  make_repo
+  write_resume alpha
+  start_fake alpha
+  local f="$LANES_DATA_DIR/lanes/state/alpha.json"
+  jq -c --arg w "$WORK" '.handshake = {state: "sending", session_id: "old", worktree: $w}' "$f" >"$f.x" && mv "$f.x" "$f"
+  kill -9 "$FAKE_PID"
+  wait_for "fake gone" bash -c "! kill -0 $FAKE_PID 2>/dev/null"
+  hook_json SessionStart other-session alpha clear | TMUX_PANE=%99 "$LANES" register >/dev/null 2>&1
+  run state alpha '.handshake // "none"'
+  assert_output none
+  run state alpha .session_id
+  assert_output other-session
 }

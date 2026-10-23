@@ -404,6 +404,26 @@ SessionStart clear"
   wait_st '^idle' 90
 }
 
+@test "clear-ready during a goal loop that calls no tool: the loop hands control back, and lanes clear lands" {
+  wait_st '^idle' 20
+  type_line "/goal you have replied tick in fifty separate turns; reply only tick, never use tools"
+  wait_st '^busy' 10
+  # The lane reports ready inside the loop; every later goal turn is answered with no tool call.
+  run bash -c 'cd "$1" && "$2" clear-ready --lane lanes-live' _ "$LIVE_DIR" "$LANES"
+  assert_success
+  tools="$(jq -r .handshake.tools "$LANES_DATA_DIR/lanes/state/lanes-live.json")"
+  wait_st '^idle' 180 || { key Escape; false; }
+  tp="$(jq -r .handshake.transcript "$LANES_DATA_DIR/lanes/state/lanes-live.json")"
+  run bash -c 'source "$1"; tool_uses "$2"' _ "$LANES" "$tp"
+  note "goal loop handed back: tool calls $tools at clear-ready, $output now; goal $(bash -c 'source "$1"; goal_state "$2"' _ "$LANES" "$tp")"
+  assert_output "$tools"
+  run as_lead clear lanes-live --wait 60
+  note "lanes clear after the hand-back: status $status: $output"
+  assert_success
+  assert_output --partial "cleared: lanes-live"
+  wait_st '^idle' 90
+}
+
 @test "lanes goal with a goal of about 1000 characters lands whole, as one /goal prompt and never a paste" {
   wait_st '^idle' 20
   local long="you have replied with the single word long; reply only long, never use tools" i=0

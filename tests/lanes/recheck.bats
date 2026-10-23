@@ -426,17 +426,23 @@ BURST 3"
   assert_output stale
 }
 
-@test "the Enter retry checks again too: a tree edit after a lost Enter means no second Enter, and the message says it may land late" {
+@test "the Enter retry checks again too: a tree edit after a lost Enter means no second Enter and no erase, and the message says so" {
   ready_lane alpha FAKE_SWALLOW_ENTERS=1
   shim_on_keys " Enter" "printf 'z\\\\n' >>'$WORK/file'"
   PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
   assert_failure
   assert_output --partial "/clear was sent to $PANE once, then the tree stopped being clean"
   assert_output --partial "it may have been taken late"
+  assert_output --partial "nothing was deleted"
   run grep -c ENTER-SWALLOWED "$FAKE_LOG"
   assert_output 1
   run submitted /clear
   assert_output 0
+  # Text an Enter went to is no longer ours: no Backspace burst follows the typed /clear.
+  run bash -c "grep -c '^BURST' '$FAKE_LOG'"
+  assert_output 2
+  run composer_line
+  assert_output /clear
   # The record stays at sending, so a rerun finds out whether the /clear landed.
   run state alpha .handshake.state
   assert_output sending
@@ -511,6 +517,101 @@ replace_typed() {
   assert_output --partial "our typed text was deleted"
   wait_for "leading part deleted" pane_has 'Try "refactor'
   run submitted /clear
+  assert_output 0
+}
+
+# shim_after_typed <tmux subcommand> <n> <action>: a tmux shim that, once /clear is typed, edits the tree (so the
+# check after typing objects and our text is to be erased) and runs <action> right after the n-th call of
+# <subcommand> from then on.
+shim_after_typed() {
+  local typed="$LANES_TEST_TMP/typed" count="$LANES_TEST_TMP/after-count"
+  mkdir -p "$LANES_TEST_TMP/shim"
+  echo "$2" >"$count"
+  cat >"$LANES_TEST_TMP/shim/tmux" <<SHIM
+#!/usr/bin/env bash
+"$(command -v tmux)" "\$@"
+rc=\$?
+if [[ " \$* " == *"-l -- /clear"* && ! -f "$typed" ]]; then : >"$typed"; printf 'z\\n' >>"$WORK/file"; fi
+if [[ " \$* " == *"$1"* && -f "$typed" && -f "$count" ]]; then
+  n=\$((\$(cat "$count") - 1))
+  if ((n > 0)); then echo "\$n" >"$count"; else rm -f "$count"; $3; fi
+fi
+exit \$rc
+SHIM
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+}
+
+@test "synchronize-panes turned on while the erase waits for the screen to settle stops the erase: no Backspace is sent" {
+  ready_lane alpha
+  # The arrival check reads the screen once; the second read after typing is the erase's first, still settling.
+  shim_after_typed capture-pane 2 "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' set-window-option -t '$PANE' synchronize-panes on >/dev/null"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "our typed text was left in the input line of $PANE, because pane $PANE has synchronize-panes on"
+  run bash -c "grep -c '^BURST' '$FAKE_LOG'"
+  assert_output 1
+  run composer_line
+  assert_output /clear
+}
+
+@test "a human key typed right after the erase's pane check stops the burst: the screen is read once more and must plan the same erase" {
+  ready_lane alpha
+  shim_after_typed pane_in_mode 1 "'$(command -v tmux)' -L '$LANES_TMUX_SOCKET' send-keys -t '$PANE' -l -- X; sleep 0.3"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "the input line changed after it was read"
+  run composer_line
+  assert_output /clearX
+}
+
+@test "synchronize-panes turned on while the checks before a key run their git reads stops the key: the pane is checked last" {
+  ready_lane alpha
+  mkdir -p "$LANES_TEST_TMP/shim"
+  # The first screen read ends the wait for idle; the next read of HEAD is the clear-ready proof before the first key.
+  shim_on_capture ": >'$LANES_TEST_TMP/settled'"
+  cat >"$LANES_TEST_TMP/shim/git" <<SHIM
+#!/usr/bin/env bash
+if [[ " \$* " == *" rev-parse HEAD "* && -f "$LANES_TEST_TMP/settled" && ! -f "$LANES_TEST_TMP/synced" ]]; then
+  : >"$LANES_TEST_TMP/synced"
+  "$(command -v tmux)" -L "$LANES_TMUX_SOCKET" set-window-option -t "$PANE" synchronize-panes on >/dev/null
+fi
+exec "$(command -v git)" "\$@"
+SHIM
+  chmod +x "$LANES_TEST_TMP/shim/git"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "has synchronize-panes on"
+  [ -f "$LANES_TEST_TMP/synced" ]
+  OUT="$output"
+  still_ready "turn synchronize-panes off"
+}
+
+@test "a request landing after this clear wrote its cleared record stops the goal: nothing is typed, and the request stands" {
+  ready_lane alpha
+  register_lead
+  # The first screen read after /clear was submitted is the wait for the new session's empty input line.
+  mkdir -p "$LANES_TEST_TMP/shim"
+  cat >"$LANES_TEST_TMP/shim/tmux" <<SHIM
+#!/usr/bin/env bash
+"$(command -v tmux)" "\$@"
+rc=\$?
+if [[ " \$* " == *" capture-pane "* && ! -f "$LANES_TEST_TMP/requested" ]] && grep -q '^SUBMIT /clear' "$FAKE_LOG"; then
+  : >"$LANES_TEST_TMP/requested"
+  TMUX_PANE=%99 "$LANES" request alpha >"$LANES_TEST_TMP/request.out" 2>&1
+fi
+exit \$rc
+SHIM
+  chmod +x "$LANES_TEST_TMP/shim/tmux"
+  PATH="$LANES_TEST_TMP/shim:$PATH" run as_lead clear alpha
+  assert_failure
+  assert_output --partial "goal not sent: a new 'lanes request alpha' arrived while this command ran"
+  run cat "$LANES_TEST_TMP/request.out"
+  assert_output --partial "requested:"
+  run state alpha .handshake.state
+  assert_output requested
+  run submitted /clear
+  assert_output 1
+  run submitted /goal
   assert_output 0
 }
 

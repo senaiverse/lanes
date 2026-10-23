@@ -77,7 +77,8 @@ says to press i in its pane.
 
 Run `lanes goal <lane> "<one line>"` when a lane should work toward a new end state without losing its context: a new
 item, a narrower target, or a goal that ended early. It refuses unless you are the lead, the goal is one line of at
-most 4,000 characters, and the lane is idle (a background shell may run). It types the goal through the same checks as
+most 1,400 characters that the input line keeps as typed (HANDSHAKE.md lists the text it refuses), and the lane is
+idle (a background shell may run). It types the goal through the same checks as
 `lanes clear` and confirms it by the lane's own prompt hook; give it a Bash `timeout` of 180000 (it can wait `--wait`
 seconds and then up to 40 s for the confirmation). It sets the live goal only: ask the lane to copy it into its RESUME
 Goal, the goal a later `lanes clear` sets again. To give a lane a plain instruction, message it instead.

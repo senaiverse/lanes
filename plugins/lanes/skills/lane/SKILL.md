@@ -62,9 +62,11 @@ When the lead asks (or your own context reaches the threshold and you tell the l
 5. Leave an active `/goal` alone. You cannot clear it; the `/clear` that `lanes clear` types removes it, and
    `lanes clear` then sets your RESUME Goal.
 6. Run `lanes clear-ready` from the work tree you work in. If it refuses, fix the cause it names and run it again.
-7. Send the lead "clear-ready", then stop and wait. A new prompt, a commit, an edit or another turn after this cancels
-   the readiness. When your goal starts another turn, run `lanes clear-ready` again, answer only "clear-ready" and call
-   no other tool: after a few such turns the goal hands control back, and the lead can clear you.
+7. Send the lead "clear-ready", then stop and wait. A new prompt, a commit, an edit or any tool call after this cancels
+   the readiness. Answer every later turn (your goal going on, a notification, a message) with only "clear-ready" and
+   no tool call at all, never `lanes clear-ready` again: after a few such turns the goal hands control back, and the
+   lead can clear you. If you must work again, do it; the lead's `lanes clear` then refuses until you report
+   clear-ready again (steps 1-7).
 
 Done when `lanes clear-ready` printed `clear-ready: <lane>` and the lead has your message.
 

@@ -97,10 +97,12 @@ EOF
   git -C "$WORK" push -q
 }
 
-# hook_json <event> <session_id> <lane> [source]: the hook input Claude Code sends.
+# hook_json <event> <session_id> <lane> [source]: the hook input Claude Code sends, with a transcript path that holds
+# nothing yet (a session no one has used).
 hook_json() {
   jq -nc --arg e "$1" --arg s "$2" --arg t "$3" --arg c "$WORK" --arg src "${4:-startup}" \
-    '{hook_event_name:$e,session_id:$s,session_title:$t,cwd:$c,source:$src}'
+    --arg tp "$LANES_TEST_TMP/transcripts/$2.jsonl" \
+    '{hook_event_name:$e,session_id:$s,session_title:$t,cwd:$c,source:$src,transcript_path:$tp}'
 }
 
 # register_lane <lane> <session_id> [pane]: run the SessionStart hook as Claude Code would, with the TMUX of the test's

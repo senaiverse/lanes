@@ -28,13 +28,15 @@ DATA="${LANES_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/lanes}"
 REG="$DATA/lanes"
 STATE="$REG/state"
 
-# The one screen fact lanes still reads (Claude Code 2.1.309, tests/lanes/captures): the input line starts with `❯`
-# and a no-break space, and an empty input shows a dim placeholder. Activity comes from the sessions file instead.
+# What lanes reads from the screen (Claude Code 2.1.309, tests/lanes/captures): the input line, which starts with `❯`
+# and a no-break space (a dim placeholder when empty), and vim's `-- INSERT --` footer. Activity is the sessions file's.
 PROMPT_MARK=$'❯\xc2\xa0'
 RESUME_START='<!-- lanes:resume:start -->'
 RESUME_END='<!-- lanes:resume:end -->'
 RESUME_CAP=8000
-GOAL_CAP=4000   # the /goal condition limit (code.claude.com/docs/en/goal)
+# The longest goal proven to land whole in an 80x24 pane (2.1.309): at 1500 characters the input line scrolls off the
+# screen, so lanes cannot see that what it typed arrived; /goal itself takes 4000 (code.claude.com/docs/en/goal).
+GOAL_CAP=1400
 HOOK_CAP=10000  # additionalContext over this is replaced by a file path and a preview (hooks docs)
 REQUIRED_SECTIONS=("Goal" "Now" "Next step" "Links" "Running" "Suggested skills")
 
@@ -563,18 +565,49 @@ jq_fields() {
   unset 'FIELDS[$1]'
 }
 
-# goal_problem <text>: why the text cannot be typed as `/goal <text>`, or nothing.
+# goal_chars <text>: the first character Claude Code 2.1.309 changes at Enter, as a refusal, or nothing. It removes an
+# invisible character (default-ignorable, U+FFF9-FFFB) and then waits for a second Enter, except a joiner or variation
+# selector after a symbol (an emoji's own), and composes a combining mark into the letter before it (NFC).
+goal_chars() {
+  jq -rn --arg t "$1" '
+    def hex: [recurse(if . >= 16 then (. / 16 | floor) else empty end) | . % 16]
+      | reverse | map("0123456789ABCDEF"[.:. + 1]) | add | if length < 4 then ("000" + .)[-4:] else . end;
+    def invisible: . == 173 or . == 847 or . == 1564 or (. >= 4447 and . <= 4448) or (. >= 6068 and . <= 6069)
+      or (. >= 6155 and . <= 6159) or (. >= 8203 and . <= 8207) or (. >= 8234 and . <= 8238)
+      or (. >= 8288 and . <= 8303) or . == 12644 or (. >= 65024 and . <= 65039) or . == 65279 or . == 65440
+      or (. >= 65520 and . <= 65531) or (. >= 113824 and . <= 113827) or (. >= 119155 and . <= 119162)
+      or (. >= 917504 and . <= 921599);
+    def combining: (. >= 768 and . <= 879) or (. >= 6832 and . <= 6911) or (. >= 7616 and . <= 7679)
+      or (. >= 8400 and . <= 8447) or (. >= 65056 and . <= 65071);
+    ($t | explode) as $c
+    | first(range(0; $c | length) as $i | $c[$i] as $x
+      | if $x < 32 or ($x >= 127 and $x <= 159) then "holds a control character (U+\($x | hex))"
+        elif $x == 8232 or $x == 8233 then "holds a line or paragraph separator (U+\($x | hex)), which Enter does not submit"
+        elif ($x | invisible) and (($x == 8205 or $x == 65038 or $x == 65039) and $i > 0 and $c[$i - 1] >= 8592 | not)
+        then "holds the invisible character U+\($x | hex), which Claude Code removes at Enter instead of submitting"
+        elif $x | combining then "holds the combining mark U+\($x | hex), which Claude Code composes into the letter before it, so the goal it gets differs from the one typed"
+        else empty end) // empty'
+}
+
+# goal_problem <text>: why the text cannot be typed as `/goal <text>` and arrive as typed, or nothing. Besides
+# goal_chars, a trailing backslash makes Enter insert a newline and a last token `:` plus two or more characters
+# opens the emoji picker, whose Enter completes it (both measured on 2.1.309); an `@` token submits as typed.
 goal_problem() {
-  local n
+  local n bad
   n="$(char_count "$1")" || return 1
+  bad="$(goal_chars "$1")" || return 1
   if [[ -z "$1" ]]; then
     echo "is empty"
   elif [[ "$1" == *$'\n'* ]]; then
     echo "must be one line (it is typed as /goal, and a newline would submit it early)"
-  elif [[ "$1" == *[[:cntrl:]]* ]]; then
-    echo "holds a control character"
+  elif [[ -n "$bad" ]]; then
+    echo "$bad"
+  elif [[ "$1" == *"\\" ]]; then
+    echo "ends in a backslash, which makes Enter start a new line instead of submitting"
+  elif [[ "$1" =~ (^|[[:space:]])(:[^:[:space:]]{2,})$ ]]; then
+    echo "ends in '${BASH_REMATCH[2]}', which opens Claude Code's emoji picker, so Enter would complete it instead of submitting"
   elif ((n > GOAL_CAP)); then
-    echo "is over $GOAL_CAP characters, the /goal limit"
+    echo "is over $GOAL_CAP characters, the longest goal proven to arrive whole in an 80x24 pane"
   fi
   return 0
 }
@@ -785,7 +818,7 @@ name_holder() {
 }
 
 cmd_register() {
-  local input lane sid cwd src tp pane server rc role existing old_sid held ctx="" fresh wt down ids cpid="${CLAUDE_PID:-}" f=()
+  local input lane sid cwd src tp pane server rc role existing old_sid held ctx="" fresh taken wt down ids cpid="${CLAUDE_PID:-}" f=()
   input="$(cat || true)"
   if ! jq_fields 5 'if type == "object" then (.session_title // ""), (.session_id // ""), (.cwd // ""), (.source // ""),
     (.transcript_path // "" | tostring) else empty end' "$input"; then
@@ -846,6 +879,10 @@ cmd_register() {
   case "${LANES_ROLE:-}" in lead | lane) role="$LANES_ROLE" ;; esac
   fresh=1
   [[ -n "$existing" && "$old_sid" == "$sid" ]] && fresh=0
+  # Another process took the name (the registered one proven gone, or none recorded): its handshake belongs to a
+  # session that no longer runs, so this one starts with none.
+  taken=0
+  [[ -n "$existing" && "$(jq -r '.claude_pid // "" | tostring' <<<"$existing")" != "$cpid" ]] && taken=1
   # Beside the pane id: the caller's tmux server (caller_server; the pane id is unique only within it) and the pane's
   # pid (identity_problem), Claude Code's own pid and start time (lane_session, which proves a reused pid by it), and
   # its config dir, where its sessions file is (null: ~/.claude).
@@ -866,16 +903,19 @@ cmd_register() {
   valid_sid "$sid" && write_atomic "$DATA/sessions/$sid" "$lane"
   gc_sessions
   if ((fresh)); then
-    state_update "$lane" '
-      (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid and $src == "clear"
+    state_update "$lane" '(if $taken == 1 then del(.handshake) else . end)
+      | (if (.handshake.state // "") == "sending" and .handshake.session_id != $sid and $src == "clear"
        then .handshake.state = "cleared" | .handshake.cleared_at = $now | .handshake.cleared_session = $sid else . end)
       | .session_id = $sid | .prompts = 0 | .last_command = null | .pct_at = null' --arg sid "$sid" --arg src "$src" \
-      --argjson now "$(now)"
+      --argjson now "$(now)" --argjson taken "$taken"
   fi
   # How this session began (startup, resume, clear, compact, fork), so lanes clear tells a /clear from a restart.
   state_update "$lane" '.transcript = (if $tp == "" then null else $tp end) | .start_source = $src' --arg tp "$tp" --arg src "$src"
-  # RESUME is read from the work tree clear-ready proved, which can differ from the session's start directory.
-  wt="$(state_read "$lane" | jq -r '.handshake.worktree // ""')"
+  # After the /clear lanes typed (the record it moved to cleared just now, for this session) RESUME is read from the
+  # work tree clear-ready proved, when it is in the lane's project; after any other /clear, from the session's cwd.
+  wt="$(state_read "$lane" | jq -r --arg sid "$sid" --argjson fresh "$fresh" '.handshake // {}
+    | if $fresh == 1 and .state == "cleared" and .cleared_session == $sid then .worktree // "" else "" end')"
+  [[ -z "$wt" || "$(project_of "$wt")" == "$(project_of "$cwd")" ]] || wt=""
   mutex_drop
   if [[ "$src" == clear ]]; then
     ctx="$(resume_context "$lane" "$role" "${wt:-$cwd}")"

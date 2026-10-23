@@ -310,3 +310,18 @@ marker-gone"
   kill "$live"
   assert_output --regexp '^locked after [0-3] s$'
 }
+
+# fields <count> <filter>: jq_fields over '{}', printing its exit code and the fields it set.
+fields() { bash -c 'source "$1"; if jq_fields "$2" "$3" "{}"; then printf "ok:%s\n" "${FIELDS[*]}"; else echo "rc=$?"; fi' _ "$LANES" "$@"; }
+
+@test "jq_fields takes exactly the count asked for, and only when jq ran the whole filter" {
+  run fields 2 '1, "b"'
+  assert_output "ok:1 b"
+  run fields 2 '1, "b", 3'
+  assert_output "rc=1"
+  run fields 2 '1'
+  assert_output "rc=1"
+  # A filter that dies after printing every value it was asked for is still refused: its last "end" never came.
+  run fields 2 '1, "b", error("killed")'
+  assert_output "rc=1"
+}

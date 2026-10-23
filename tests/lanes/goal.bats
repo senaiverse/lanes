@@ -8,12 +8,12 @@ load lead
 
 submits() { grep -E '^SUBMIT ' "$FAKE_LOG" | cut -d' ' -f2- || true; }
 
-# goal_lane [VAR=value...]: a ready lane whose goal loop has run FAKE_GOAL_TURNS extra turns and given control back
-# with the goal still set.
+# goal_lane [VAR=value...]: a ready lane whose goal loop ran three turns with no tool call and gave control back with
+# the goal still set.
 goal_lane() {
   make_repo
   write_resume alpha
-  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=2 "$@"
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_NO_TOOL_TURNS=3 "$@"
   wait_for "goal loop handed back" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -eq 2 ]"
   wait_status idle
   wait_for "goal footer" pane_has '◎ /goal active'
@@ -53,17 +53,35 @@ goal_lane() {
   assert_output 1
 }
 
-@test "a goal loop that goes on after clear-ready (turns with no prompt) refuses /clear: nothing is typed" {
+@test "a goal loop that goes on after clear-ready with no tool call is cleared once it hands control back" {
   make_repo
   write_resume alpha
-  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=3 FAKE_TURN_MS=400
-  # clear-ready runs inside a goal turn, as the lane's Bash tool would run it; the loop then goes on.
-  "$LANES" clear-ready --lane alpha >/dev/null
-  n="$(grep -c '^GOAL-CONTINUE$' "$FAKE_LOG" || true)"
-  wait_for "another goal turn" bash -c "[ \$(grep -c '^GOAL-CONTINUE$' '$FAKE_LOG') -gt $n ]"
-  run as_lead clear alpha --wait 5
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_NO_TOOL_TURNS=4 FAKE_TURN_MS=400
+  # clear-ready runs inside a goal turn, as the lane's Bash tool would run it; the loop then goes on without tools.
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  run as_lead clear alpha --wait 10
+  assert_success
+  assert_output --partial "cleared: alpha"
+  run grep -c '^GOAL-CONTINUE$' "$FAKE_LOG"
+  assert_output 3
+  run grep -c '^SUBMIT /clear$' "$FAKE_LOG"
+  assert_output 1
+}
+
+@test "a goal turn that calls a tool after clear-ready refuses /clear: nothing is typed" {
+  make_repo
+  write_resume alpha
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_NO_TOOL_TURNS=2 FAKE_TURN_MS=400
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  # The next goal turn calls a tool; the loop then hands back after two turns without one.
+  : >"$FAKE_LOG.call-tools"
+  wait_for "a tool call" grep -q '^TOOL$' "$FAKE_LOG"
+  rm -f "$FAKE_LOG.call-tools"
+  run as_lead clear alpha --wait 10
   assert_failure
-  assert_output --partial "began another turn since clear-ready"
+  assert_output --partial "tool(s) since clear-ready"
   run grep -c '^BURST' "$FAKE_LOG"
   assert_output 0
   run state alpha .handshake.state
@@ -73,7 +91,7 @@ goal_lane() {
 @test "a running goal loop keeps the lane busy (one busy span), so clear waits and then refuses: nothing is typed" {
   make_repo
   write_resume alpha
-  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_TURNS=1000 FAKE_TURN_MS=60000
+  start_fake alpha FAKE_GOAL="ship A1" FAKE_GOAL_NO_TOOL_TURNS=1000 FAKE_TURN_MS=60000
   "$LANES" clear-ready --lane alpha >/dev/null
   run as_lead clear alpha --wait 2
   assert_failure
@@ -469,4 +487,56 @@ kill_after_enter() {
   [[ "$OUT" == *"stopped after pressing Enter in $PANE"*"nothing was deleted"* ]]
   run composer_squashed
   assert_output "/clear"
+}
+
+# goal_refused <text> <reason>: `lanes goal` refuses the text before anything else, naming the reason.
+goal_refused() {
+  run "$LANES" goal alpha "$1"
+  assert_failure 2
+  assert_output --partial "goal not sent: the goal $2"
+}
+# goal_ok <text>: goal_problem has no objection to the text.
+goal_ok() {
+  run bash -c 'source "$1"; goal_problem "$2"' _ "$LANES" "$1"
+  assert_success
+  assert_output ""
+}
+
+@test "goal text the input line changes at Enter is refused: a trailing backslash, an invisible character, a combining mark" {
+  goal_refused 'ship A1 \' "ends in a backslash"
+  local cp
+  for cp in 200b 202e feff ad 2060 fe0f e0041 3164 fff9; do
+    goal_refused "ship x$(printf "\\U$(printf '%08x' "0x$cp")")y" "holds the invisible character U+$(printf '%04X' "0x$cp")"
+  done
+  goal_refused $'ship é' "holds the combining mark U+0301"
+  goal_refused $'ship a b' "holds a line or paragraph separator"
+  goal_refused $'ship a\u0085b' "holds a control character"
+  # An emoji's own variation selector and joiner stay, as do a precomposed letter and a no-break space.
+  goal_ok $'ship ❤️ and \U0001f468‍\U0001f469'
+  goal_ok $'ship café at noon'
+}
+
+@test "a goal ending in an emoji shortcode token is refused, since Enter completes it; other colons and @ tokens are kept" {
+  goal_refused "reply only ok :sm" "ends in ':sm'"
+  goal_refused "reply only ok :+1" "ends in ':+1'"
+  goal_ok "reply only ok :s"
+  goal_ok "reply only ok 10:30"
+  goal_ok "reply only ok :ok:"
+  goal_ok "reply only ok a:sm"
+  goal_ok "reply only ok :sm now"
+  goal_ok "reply only ok @.rem"
+}
+
+@test "the goal cap is the longest goal proven to land whole in an 80x24 pane: 1400 characters" {
+  goal_ok "$(printf 'g%.0s' $(seq 1 1400))"
+  goal_refused "$(printf 'g%.0s' $(seq 1 1401))" "is over 1400 characters"
+}
+
+@test "the goal is confirmed only by a prompt of the session it was typed into" {
+  mkdir -p "$LANES_DATA_DIR/lanes/state"
+  printf '{"session_id":"other","last_command":"/goal ship B2","prompts":1}\n' >"$LANES_DATA_DIR/lanes/state/alpha.json"
+  run bash -c 'source "$1"; CLEAR_TIMEOUT=1; wait_goal_seen alpha mine "ship B2" 0' _ "$LANES"
+  assert_failure
+  run bash -c 'source "$1"; CLEAR_TIMEOUT=1; wait_goal_seen alpha other "ship B2" 0' _ "$LANES"
+  assert_success
 }

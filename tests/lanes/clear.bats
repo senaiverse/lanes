@@ -528,11 +528,12 @@ refused_untouched_at() {
   assert_output 1
 }
 
-@test "a sending record and a lane restarted, not cleared, is refused: the new session gets no goal" {
+@test "a sending record and a lane restarted in the same process, not cleared, is refused: the new session gets no goal" {
   ready_lane alpha
   mark_sending
-  lanes_tmux kill-session -t alpha
-  start_fake alpha
+  # The same Claude Code process starts a new session that is not a /clear (as /resume does).
+  edit_session '.sessionId = "restarted"'
+  hook_json SessionStart restarted alpha startup | CLAUDE_PID="$FAKE_PID" TMUX="$(server_tmux)" TMUX_PANE="$PANE" "$LANES" register >/dev/null 2>&1
   run state alpha .start_source
   assert_output startup
   run as_lead clear alpha
@@ -542,6 +543,20 @@ refused_untouched_at() {
   assert_output 0
   run state alpha .handshake.state
   assert_output stale
+  run reg alpha .clear_ready
+  assert_output false
+}
+
+@test "a lane restarted as a new process starts with no handshake: lanes clear refuses and types nothing" {
+  ready_lane alpha
+  mark_sending
+  lanes_tmux kill-session -t alpha
+  start_fake alpha
+  run as_lead clear alpha
+  assert_failure
+  assert_output --partial "is not clear-ready (handshake: none)"
+  run submitted /
+  assert_output 0
   run reg alpha .clear_ready
   assert_output false
 }
@@ -560,8 +575,9 @@ refused_untouched_at() {
   assert_output --partial "the lane restarted (source startup) instead of clearing"
   run submitted /
   assert_output 0
-  run state alpha .handshake.state
-  assert_output stale
+  # The new process took the name with no handshake of its own, so the old record was not left to refuse_clear.
+  run state alpha '.handshake // "none"'
+  assert_output none
 }
 
 @test "the no-flock mutex: a live holder is waited for and never broken; once it dies the lock is taken over" {
@@ -776,41 +792,53 @@ bounded_hook() {
 # add_turn_entry <json>: one transcript line, as Claude Code appends it when a turn begins without a prompt.
 add_turn_entry() { printf '%s\n' "$1" >>"$(state alpha .transcript)"; }
 
-@test "a Stop hook's feedback after clear-ready (a /goal verdict sending the loop on) is a new turn: refused" {
+# tool_use_entry <id>: the assistant entry of one tool call, as 2.1.309 writes it before the tool runs.
+tool_use_entry() {
+  add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"'"$1"'","name":"Bash","input":{"command":"git status"}}]}}'
+}
+
+@test "turns begun after clear-ready and answered with no tool call (a /goal verdict, a task notification) change nothing: the clear lands" {
   ready_lane alpha
   add_turn_entry '{"type":"user","isMeta":true,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"Stop hook feedback:\n[ship A1]: not yet"}}'
+  add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"clear-ready"}]}}'
+  add_turn_entry '{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}}'
+  add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"clear-ready"}]}}'
+  run as_lead clear alpha
+  assert_success
+  assert_output --partial "cleared: alpha"
+}
+
+@test "a tool call after clear-ready, in any turn, is refused: nothing is typed" {
+  ready_lane alpha
+  add_turn_entry '{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}}'
+  tool_use_entry toolu_after
   run as_lead clear alpha
   assert_failure
-  assert_output --partial "began another turn since clear-ready"
+  assert_output --partial "the lane called 1 tool(s) since clear-ready"
   run keys_sent
   assert_output 0
   run state alpha .handshake.state
   assert_output stale
 }
 
-@test "a background task's notification after clear-ready is a new turn: refused" {
-  ready_lane alpha
-  add_turn_entry '{"type":"user","origin":{"kind":"task-notification"},"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}}'
-  run as_lead clear alpha
-  assert_failure
-  assert_output --partial "began another turn since clear-ready"
-  run keys_sent
-  assert_output 0
-}
-
-@test "the rest of clear-ready's own turn (its tool result and the reply) is not a new turn: the clear lands" {
-  ready_lane alpha
-  add_turn_entry '{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fake","content":"clear-ready: alpha","is_error":false}]}}'
-  add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"clear-ready"}]}}'
-  add_turn_entry '{"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:01.100Z"}'
+@test "clear-ready's own tool call, already in the transcript while it runs, and the rest of its turn are not work after it: the clear lands" {
+  make_repo
+  write_resume alpha
+  start_fake alpha
+  tool_use_entry toolu_clear_ready
+  run "$LANES" clear-ready --lane alpha
+  assert_success
+  add_turn_entry '{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_clear_ready","content":"clear-ready: alpha","is_error":false}]}}'
+  add_turn_entry '{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"clear-ready"}]}}'
+  add_turn_entry '{"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:04.100Z"}'
   run as_lead clear alpha
   assert_success
 }
 
-@test "a transcript that cannot be read is refused: a new turn could not be ruled out" {
+@test "a transcript that cannot be read is refused: a tool call since clear-ready could not be ruled out" {
   ready_lane alpha
   f="$LANES_DATA_DIR/lanes/state/alpha.json"
-  jq '.handshake.turns = ""' "$f" >"$f.n" && mv "$f.n" "$f"
+  jq '.handshake.tools = ""' "$f" >"$f.n" && mv "$f.n" "$f"
   run as_lead clear alpha
   assert_failure
   assert_output --partial "could not be read"

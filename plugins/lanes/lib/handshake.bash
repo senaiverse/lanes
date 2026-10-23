@@ -85,6 +85,17 @@ turn_starts() {
           and (.attachment.sentinel | not)))] | length'
 }
 
+# tool_uses <transcript>: how many tool calls the transcript shows, the distinct ids of the assistant entries' tool_use
+# blocks. 2.1.309 writes a call's tool_use entry before the tool runs, so a count taken inside a tool call includes it
+# (probe: a Bash call's own `tail` of the transcript ends in its tool_use). A missing file has none yet.
+tool_uses() {
+  [[ -n "$1" ]] || return 1
+  [[ -e "$1" ]] || { echo 0; return 0; }
+  [[ -r "$1" ]] || return 1
+  { grep -F '"tool_use"' "$1" || true; } | jq -Rn '[inputs | fromjson? | select(.type == "assistant")
+    | .message.content | arrays | .[] | objects | select(.type == "tool_use") | .id] | unique | length'
+}
+
 # unused_problem <lane> <session id>: why that session of the lane is not unused, or nothing. Unused means no prompt
 # reached it (the prompt hook's count) and its transcript shows no turn begun (turn_starts), so a message or
 # notification that fired no hook counts too; the goal is typed only into an unused session.
@@ -165,7 +176,7 @@ cmd_request() {
 # cmd_clear_ready: the work tree is the one the lane runs this from (its Bash tool's directory), not the directory the
 # session started in. The goal re-sent after /clear is the RESUME Goal, its one source (RULES.md rule 6).
 cmd_clear_ready() {
-  local arg="" lane e st wt file block h goal tp turns rc=0
+  local arg="" lane e st wt file block h goal tp tools rc=0
   [[ "${1:-}" == "--lane" ]] && arg="${2:-}"
   lane="$(self_lane "$arg")"
   e="$(reg_read "$lane")" || die "no valid registry entry for '$lane'" "restart the session as 'claude --name $lane' inside tmux"
@@ -187,9 +198,13 @@ cmd_clear_ready() {
     [[ -z "$WHY" ]] || die "not clear-ready" "$WHY"
   fi
   goal="$(trim "$(section_text "$block" Goal)")"
-  # The turns begun so far, this one included: one more later means the lane worked on after reporting ready.
+  # The tool calls so far, this one included: one more later means the lane worked on after reporting ready. Without a
+  # readable transcript lanes clear could never prove that, so the lane is not marked ready.
   tp="$(jq -r '.transcript // ""' <<<"$st")"
-  turns="$(turn_starts "$tp")" || turns=""
+  [[ -n "$tp" ]] ||
+    die "not clear-ready" "lane $lane has no transcript recorded (its SessionStart gave no transcript_path), so lanes clear could never prove that no tool ran since: restart the session as 'claude --name $lane'"
+  tools="$(tool_uses "$tp")" ||
+    die "not clear-ready" "the transcript '$tp' of lane $lane cannot be read, so lanes clear could never prove that no tool ran since: make it readable, then run 'lanes clear-ready' again"
   mutex_take 5 || rc=$?
   ((rc == 0)) || die "not clear-ready: $(mutex_refusal "$rc")" "run 'lanes clear-ready' again in a moment"
   # Ownership is decided under the mutex: a session that took the lane meanwhile is not marked ready for the old one.
@@ -197,9 +212,9 @@ cmd_clear_ready() {
     die "not clear-ready" "lane $lane started a new session while clear-ready ran: run it again"
   hs_cas_locked "$lane" "$HS_SAME" '{state: "ready", ready_at: $now, requested_at: (. // {}).requested_at,
       session_id: $sid, worktree: $wt, head: $head, resume_hash: $h, prompts: $prompts, goal: $goal, attempts: 0,
-      transcript: $tp, turns: $turns}' \
+      transcript: $tp, tools: $tools}' \
     --argjson now "$(now)" --arg sid "$(jq -r .session_id <<<"$e")" --arg wt "$wt" --arg head "$(git -C "$wt" rev-parse HEAD)" \
-    --arg h "$h" --arg goal "$goal" --arg tp "$tp" --arg turns "$turns" \
+    --arg h "$h" --arg goal "$goal" --arg tp "$tp" --argjson tools "$tools" \
     --argjson prompts "$(state_read "$lane" | jq '.prompts // 0')" ||
     die "not clear-ready" "$HS_WHY: run 'lanes clear-ready' again (after a new request, rewrite the RESUME block first)"
   reg_update "$lane" '.clear_ready = true'
@@ -207,7 +222,7 @@ cmd_clear_ready() {
   echo "clear-ready: $lane at $(git -C "$wt" rev-parse --short HEAD). Tell the lead \"clear-ready\", then stop and wait."
 }
 
-# ---- screen: the one fact with no native signal, a human's draft in the input line -------------------------------
+# ---- screen: the input line (a human's draft, our typed text) and vim's mode footer, which have no native signal --
 
 # screen_read <pane>: sets COMPOSER (the typed text, all its wrapped lines; empty for the placeholder),
 # COMPOSER_FOUND (0 when no `❯`+NBSP input line is on screen, as under a dialog or another program) and SCREEN_INSERT
@@ -380,17 +395,29 @@ moved_problem() {
   fi
 }
 
+# record_problem <lane> <record>: why the lane's handshake record is no longer <record> (compact JSON), or nothing.
+record_problem() {
+  local cur
+  cur="$(state_read "$1" | jq -c '.handshake // null')" || return 1
+  [[ "$cur" != "$2" ]] || return 0
+  why_of ready_problem "$1" "$(jq -r '.state // "none"' <<<"$cur")"
+  echo "${WHY:-the handshake of $1 changed while this command ran}"
+}
+
 # send_guard <lane> <pane> [input]: sets WHY to why no key may be sent now, or empty; it runs before typing and before
-# every Enter, and leaves keys_check's HOLD_FIX. The caller sets GUARD_SID (the session the pane must still hold),
-# GUARD_SIG (SS_SIG at the proven idle point), GUARD_READY (1: the clear-ready proof must still hold) and GUARD_UNUSED
-# (1: the session must still be unused, checked last); <input> is what the input line must hold.
-GUARD_SID="" GUARD_SIG="" GUARD_READY=0 GUARD_UNUSED=0
+# every Enter. The slow checks run first and where keys go (keys_check, whose HOLD_FIX it leaves) last, right before
+# the key. The caller sets GUARD_SID (the session the pane must hold), GUARD_SIG (SS_SIG at the proven idle point),
+# GUARD_READY (1: the clear-ready proof must hold), GUARD_RECORD (the handshake record this command wrote, or empty)
+# and GUARD_UNUSED (1: the session must be unused); <input> is what the input line must hold.
+GUARD_SID="" GUARD_SIG="" GUARD_READY=0 GUARD_RECORD="" GUARD_UNUSED=0
 send_guard() {
-  keys_check "$1" "$2" "$GUARD_SID"
-  if [[ -z "$WHY" ]] && ((GUARD_READY)); then why_of changed_since_ready "$1" "$(reg_read "$1")" "$(state_read "$1")"; fi
-  [[ -n "$WHY" ]] || why_of moved_problem "$1"
-  [[ -n "$WHY" ]] || why_of composer_problem "$2" "${@:3}"
+  WHY="" HOLD_FIX=""
+  if ((GUARD_READY)); then why_of changed_since_ready "$1" "$(reg_read "$1")" "$(state_read "$1")"; fi
+  if [[ -z "$WHY" && -n "$GUARD_RECORD" ]]; then why_of record_problem "$1" "$GUARD_RECORD"; fi
   if [[ -z "$WHY" ]] && ((GUARD_UNUSED)); then why_of unused_problem "$1" "$GUARD_SID"; fi
+  [[ -n "$WHY" ]] || why_of composer_problem "$2" "${@:3}"
+  [[ -n "$WHY" ]] || why_of moved_problem "$1"
+  [[ -n "$WHY" ]] || keys_check "$1" "$2" "$GUARD_SID"
 }
 
 # send_literal <pane> <text>: the one place that types text. tmux reads a `;` that ends an argument as a command
@@ -462,16 +489,17 @@ screen_settled() {
 }
 
 # erase_if_ours <lane> <pane> <text>: delete our typed text from its end, one burst of at most 64 Backspaces at a
-# time. Before each burst keys_check runs, then the input line is read until it settles and must hold only the part
-# of our text not yet deleted (or less of it), and the burst follows that read at once: a key typed after the read is
-# all a burst can reach. A screen that still shows more than is left is read again for up to a second. Sets ERASED.
+# time, never once an Enter was pressed (ENTERED: the text may have been submitted, so it is no longer ours). Each
+# burst follows a settled read of the input line that holds only the part of our text not yet deleted (or less of
+# it), then keys_check, then one more read that must plan the same burst; a key typed after that read is all a burst
+# can reach. A screen that still shows more than is left is read again for up to a second. Sets ERASED.
+ENTERED=0
 erase_if_ours() {
-  local left least len n keys plan sent=0 tries=0 burst=() keys_why
+  local left least len n keys plan sent=0 tries=0 burst=()
+  if ((ENTERED)); then ERASED="the text may have been submitted, so nothing was deleted"; return 0; fi
   left="$(printf '%s' "$3" | jq -Rs 'explode | length')" ||
     { ERASED="our typed text was left in the input line of $2, because its length could not be counted"; return 0; }
   while :; do
-    keys_check "$1" "$2" "$GUARD_SID"
-    keys_why="$WHY"
     if ! screen_settled "$2"; then
       ERASED="our typed text was left in the input line of $2, because the line kept changing (it shows '${COMPOSER:0:60}')"
       return 0
@@ -498,7 +526,13 @@ erase_if_ours() {
       ((sent)) || ERASED="none of our typed text was in the input line"
       return 0
     fi
-    [[ -z "$keys_why" ]] || { ERASED="our typed text was left in the input line of $2, because $keys_why"; return 0; }
+    keys_check "$1" "$2" "$GUARD_SID"
+    [[ -z "$WHY" ]] || { ERASED="our typed text was left in the input line of $2, because $WHY"; return 0; }
+    screen_read "$2"
+    if ((!COMPOSER_FOUND)) || [[ "$(erase_plan "$3" "$COMPOSER" "$left")" != "$plan" ]]; then
+      ERASED="deleting our typed text stopped, because the input line changed after it was read (it shows '${COMPOSER:0:60}'); that was left as it is"
+      return 0
+    fi
     burst=()
     for ((; keys > 0; keys--)); do burst+=(BSpace); done
     tm send-keys -t "$2" "${burst[@]}"
@@ -514,17 +548,23 @@ erase_if_ours() {
 submit() {
   local rc=0
   # A kill (the Bash tool's timeout) deletes what was typed and not yet submitted while the input line holds only
-  # that, and says so. Text an Enter went to may have been submitted, so it is no longer ours to delete (ENTERED).
+  # that, and says so; after an Enter, erase_if_ours deletes nothing (ENTERED), on this path as on every other.
   TYPED="" ENTERED=0 SUBMIT_PANE="$2" SUBMIT_LANE="$1"
-  trap 'if ((ENTERED)); then
-      echo "lanes: stopped after pressing Enter in $SUBMIT_PANE: the text may have been submitted, so nothing was deleted; look at the pane and run '"'lanes status'"'" >&2
-      exit 143
-    fi
-    if [[ -n "$TYPED" ]]; then erase_if_ours "$SUBMIT_LANE" "$SUBMIT_PANE" "$TYPED"; else ERASED="nothing was typed"; fi
-    echo "lanes: stopped while typing into $SUBMIT_PANE: $ERASED" >&2; exit 143' TERM INT
+  trap submit_killed TERM INT
   submit_keys "$@" || rc=$?
   trap 'exit 143' TERM INT # bin/lanes' own handler again
   return "$rc"
+}
+
+# submit_killed: submit's TERM and INT handler; it says what became of our typed text, then exits 143.
+submit_killed() {
+  if ((ENTERED)) || [[ -n "$TYPED" ]]; then erase_if_ours "$SUBMIT_LANE" "$SUBMIT_PANE" "$TYPED"; else ERASED="nothing was typed"; fi
+  if ((ENTERED)); then
+    echo "lanes: stopped after pressing Enter in $SUBMIT_PANE: $ERASED; look at the pane and run 'lanes status'" >&2
+  else
+    echo "lanes: stopped while typing into $SUBMIT_PANE: $ERASED" >&2
+  fi
+  exit 143
 }
 
 # arrived <pane> <text>: the input line shows exactly <text>, read 0.3 s after typing and then every 0.1 s for up to a
@@ -566,8 +606,7 @@ submit_keys() {
     erase_if_ours "$lane" "$pane" "$text"
     return 2
   fi
-  # From here the text may be submitted, so the kill trap deletes nothing (submit).
-  # shellcheck disable=SC2034 # read by submit's trap
+  # From here the text may be submitted, so erase_if_ours deletes nothing, after a kill or a later objection alike.
   TYPED="" ENTERED=1
   tm send-keys -t "$pane" Enter
   "$@" && return 0
@@ -764,13 +803,13 @@ identity_problem() {
   return 0
 }
 
-# target_checks <lane> <entry>: the registered pane exists, is not this pane (the caller's pane on the caller's server,
-# entry_on_pane), and keys sent to it reach this lane's session alone (keys_check). Sets PANE_T.
+# target_checks <lane> <entry>: the registered pane exists and keys sent to it reach this lane's session alone
+# (keys_check). It is never the caller's own pane: the caller is the lead (require_lead) and the target is not a lead
+# (require_own_lane), and a pane is registered to one lane only (release_pane). Sets PANE_T.
 target_checks() {
   local lane="$1" e="$2"
   PANE_T="$(jq -r '.tmux_pane // ""' <<<"$e")"
   [[ -n "$PANE_T" ]] || die "lane $lane has no tmux pane registered" "start it inside tmux as 'claude --name $lane'"
-  ! entry_on_pane "$e" "$(caller_server)" "${TMUX_PANE:-}" || die "lane $lane is this pane" "a session never clears itself or types into its own pane; the human clears the lead"
   pane_exists "$PANE_T" || die "pane $PANE_T of lane $lane does not exist" "the lane is gone; restart it as 'claude --name $lane'"
   keys_check "$lane" "$PANE_T" "$(jq -r .session_id <<<"$e")"
   [[ -z "$WHY" || -z "$HOLD_FIX" ]] || die "$REFUSAL: $WHY" "$HOLD_FIX, then run the command again; nothing was typed or written"
@@ -778,9 +817,9 @@ target_checks() {
 }
 
 # changed_since_ready <lane> <entry> <state>: what changed since clear-ready (session, head, tree, RESUME, prompts, a
-# turn begun without a prompt), each reason ending "since clear-ready", or nothing.
+# tool call), each reason naming clear-ready, or nothing.
 changed_since_ready() {
-  local e="$2" st="$3" wt block tp n
+  local e="$2" st="$3" wt block tp n was
   wt="$(jq -r '.handshake.worktree // ""' <<<"$st")"
   [[ "$(jq -r .session_id <<<"$e")" == "$(jq -r .handshake.session_id <<<"$st")" ]] || { echo "the session changed since clear-ready"; return; }
   [[ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" == "$(jq -r .handshake.head <<<"$st")" ]] || { echo "HEAD moved since clear-ready"; return; }
@@ -790,14 +829,19 @@ changed_since_ready() {
   [[ "$(hash_of "$block")" == "$(jq -r .handshake.resume_hash <<<"$st")" ]] || { echo "the RESUME block changed since clear-ready"; return; }
   [[ "$(jq -r '.prompts // 0' <<<"$st")" == "$(jq -r '.handshake.prompts // 0' <<<"$st")" ]] ||
     { echo "the lane received a new prompt since clear-ready"; return; }
-  # A turn can begin with no prompt (a /goal loop going on, a finished background shell), so the transcript is read.
+  # Work is a tool call: a turn that calls none (a /goal turn, a notification answered "clear-ready") changes nothing,
+  # and Claude Code hands a goal back after several such turns (code.claude.com/docs/en/goal).
   tp="$(jq -r '.handshake.transcript // ""' <<<"$st")"
+  was="$(jq -r '.handshake.tools // ""' <<<"$st")"
   n=""
-  if [[ "$(jq -r '.handshake.turns // ""' <<<"$st")" =~ ^[0-9]+$ ]]; then n="$(turn_starts "$tp")" || n=""; fi
+  if [[ "$was" =~ ^[0-9]+$ ]]; then n="$(tool_uses "$tp")" || n=""; fi
   [[ -n "$n" ]] ||
-    { echo "the lane's transcript '$tp' could not be read, so a turn begun since clear-ready cannot be ruled out"; return; }
-  [[ "$n" == "$(jq -r .handshake.turns <<<"$st")" ]] ||
-    echo "the lane began another turn since clear-ready (its /goal went on, a background shell finished, or a message arrived)"
+    { echo "the lane's transcript '$tp' could not be read, so a tool call since clear-ready cannot be ruled out"; return; }
+  if ((n > was)); then
+    echo "the lane called $((n - was)) tool(s) since clear-ready, so it worked on after reporting ready"
+  elif ((n < was)); then
+    echo "the lane's transcript shows fewer tool calls than at clear-ready ($n, then $was), so it is not the one proven"
+  fi
 }
 
 # final_verify <lane> <pane>: after the wait, the record is still ready (it becomes HS_WAS, the one hs_sending moves)
@@ -928,6 +972,7 @@ cmd_clear() {
     idle_point "$lane" "$pane" "$wait_s" "$sid" 1
     final_verify "$lane" "$pane"
     hs_sending "$lane"
+    GUARD_RECORD="$HS_WAS"
     rc=0
     submit "$lane" "$pane" "/clear" wait_new_session "$lane" "$sid" || rc=$?
     ((rc != 2)) || refuse_keys "$lane" "$MOVED before /clear was sent" "${MOVED_FIX:+nothing was submitted ($ERASED); $MOVED_FIX}" "nothing was submitted ($ERASED); ask the lane to report clear-ready again"
@@ -955,11 +1000,14 @@ cmd_clear() {
   if [[ -n "$goal" ]]; then
     wait_composer_empty "$pane" || die "the cleared session in $pane shows no empty input line" "look at the pane; the goal was not sent"
     idle_point "$lane" "$pane" "$wait_s" "$new_sid" 0
-    # The goal goes only into an unused session, checked last before the goal is typed and before its Enter.
-    GUARD_UNUSED=1
+    # The goal goes only into an unused session and only while the record is still the cleared one this command
+    # proved, both checked again before the goal is typed and before its Enter.
+    GUARD_UNUSED=1 GUARD_RECORD="$HS_WAS"
     rc=0
     send_goal "$lane" "$pane" "$new_sid" "$goal" || rc=$?
     if ((rc == 2)); then
+      why_of record_problem "$lane" "$GUARD_RECORD"
+      [[ -z "$WHY" ]] || die "goal not sent: $WHY" "nothing was submitted ($ERASED); the record was left as it is: wait for the lane's new 'clear-ready', or set the goal with 'lanes goal $lane'"
       why_of unused_problem "$lane" "$new_sid"
       [[ -z "$WHY" ]] || die "goal not sent: $WHY" "nothing was submitted ($ERASED); the goal is not typed into a session in use; set it with 'lanes goal $lane \"<goal>\"'"
       die "goal not sent: $MOVED" "nothing was submitted ($ERASED); run 'lanes clear $lane' again to send it"
@@ -995,7 +1043,7 @@ cmd_goal() {
   wait_arg "$@"
   wait_s="$WAIT_S"
   why_of goal_problem "$goal"
-  [[ -z "$WHY" ]] || die "goal not sent: the goal $WHY" "pass it as one line of at most $GOAL_CAP characters" 2
+  [[ -z "$WHY" ]] || die "goal not sent: the goal $WHY" "rewrite it as one line of at most $GOAL_CAP characters that the input line keeps as typed" 2
   require_lead "sets a lane's goal"
   REFUSAL="goal not sent"
   require_own_lane "$lane"
